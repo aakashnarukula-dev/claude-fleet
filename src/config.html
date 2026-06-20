@@ -3,103 +3,170 @@
 <head>
 <meta charset="utf-8" />
 <style>
-  :root { --bg:#0a0b0d; --panel:#121419; --line:#23262e; --fg:#e8e6e3; --muted:#8b8f98; --accent:#d97757; }
+  :root {
+    --bg:#0b0c0e; --card:#141619; --card-2:#101216; --line:#262a31; --line-2:#333842;
+    --fg:#ecebe8; --muted:#8b9097; --faint:#5e636c;
+    --accent:#d97757; --accent-ink:#190d08; --accent-soft:rgba(217,119,87,.14); --danger:#ff6b61;
+  }
   * { box-sizing: border-box; }
-  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
-    font:13px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif; -webkit-user-select:none; }
-  .drag { height:38px; -webkit-app-region:drag; }
-  .wrap { padding:6px 28px 28px; }
-  h1 { font-size:22px; font-weight:650; margin:0 0 2px; letter-spacing:-.2px; }
-  .sub { color:var(--muted); margin:0 0 22px; }
-  .label { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:18px 0 8px; }
-  .modes { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
-  .modes button { -webkit-app-region:no-drag; cursor:pointer; padding:11px 0; border-radius:9px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:13px; font-weight:600; transition:.12s; }
-  .modes button:hover { border-color:#3a3e48; }
-  .modes button.on { color:#fff; }
-  .modeDesc { color:var(--muted); font-size:12px; line-height:1.45; margin-top:8px; }
-  .proj { display:flex; align-items:center; gap:10px; }
-  .pickbtn { -webkit-app-region:no-drag; cursor:pointer; flex:none; padding:9px 14px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:12px; font-weight:600; }
-  .pickbtn:hover { border-color:#3a3e48; }
-  .pickbtn.on { border-color:var(--accent); color:#fff; background:rgba(217,119,87,.18); }
-  .projpath { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; font-size:12px; color:var(--muted); }
+  html,body { margin:0; height:100%; color:var(--fg); -webkit-user-select:none;
+    font:13px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif;
+    background:
+      radial-gradient(120% 70% at 12% -8%, rgba(217,119,87,.10), transparent 55%),
+      radial-gradient(90% 60% at 100% 110%, rgba(120,140,200,.06), transparent 60%),
+      var(--bg);
+  }
+  .drag { height:34px; -webkit-app-region:drag; }
+  .wrap { padding:2px 26px 26px; }
+
+  /* header */
+  .hdr { display:flex; align-items:center; gap:14px; margin:0 0 20px; }
+  .logo { width:44px; height:44px; flex:none; border-radius:12px; display:flex; align-items:center; justify-content:center;
+    background:linear-gradient(160deg, rgba(255,255,255,.05), rgba(255,255,255,.01)); border:1px solid var(--line); }
+  .burst { width:26px; height:26px; }
+  h1 { font-size:21px; font-weight:650; margin:0; letter-spacing:-.3px; }
+  .sub { color:var(--muted); margin:3px 0 0; font-size:12.5px; line-height:1.4; }
+
+  /* cards */
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:15px 16px; margin-bottom:11px;
+    box-shadow:0 1px 0 rgba(255,255,255,.02) inset, 0 10px 30px -22px rgba(0,0,0,.9); }
+  .label { font-size:10.5px; text-transform:uppercase; letter-spacing:.14em; color:var(--faint); font-weight:700; margin:0 0 11px; }
+  .label .hintnote { text-transform:none; letter-spacing:0; color:var(--muted); font-weight:500; margin-left:6px; }
+
+  /* project pickers */
+  .proj { display:flex; align-items:center; gap:8px; }
+  .pickbtn { -webkit-app-region:no-drag; cursor:pointer; flex:none; padding:8px 13px; border-radius:9px; border:1px solid var(--line);
+    background:var(--card-2); color:var(--fg); font-size:12px; font-weight:600; transition:.14s; }
+  .pickbtn:hover { border-color:var(--line-2); }
+  .pickbtn.on { border-color:var(--accent); color:#fff; background:var(--accent-soft); }
+  .projpath { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; font-size:12px; color:var(--faint); }
   .projpath.set { color:var(--fg); }
-  .recent { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
-  .chip { -webkit-app-region:no-drag; cursor:pointer; max-width:200px; padding:5px 10px; border-radius:7px; border:1px solid var(--line); background:var(--panel); color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .chip:hover { border-color:#3a3e48; color:var(--fg); }
-  .chip.on { border-color:var(--accent); color:var(--fg); }
-  .sel { -webkit-app-region:no-drag; width:100%; padding:9px 12px; border-radius:8px; border:1px solid var(--line); background:#0d0f13; color:var(--fg); font-size:13px; outline:none; cursor:pointer; }
-  .sel:focus { border-color:var(--accent); }
-  .counts { display:grid; grid-template-columns:repeat(9,1fr); gap:6px; }
-  .counts button { -webkit-app-region:no-drag; cursor:pointer; padding:10px 0; border-radius:9px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:14px; font-weight:600; }
-  .counts button:hover { border-color:#3a3e48; }
-  .counts button.on { background:var(--accent); border-color:var(--accent); color:#1a0f0a; }
-  .heads { display:flex; flex-direction:column; gap:8px; }
-  .hrow { display:flex; align-items:center; gap:10px; }
-  .tag { width:54px; font-size:11px; color:var(--muted); flex:none; text-align:right; }
-  .heads input { -webkit-app-region:no-drag; -webkit-user-select:text; flex:1; padding:9px 12px; border-radius:8px; border:1px solid var(--line); background:#0d0f13; color:var(--fg); font-size:13px; outline:none; }
-  .heads input:focus { border-color:var(--accent); }
-  .warn { margin-top:14px; font-size:12px; line-height:1.45; color:#e0a86b; }
-  .go { -webkit-app-region:no-drag; margin-top:24px; width:100%; padding:12px; border:none; border-radius:10px;
-    background:var(--accent); color:#1a0f0a; font-size:14px; font-weight:700; cursor:pointer; }
-  .go:disabled { opacity:.5; cursor:default; }
-  .err { color:#ff6b61; margin-top:12px; min-height:16px; font-size:12px; white-space:pre-wrap; }
-  .auton { -webkit-app-region:no-drag; display:flex; align-items:flex-start; gap:9px; margin-top:20px; cursor:pointer; }
-  .auton input { margin:2px 0 0; accent-color:var(--accent); width:15px; height:15px; flex:none; }
-  .auton span { color:var(--muted); font-size:12px; line-height:1.4; }
-  .burst { width:30px; height:30px; vertical-align:-7px; margin-right:10px; }
-  .acct { display:inline-flex; align-items:center; gap:5px; padding-right:4px; }
+
+  /* chips (recents + accounts) */
+  .recent { display:flex; flex-wrap:wrap; gap:6px; margin-top:11px; }
+  .recent:empty { margin-top:0; }
+  .chip { -webkit-app-region:no-drag; cursor:pointer; max-width:210px; padding:5px 10px; border-radius:8px; border:1px solid var(--line);
+    background:var(--card-2); color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; transition:.14s; }
+  .chip:hover { border-color:var(--line-2); color:var(--fg); }
+  .chip.on { border-color:var(--accent); color:var(--fg); background:var(--accent-soft); }
+  .acct { display:inline-flex; align-items:center; gap:6px; padding-right:5px; }
   .acct > span { cursor:pointer; }
-  .acctx { -webkit-app-region:no-drag; cursor:pointer; border:none; background:transparent; color:var(--muted); font-size:14px; line-height:1; padding:0 2px; border-radius:4px; }
-  .acctx:hover { color:#ff6b61; background:rgba(255,107,97,.12); }
+  .acctx { -webkit-app-region:no-drag; cursor:pointer; border:none; background:transparent; color:var(--faint); font-size:14px; line-height:1; padding:0 1px; border-radius:5px; transition:.14s; }
+  .acctx:hover { color:var(--danger); }
   .acct-add { border-style:dashed; color:var(--muted); }
-  .acct-add:hover { color:var(--fg); }
-  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:50; -webkit-app-region:no-drag; }
+  .acct-add:hover { color:var(--fg); border-color:var(--accent); }
+
+  /* select */
+  .select-wrap { position:relative; margin-top:11px; }
+  .select-wrap .chev { position:absolute; right:12px; top:50%; transform:translateY(-50%); pointer-events:none; color:var(--muted); }
+  .sel { -webkit-app-region:no-drag; appearance:none; -webkit-appearance:none; width:100%; padding:10px 34px 10px 12px; border-radius:9px;
+    border:1px solid var(--line); background:var(--card-2); color:var(--fg); font-size:13px; outline:none; cursor:pointer; transition:.14s; }
+  .sel:hover { border-color:var(--line-2); }
+  .sel:focus { border-color:var(--accent); }
+  .hint { display:none; align-items:center; gap:8px; margin-top:9px; font-size:11.5px; color:var(--muted); }
+  .linkbtn { -webkit-app-region:no-drag; cursor:pointer; border:none; background:transparent; color:var(--accent); font-size:11.5px; font-weight:600; padding:0; text-decoration:underline; text-underline-offset:2px; }
+  .linkbtn:hover { color:#e89072; }
+
+  /* options */
+  .opt { -webkit-app-region:no-drag; display:flex; align-items:flex-start; gap:10px; cursor:pointer; }
+  .opt + .opt, .opt + #gridCfg, #gridCfg + .opt { margin-top:13px; padding-top:13px; border-top:1px solid var(--line); }
+  .opt input { margin:1px 0 0; accent-color:var(--accent); width:16px; height:16px; flex:none; }
+  .opt .otxt { font-size:12px; line-height:1.45; color:var(--muted); }
+  .opt .otxt b { color:var(--fg); font-weight:650; }
+
+  /* grid (no-orchestrator) config */
+  #gridCfg { margin-top:13px; padding-top:13px; border-top:1px solid var(--line); }
+  .counts { display:grid; grid-template-columns:repeat(9,1fr); gap:5px; margin-bottom:13px; }
+  .counts button { -webkit-app-region:no-drag; cursor:pointer; padding:9px 0; border-radius:8px; border:1px solid var(--line);
+    background:var(--card-2); color:var(--fg); font-size:13px; font-weight:600; transition:.14s; }
+  .counts button:hover { border-color:var(--line-2); }
+  .counts button.on { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+  .heads { display:flex; flex-direction:column; gap:7px; }
+  .hrow { display:flex; align-items:center; gap:10px; }
+  .tag { width:52px; font-size:11px; color:var(--faint); flex:none; text-align:right; }
+  .heads input { -webkit-app-region:no-drag; -webkit-user-select:text; flex:1; padding:8px 12px; border-radius:8px; border:1px solid var(--line);
+    background:var(--card-2); color:var(--fg); font-size:13px; outline:none; transition:.14s; }
+  .heads input:focus { border-color:var(--accent); }
+
+  /* CTA */
+  .go { -webkit-app-region:no-drag; margin-top:16px; width:100%; padding:13px; border:none; border-radius:12px; cursor:pointer;
+    background:linear-gradient(180deg, #e08763, var(--accent)); color:var(--accent-ink); font-size:14px; font-weight:700; letter-spacing:.01em;
+    box-shadow:0 8px 22px -12px rgba(217,119,87,.7); transition:.15s; }
+  .go:hover:not(:disabled) { filter:brightness(1.05); transform:translateY(-1px); }
+  .go:disabled { opacity:.4; cursor:default; box-shadow:none; background:var(--card); color:var(--muted); border:1px solid var(--line); }
+  .err { color:var(--danger); margin-top:11px; min-height:15px; font-size:12px; white-space:pre-wrap; }
+
+  /* device-code modal */
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.62); backdrop-filter:blur(3px); display:none; align-items:center; justify-content:center; z-index:50; -webkit-app-region:no-drag; }
   .modal-bg.show { display:flex; }
-  .modal { width:330px; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px; text-align:center; }
-  .modal h2 { font-size:15px; margin:0 0 6px; }
-  .modal p { color:var(--muted); font-size:12px; margin:0 0 14px; line-height:1.45; }
+  .modal { width:336px; background:var(--card); border:1px solid var(--line-2); border-radius:16px; padding:24px; text-align:center; box-shadow:0 30px 70px -30px rgba(0,0,0,.9); }
+  .modal h2 { font-size:15.5px; margin:0 0 6px; font-weight:650; }
+  .modal p { color:var(--muted); font-size:12px; margin:0 0 16px; line-height:1.45; }
   .modal p b { color:var(--fg); }
   .code-row { display:flex; align-items:stretch; gap:8px; margin-bottom:10px; }
-  .code { flex:1; font:600 27px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing:3px; color:#fff; background:#0d0f13; border:1px solid var(--line); border-radius:10px; padding:15px; user-select:text; -webkit-user-select:text; }
-  .copybtn { -webkit-app-region:no-drag; cursor:pointer; width:48px; flex:none; border:1px solid var(--line); background:#0d0f13; color:var(--muted); border-radius:10px; display:flex; align-items:center; justify-content:center; transition:.14s; }
+  .code { flex:1; font:600 27px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing:3px; color:#fff; background:var(--card-2);
+    border:1px solid var(--line); border-radius:11px; padding:16px; user-select:text; -webkit-user-select:text; }
+  .copybtn { -webkit-app-region:no-drag; cursor:pointer; width:48px; flex:none; border:1px solid var(--line); background:var(--card-2); color:var(--muted);
+    border-radius:11px; display:flex; align-items:center; justify-content:center; transition:.14s; }
   .copybtn:hover { color:var(--fg); border-color:var(--accent); }
-  .copybtn.copied { color:#1a0f0a; background:var(--accent); border-color:var(--accent); }
-  .dstatus { font-size:11px; margin-bottom:14px; min-height:14px; color:var(--muted); }
+  .copybtn.copied { color:var(--accent-ink); background:var(--accent); border-color:var(--accent); }
+  .dstatus { font-size:11.5px; margin-bottom:16px; min-height:15px; color:var(--muted); }
   .modal .row { display:flex; gap:8px; }
-  .modal .row button { -webkit-app-region:no-drag; cursor:pointer; flex:1; padding:9px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:12px; font-weight:600; }
-  .modal .row button.primary { background:var(--accent); color:#1a0f0a; border-color:var(--accent); }
+  .modal .row button { -webkit-app-region:no-drag; cursor:pointer; flex:1; padding:10px; border-radius:9px; border:1px solid var(--line);
+    background:var(--card-2); color:var(--fg); font-size:12px; font-weight:600; transition:.14s; }
+  .modal .row button:hover { border-color:var(--line-2); }
+  .modal .row button.primary { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
+  .modal .row button.primary:hover { filter:brightness(1.05); }
 </style>
 </head>
 <body>
 <div class="drag"></div>
 <div class="wrap">
-  <h1><svg class="burst" id="burst" viewBox="0 0 100 100"></svg>Claude Fleet</h1>
-  <p class="sub">Pick a project — a local folder or a GitHub repo. One orchestrator splits your goal across worker terminals, integrates, and pushes.</p>
+  <header class="hdr">
+    <div class="logo"><svg class="burst" id="burst" viewBox="0 0 100 100"></svg></div>
+    <div>
+      <h1>Claude Fleet</h1>
+      <p class="sub">Pick a project, give one goal — an orchestrator splits it across worker terminals, integrates, and ships.</p>
+    </div>
+  </header>
 
-  <div class="label">Project folder</div>
-  <div class="proj">
-    <button class="pickbtn" id="pickBtn">Choose folder…</button>
-    <button class="pickbtn" id="newProjBtn" title="Launch with no folder — tell Claude what to build and it sets up the project for you.">New project</button>
-    <span class="projpath" id="projPath">No folder selected</span>
-  </div>
-  <div class="recent" id="recent"></div>
+  <section class="card">
+    <div class="label">Project</div>
+    <div class="proj">
+      <button class="pickbtn" id="pickBtn">Choose folder…</button>
+      <button class="pickbtn" id="newProjBtn" title="Launch with no folder — tell Claude what to build and it sets up the project for you.">New project</button>
+      <span class="projpath" id="projPath">No folder selected</span>
+    </div>
+    <div class="recent" id="recent"></div>
+  </section>
 
-  <div class="label">…or a GitHub repo</div>
-  <div class="recent" id="accts"></div>
-  <select class="sel" id="repoSel"><option>Pick an account…</option></select>
+  <section class="card">
+    <div class="label">…or a GitHub repo</div>
+    <div class="recent" id="accts"></div>
+    <div class="select-wrap">
+      <select class="sel" id="repoSel"><option>Pick an account…</option></select>
+      <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+    </div>
+    <div class="hint" id="scopeHint">
+      <span>Showing public repos only.</span>
+      <button class="linkbtn" id="scopeFix">Enable private repos</button>
+    </div>
+  </section>
 
-  <label class="auton"><input type="checkbox" id="useOrch" checked />
-    <span><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly (each works its own area and pushes itself).</span></label>
+  <section class="card">
+    <label class="opt"><input type="checkbox" id="useOrch" checked />
+      <span class="otxt"><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly.</span></label>
 
-  <div id="gridCfg" style="display:none">
-    <div class="label">How many panes? <span style="text-transform:none;letter-spacing:0;color:var(--muted)">— each is a worker you task directly, max 9</span></div>
-    <div class="counts" id="counts"></div>
-    <div class="label">Pane names <span style="text-transform:none;letter-spacing:0;color:var(--muted)">— each owns its area and pushes to the default branch itself</span></div>
-    <div class="heads" id="heads"></div>
-  </div>
+    <div id="gridCfg" style="display:none">
+      <div class="label">Panes <span class="hintnote">— each is a worker you task directly, max 9</span></div>
+      <div class="counts" id="counts"></div>
+      <div class="label">Pane names <span class="hintnote">— each owns its area and pushes itself</span></div>
+      <div class="heads" id="heads"></div>
+    </div>
 
-  <label class="auton"><input type="checkbox" id="auton" checked />
-    <span>Autonomous (scoped) — auto-approve the fleet's safe verbs: edits, git add/commit/merge, and push to the project branch. rm, curl &amp; anything else still ask.</span></label>
+    <label class="opt"><input type="checkbox" id="auton" checked />
+      <span class="otxt"><b>Autonomous (scoped)</b> — auto-approve safe verbs: edits, git add/commit/merge, and push to the project branch. rm, curl &amp; anything else still ask.</span></label>
+  </section>
 
   <button class="go" id="go" disabled>Launch fleet</button>
   <div class="err" id="err"></div>
@@ -123,7 +190,7 @@
   </div>
 </div>
 <script>
-  // draw the Claude burst logo
+  // draw the Claude burst logo (white)
   (function () {
     const svg = document.getElementById('burst'); if (!svg) return;
     const cx = 50, cy = 50, R = 42, ns = 'http://www.w3.org/2000/svg';
@@ -133,7 +200,7 @@
       const ln = document.createElementNS(ns, 'line');
       ln.setAttribute('x1', cx); ln.setAttribute('y1', cy);
       ln.setAttribute('x2', (cx + L * Math.cos(a)).toFixed(2)); ln.setAttribute('y2', (cy + L * Math.sin(a)).toFixed(2));
-      ln.setAttribute('stroke', '#d97757'); ln.setAttribute('stroke-width', '8'); ln.setAttribute('stroke-linecap', 'round');
+      ln.setAttribute('stroke', '#ffffff'); ln.setAttribute('stroke-width', '8'); ln.setAttribute('stroke-linecap', 'round');
       svg.appendChild(ln);
     });
   })();
@@ -149,7 +216,9 @@
   const gridCfg = document.getElementById('gridCfg');
   const countsEl = document.getElementById('counts');
   const headsEl = document.getElementById('heads');
-  let repo = '', repoNWO = '', repoBranch = 'main', account = '', count = 3, newProject = false; const repoCache = {};
+  const scopeHint = document.getElementById('scopeHint');
+  let repo = '', repoNWO = '', repoBranch = 'main', account = '', count = 3, newProject = false;
+  const repoCache = {}, scopeCache = {};
   let accounts = [];
 
   function fit() { requestAnimationFrame(() => window.fleet.resizeWindow(document.querySelector('.wrap').getBoundingClientRect().bottom + 8)); }
@@ -213,14 +282,14 @@
     const r = await window.fleet.ghDisconnect(user);
     if (r && r.error) { errEl.textContent = 'Disconnect failed: ' + r.error; return; }
     if (account === user) clearGithub();
-    delete repoCache[user];
+    delete repoCache[user]; delete scopeCache[user];
     loadAccounts();
   }
   // device-code connect modal
   const ghModal = document.getElementById('ghModal'), ghCode = document.getElementById('ghCode'), ghStatus = document.getElementById('ghStatus');
   const GH_DEVICE_URL = 'https://github.com/login/device';
   let ghOpened = false, currentCode = '';
-  function ghSetStatus(t, err) { ghStatus.textContent = t; ghStatus.style.color = err ? '#ff6b61' : ''; }
+  function ghSetStatus(t, err) { ghStatus.textContent = t; ghStatus.style.color = err ? 'var(--danger)' : ''; }
   // open the device page ONCE, instantly, the moment the code arrives from GitHub.
   window.fleet.onDeviceCode((code) => {
     currentCode = code; ghCode.textContent = code;
@@ -241,11 +310,23 @@
     ghOpened = false; currentCode = '';   // fresh attempt
     ghCode.textContent = '· · · ·'; ghSetStatus('Starting GitHub sign-in…'); ghModal.classList.add('show');
     window.fleet.ghConnect().then((r) => {
-      if (r && r.ok) { ghModal.classList.remove('show'); loadAccounts(); }
-      else { ghSetStatus('Failed: ' + ((r && r.error) || 'unknown') + '. Is the GitHub CLI (gh) installed?', true); }
+      if (r && r.ok) {
+        ghModal.classList.remove('show');
+        loadAccounts();
+        if (account) { delete repoCache[account]; delete scopeCache[account]; loadRepos(account); }   // pick up newly-granted scope (e.g. private repos)
+      } else {
+        ghSetStatus('Failed: ' + ((r && r.error) || 'unknown') + '. Is the GitHub CLI (gh) installed?', true);
+      }
     });
   }
-  function clearGithub() { account = ''; repoNWO = ''; [...acctsEl.children].forEach((c) => c.classList.remove('on')); repoSel.innerHTML = '<option>Pick an account…</option>'; repoSel.disabled = false; }
+  document.getElementById('scopeFix').onclick = connectAccount;   // re-authorize to grant the `repo` scope (private access)
+
+  function clearGithub() {
+    account = ''; repoNWO = '';
+    [...acctsEl.children].forEach((c) => c.classList.remove('on'));
+    repoSel.innerHTML = '<option>Pick an account…</option>'; repoSel.disabled = false;
+    scopeHint.style.display = 'none';
+  }
   function setAccount(id) {
     account = id; repo = ''; newProject = false; newProjBtn.classList.remove('on');   // choosing GitHub clears the local folder + new-project
     projPath.textContent = 'No folder selected'; projPath.classList.remove('set');
@@ -253,20 +334,23 @@
     renderRecent(); loadRepos(id);
   }
   async function loadRepos(acct) {
-    repoNWO = ''; refreshGo();
+    repoNWO = ''; refreshGo(); scopeHint.style.display = 'none';
     if (repoCache[acct]) return fillRepos(repoCache[acct], acct);
     repoSel.innerHTML = '<option>Loading repos…</option>'; repoSel.disabled = true; fit();
     const res = await window.fleet.listAccountRepos(acct);
     if (account !== acct) return;   // user switched account while loading
     if (!res || res.error) { repoSel.innerHTML = '<option>' + (res && res.error ? 'error: ' + res.error : 'no repos') + '</option>'; repoSel.disabled = true; fit(); return; }
-    repoCache[acct] = res.repos || []; fillRepos(repoCache[acct], acct);
+    repoCache[acct] = res.repos || []; scopeCache[acct] = res.scopes || '';
+    fillRepos(repoCache[acct], acct);
   }
+  function hasRepoScope(acct) { return /(^|[,\s])repo([,\s]|$)/.test(scopeCache[acct] || ''); }
   function fillRepos(repos, acct) {
     repoSel.disabled = false; repoSel.innerHTML = '';
-    if (!repos.length) { repoSel.innerHTML = '<option>no repos found</option>'; repoSel.disabled = true; fit(); return; }
+    if (!repos.length) { repoSel.innerHTML = '<option>no repos found</option>'; repoSel.disabled = true; scopeHint.style.display = hasRepoScope(acct) ? 'none' : 'flex'; fit(); return; }
     repos.forEach((r) => { const o = document.createElement('option'); o.value = r.nameWithOwner; o.dataset.branch = r.defaultBranch || 'main'; o.textContent = r.name + (String(r.visibility || '').toLowerCase() === 'private' ? '  · private' : ''); repoSel.appendChild(o); });
-    const def = repoSel.options[0];
-    repoSel.value = def.value; selectRepo(); fit();
+    repoSel.value = repoSel.options[0].value; selectRepo();
+    scopeHint.style.display = hasRepoScope(acct) ? 'none' : 'flex';   // no `repo` scope → only public repos visible
+    fit();
   }
   function selectRepo() { const o = repoSel.selectedOptions[0]; repoNWO = (o && o.value) || ''; repoBranch = (o && o.dataset.branch) || 'main'; refreshGo(); }
   repoSel.onchange = selectRepo;

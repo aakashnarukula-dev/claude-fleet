@@ -228,6 +228,17 @@ function ghTokenFor(account) {
   });
 }
 function ghEnv(token) { return token ? Object.assign(cmdEnv(), { GH_TOKEN: token }) : cmdEnv(); }
+// the OAuth scopes on a token (from the X-OAuth-Scopes response header) — used to tell whether an account can see
+// private repos (needs the `repo` scope). Empty string if it can't be determined.
+function ghScopes(token) {
+  return new Promise((resolve) => {
+    execFile('gh', ['api', '-i', 'user'], { env: ghEnv(token), timeout: 15000 }, (err, out) => {
+      if (err) return resolve('');
+      const m = String(out).match(/^x-oauth-scopes:\s*(.*)$/im);
+      resolve(m ? m[1].trim() : '');
+    });
+  });
+}
 // clone <owner>/<repo> to ~/Developer/<repo> if it isn't there yet, then fetch to refresh. Uses the selected account's
 // token (if any) so private repos on a non-active account clone correctly. Prefers gh (handles auth), falls back to git.
 async function ensureRepoClone(nameWithOwner, defaultBranch, account) {
@@ -659,7 +670,8 @@ ipcMain.handle('clipboard-write', (_e, t) => { try { clipboard.writeText(String(
 // without changing the user's globally-active gh account.
 ipcMain.handle('list-account-repos', async (_e, account) => {
   const token = await ghTokenFor(account);
-  return new Promise((resolve) => {
+  const scopesP = ghScopes(token);   // fetched in parallel with the repo list
+  const result = await new Promise((resolve) => {
     execFile('gh', ['repo', 'list', String(account), '--limit', '100', '--json', 'nameWithOwner,name,defaultBranchRef,visibility,pushedAt'],
       { env: ghEnv(token), timeout: 25000, maxBuffer: 8 * 1024 * 1024 }, (err, out, errOut) => {
         if (err) return resolve({ error: (errOut && errOut.trim()) || err.message });
@@ -672,6 +684,8 @@ ipcMain.handle('list-account-repos', async (_e, account) => {
         } catch (_) { resolve({ error: 'could not parse gh output' }); }
       });
   });
+  if (result.error) return result;
+  return { repos: result.repos, scopes: await scopesP };
 });
 
 // Grid mode: add one more named worker to a running session (no restart). Engine creates a fresh
