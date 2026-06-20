@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#23262d"/>
+      <stop offset="1" stop-color="#0a0b0d"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="90%" r="62%">
+      <stop offset="0" stop-color="#d97757" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#d97757" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- squircle background -->
+  <rect x="80" y="80" width="864" height="864" rx="204" fill="url(#bg)"/>
+  <rect x="80" y="80" width="864" height="864" rx="204" fill="url(#glow)"/>
+  <rect x="80.75" y="80.75" width="862.5" height="862.5" rx="203.25" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="1.5"/>
+
+  <!-- terminal prompt chevron -->
+  <path d="M 246 392 L 356 512 L 246 632" fill="none" stroke="#d97757" stroke-width="46" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Claude burst (white) -->
+  <g stroke="#ffffff" stroke-width="32" stroke-linecap="round">
+    <line x1="566" y1="512" x2="566" y2="354"/>
+    <line x1="566" y1="512" x2="624.5" y2="410.8"/>
+    <line x1="566" y1="512" x2="693.2" y2="438.5"/>
+    <line x1="566" y1="512" x2="689.2" y2="512"/>
+    <line x1="566" y1="512" x2="702.8" y2="591"/>
+    <line x1="566" y1="512" x2="622.9" y2="610.5"/>
+    <line x1="566" y1="512" x2="566" y2="663.7"/>
+    <line x1="566" y1="512" x2="502.8" y2="621.5"/>
+    <line x1="566" y1="512" x2="429.2" y2="591"/>
+    <line x1="566" y1="512" x2="445.9" y2="512"/>
+    <line x1="566" y1="512" x2="442.8" y2="440.9"/>
+    <line x1="566" y1="512" x2="508.3" y2="412.1"/>
+  </g>
+
+  <!-- terminal block cursor -->
+  <rect x="756" y="448" width="44" height="128" rx="14" fill="#d97757" fill-opacity="0.92"/>
+</svg>
