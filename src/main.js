@@ -652,6 +652,8 @@ ipcMain.handle('gh-disconnect', (_e, account) => new Promise((resolve) => {
 
 // open an external URL in the default browser (device-code "Open" fallback).
 ipcMain.handle('open-external', (_e, url) => { try { shell.openExternal(String(url)); } catch (_) {} return true; });
+// copy text to the clipboard (device-code "copy" button).
+ipcMain.handle('clipboard-write', (_e, t) => { try { clipboard.writeText(String(t == null ? '' : t)); } catch (_) {} return true; });
 
 // list every repo for a GitHub account via gh — includes private repos. Scoped to that account's token so it works
 // without changing the user's globally-active gh account.

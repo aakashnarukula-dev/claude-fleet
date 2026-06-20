@@ -59,7 +59,11 @@
   .modal h2 { font-size:15px; margin:0 0 6px; }
   .modal p { color:var(--muted); font-size:12px; margin:0 0 14px; line-height:1.45; }
   .modal p b { color:var(--fg); }
-  .code { font:600 27px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing:3px; color:#fff; background:#0d0f13; border:1px solid var(--line); border-radius:10px; padding:15px; margin-bottom:10px; user-select:text; -webkit-user-select:text; }
+  .code-row { display:flex; align-items:stretch; gap:8px; margin-bottom:10px; }
+  .code { flex:1; font:600 27px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing:3px; color:#fff; background:#0d0f13; border:1px solid var(--line); border-radius:10px; padding:15px; user-select:text; -webkit-user-select:text; }
+  .copybtn { -webkit-app-region:no-drag; cursor:pointer; width:48px; flex:none; border:1px solid var(--line); background:#0d0f13; color:var(--muted); border-radius:10px; display:flex; align-items:center; justify-content:center; transition:.14s; }
+  .copybtn:hover { color:var(--fg); border-color:var(--accent); }
+  .copybtn.copied { color:#1a0f0a; background:var(--accent); border-color:var(--accent); }
   .dstatus { font-size:11px; margin-bottom:14px; min-height:14px; color:var(--muted); }
   .modal .row { display:flex; gap:8px; }
   .modal .row button { -webkit-app-region:no-drag; cursor:pointer; flex:1; padding:9px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:12px; font-weight:600; }
@@ -105,7 +109,12 @@
   <div class="modal">
     <h2>Connect GitHub account</h2>
     <p>A browser will open to <b>github.com/login/device</b>. Enter this one-time code to authorize:</p>
-    <div class="code" id="ghCode">· · · ·</div>
+    <div class="code-row">
+      <div class="code" id="ghCode">· · · ·</div>
+      <button id="ghCopy" class="copybtn" title="Copy code" aria-label="Copy code">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      </button>
+    </div>
     <div class="dstatus" id="ghStatus">Starting…</div>
     <div class="row">
       <button id="ghOpen" class="primary">Open page</button>
@@ -210,18 +219,26 @@
   // device-code connect modal
   const ghModal = document.getElementById('ghModal'), ghCode = document.getElementById('ghCode'), ghStatus = document.getElementById('ghStatus');
   const GH_DEVICE_URL = 'https://github.com/login/device';
-  let ghOpened = false;
+  let ghOpened = false, currentCode = '';
   function ghSetStatus(t, err) { ghStatus.textContent = t; ghStatus.style.color = err ? '#ff6b61' : ''; }
-  // gh's own browser-open is suppressed (BROWSER=true) — open the device page ONCE, instantly, the moment the code lands.
+  // open the device page ONCE, instantly, the moment the code arrives from GitHub.
   window.fleet.onDeviceCode((code) => {
-    ghCode.textContent = code;
+    currentCode = code; ghCode.textContent = code;
     if (!ghOpened) { ghOpened = true; window.fleet.openExternal(GH_DEVICE_URL); }
     ghSetStatus('Browser opened — enter this code to authorize.');
   });
+  const ghCopyBtn = document.getElementById('ghCopy');
+  ghCopyBtn.onclick = () => {
+    if (!currentCode) return;
+    window.fleet.copyText(currentCode);
+    ghCopyBtn.classList.add('copied');
+    ghSetStatus('Code copied — paste it on the GitHub page.');
+    setTimeout(() => ghCopyBtn.classList.remove('copied'), 1200);
+  };
   document.getElementById('ghOpen').onclick = () => window.fleet.openExternal(GH_DEVICE_URL);
   document.getElementById('ghCancel').onclick = () => { window.fleet.ghConnectCancel(); ghModal.classList.remove('show'); };
   function connectAccount() {
-    ghOpened = false;   // allow a fresh auto-open for this attempt
+    ghOpened = false; currentCode = '';   // fresh attempt
     ghCode.textContent = '· · · ·'; ghSetStatus('Starting GitHub sign-in…'); ghModal.classList.add('show');
     window.fleet.ghConnect().then((r) => {
       if (r && r.ok) { ghModal.classList.remove('show'); loadAccounts(); }

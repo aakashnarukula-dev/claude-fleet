@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('fleet', {
   ghDisconnect: (account) => ipcRenderer.invoke('gh-disconnect', account),
   onDeviceCode: (cb) => ipcRenderer.on('gh-device-code', (_e, code) => cb(code)),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  copyText: (text) => ipcRenderer.invoke('clipboard-write', text),
   listAccountRepos: (account) => ipcRenderer.invoke('list-account-repos', account),
   setActiveSession: (sid) => ipcRenderer.send('active-session', sid),   // which tab is currently VISIBLE in this window (null = none) — gates notification suppression
   closeSession: (sid) => ipcRenderer.send('close-session', sid),
