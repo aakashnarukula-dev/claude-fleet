@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { --bg:#0a0b0d; --panel:#121419; --line:#23262e; --fg:#e8e6e3; --muted:#8b8f98; --accent:#d97757; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:13px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif; -webkit-user-select:none; }
+  .drag { height:38px; -webkit-app-region:drag; }
+  .wrap { padding:6px 28px 28px; }
+  h1 { font-size:22px; font-weight:650; margin:0 0 2px; letter-spacing:-.2px; }
+  .sub { color:var(--muted); margin:0 0 22px; }
+  .label { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:18px 0 8px; }
+  .modes { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+  .modes button { -webkit-app-region:no-drag; cursor:pointer; padding:11px 0; border-radius:9px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:13px; font-weight:600; transition:.12s; }
+  .modes button:hover { border-color:#3a3e48; }
+  .modes button.on { color:#fff; }
+  .modeDesc { color:var(--muted); font-size:12px; line-height:1.45; margin-top:8px; }
+  .proj { display:flex; align-items:center; gap:10px; }
+  .pickbtn { -webkit-app-region:no-drag; cursor:pointer; flex:none; padding:9px 14px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:12px; font-weight:600; }
+  .pickbtn:hover { border-color:#3a3e48; }
+  .pickbtn.on { border-color:var(--accent); color:#fff; background:rgba(217,119,87,.18); }
+  .projpath { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; font-size:12px; color:var(--muted); }
+  .projpath.set { color:var(--fg); }
+  .recent { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .chip { -webkit-app-region:no-drag; cursor:pointer; max-width:200px; padding:5px 10px; border-radius:7px; border:1px solid var(--line); background:var(--panel); color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chip:hover { border-color:#3a3e48; color:var(--fg); }
+  .chip.on { border-color:var(--accent); color:var(--fg); }
+  .sel { -webkit-app-region:no-drag; width:100%; padding:9px 12px; border-radius:8px; border:1px solid var(--line); background:#0d0f13; color:var(--fg); font-size:13px; outline:none; cursor:pointer; }
+  .sel:focus { border-color:var(--accent); }
+  .counts { display:grid; grid-template-columns:repeat(9,1fr); gap:6px; }
+  .counts button { -webkit-app-region:no-drag; cursor:pointer; padding:10px 0; border-radius:9px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:14px; font-weight:600; }
+  .counts button:hover { border-color:#3a3e48; }
+  .counts button.on { background:var(--accent); border-color:var(--accent); color:#1a0f0a; }
+  .heads { display:flex; flex-direction:column; gap:8px; }
+  .hrow { display:flex; align-items:center; gap:10px; }
+  .tag { width:54px; font-size:11px; color:var(--muted); flex:none; text-align:right; }
+  .heads input { -webkit-app-region:no-drag; -webkit-user-select:text; flex:1; padding:9px 12px; border-radius:8px; border:1px solid var(--line); background:#0d0f13; color:var(--fg); font-size:13px; outline:none; }
+  .heads input:focus { border-color:var(--accent); }
+  .warn { margin-top:14px; font-size:12px; line-height:1.45; color:#e0a86b; }
+  .go { -webkit-app-region:no-drag; margin-top:24px; width:100%; padding:12px; border:none; border-radius:10px;
+    background:var(--accent); color:#1a0f0a; font-size:14px; font-weight:700; cursor:pointer; }
+  .go:disabled { opacity:.5; cursor:default; }
+  .err { color:#ff6b61; margin-top:12px; min-height:16px; font-size:12px; white-space:pre-wrap; }
+  .auton { -webkit-app-region:no-drag; display:flex; align-items:flex-start; gap:9px; margin-top:20px; cursor:pointer; }
+  .auton input { margin:2px 0 0; accent-color:var(--accent); width:15px; height:15px; flex:none; }
+  .auton span { color:var(--muted); font-size:12px; line-height:1.4; }
+  .burst { width:30px; height:30px; vertical-align:-7px; margin-right:10px; }
+  .acct { display:inline-flex; align-items:center; gap:5px; padding-right:4px; }
+  .acct > span { cursor:pointer; }
+  .acctx { -webkit-app-region:no-drag; cursor:pointer; border:none; background:transparent; color:var(--muted); font-size:14px; line-height:1; padding:0 2px; border-radius:4px; }
+  .acctx:hover { color:#ff6b61; background:rgba(255,107,97,.12); }
+  .acct-add { border-style:dashed; color:var(--muted); }
+  .acct-add:hover { color:var(--fg); }
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:50; -webkit-app-region:no-drag; }
+  .modal-bg.show { display:flex; }
+  .modal { width:330px; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px; text-align:center; }
+  .modal h2 { font-size:15px; margin:0 0 6px; }
+  .modal p { color:var(--muted); font-size:12px; margin:0 0 14px; line-height:1.45; }
+  .modal p b { color:var(--fg); }
+  .code { font:600 27px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing:3px; color:#fff; background:#0d0f13; border:1px solid var(--line); border-radius:10px; padding:15px; margin-bottom:10px; user-select:text; -webkit-user-select:text; }
+  .dstatus { font-size:11px; margin-bottom:14px; min-height:14px; color:var(--muted); }
+  .modal .row { display:flex; gap:8px; }
+  .modal .row button { -webkit-app-region:no-drag; cursor:pointer; flex:1; padding:9px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--fg); font-size:12px; font-weight:600; }
+  .modal .row button.primary { background:var(--accent); color:#1a0f0a; border-color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="drag"></div>
+<div class="wrap">
+  <h1><svg class="burst" id="burst" viewBox="0 0 100 100"></svg>Claude Fleet</h1>
+  <p class="sub">Pick a project — a local folder or a GitHub repo. One orchestrator splits your goal across worker terminals, integrates, and pushes.</p>
+
+  <div class="label">Project folder</div>
+  <div class="proj">
+    <button class="pickbtn" id="pickBtn">Choose folder…</button>
+    <button class="pickbtn" id="newProjBtn" title="Launch with no folder — tell Claude what to build and it sets up the project for you.">New project</button>
+    <span class="projpath" id="projPath">No folder selected</span>
+  </div>
+  <div class="recent" id="recent"></div>
+
+  <div class="label">…or a GitHub repo</div>
+  <div class="recent" id="accts"></div>
+  <select class="sel" id="repoSel"><option>Pick an account…</option></select>
+
+  <label class="auton"><input type="checkbox" id="useOrch" checked />
+    <span><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly (each works its own area and pushes itself).</span></label>
+
+  <div id="gridCfg" style="display:none">
+    <div class="label">How many panes? <span style="text-transform:none;letter-spacing:0;color:var(--muted)">— each is a worker you task directly, max 9</span></div>
+    <div class="counts" id="counts"></div>
+    <div class="label">Pane names <span style="text-transform:none;letter-spacing:0;color:var(--muted)">— each owns its area and pushes to the default branch itself</span></div>
+    <div class="heads" id="heads"></div>
+  </div>
+
+  <label class="auton"><input type="checkbox" id="auton" checked />
+    <span>Autonomous (scoped) — auto-approve the fleet's safe verbs: edits, git add/commit/merge, and push to the project branch. rm, curl &amp; anything else still ask.</span></label>
+
+  <button class="go" id="go" disabled>Launch fleet</button>
+  <div class="err" id="err"></div>
+</div>
+
+<div class="modal-bg" id="ghModal">
+  <div class="modal">
+    <h2>Connect GitHub account</h2>
+    <p>A browser will open to <b>github.com/login/device</b>. Enter this one-time code to authorize:</p>
+    <div class="code" id="ghCode">· · · ·</div>
+    <div class="dstatus" id="ghStatus">Starting…</div>
+    <div class="row">
+      <button id="ghOpen" class="primary">Open page</button>
+      <button id="ghCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+<script>
+  // draw the Claude burst logo
+  (function () {
+    const svg = document.getElementById('burst'); if (!svg) return;
+    const cx = 50, cy = 50, R = 42, ns = 'http://www.w3.org/2000/svg';
+    const factors = [1.0, 0.74, 0.93, 0.78, 1.0, 0.72, 0.96, 0.80, 1.0, 0.76, 0.90, 0.73];
+    factors.forEach((f, i) => {
+      const a = (i * 30 - 90) * Math.PI / 180, L = R * f;
+      const ln = document.createElementNS(ns, 'line');
+      ln.setAttribute('x1', cx); ln.setAttribute('y1', cy);
+      ln.setAttribute('x2', (cx + L * Math.cos(a)).toFixed(2)); ln.setAttribute('y2', (cy + L * Math.sin(a)).toFixed(2));
+      ln.setAttribute('stroke', '#d97757'); ln.setAttribute('stroke-width', '8'); ln.setAttribute('stroke-linecap', 'round');
+      svg.appendChild(ln);
+    });
+  })();
+
+  const goEl = document.getElementById('go');
+  const errEl = document.getElementById('err');
+  const projPath = document.getElementById('projPath');
+  const recentEl = document.getElementById('recent');
+  const acctsEl = document.getElementById('accts');
+  const repoSel = document.getElementById('repoSel');
+  const useOrchEl = document.getElementById('useOrch');
+  const newProjBtn = document.getElementById('newProjBtn');
+  const gridCfg = document.getElementById('gridCfg');
+  const countsEl = document.getElementById('counts');
+  const headsEl = document.getElementById('heads');
+  let repo = '', repoNWO = '', repoBranch = 'main', account = '', count = 3, newProject = false; const repoCache = {};
+  let accounts = [];
+
+  function fit() { requestAnimationFrame(() => window.fleet.resizeWindow(document.querySelector('.wrap').getBoundingClientRect().bottom + 8)); }
+  function refreshGo() { goEl.disabled = !(repo || repoNWO || newProject); }
+
+  // --- new project (no folder): boot the orchestrator in a scratch repo; Claude names + sets up the project ---
+  function setNewProject(on) {
+    newProject = !!on;
+    newProjBtn.classList.toggle('on', newProject);
+    if (newProject) {                              // mutually exclusive with a folder OR a GitHub repo
+      repo = ''; clearGithub();
+      projPath.textContent = 'New project — Claude will create the folder'; projPath.classList.add('set');
+      useOrchEl.checked = true; syncOrch();        // new project always uses the orchestrator
+    } else if (!repo && !repoNWO) {
+      projPath.textContent = 'No folder selected'; projPath.classList.remove('set');
+    }
+    refreshGo(); renderRecent();
+  }
+
+  // --- local folder + recents ---
+  function setRepo(p) {
+    repo = p || '';
+    if (repo) newProject = false;                  // picking a folder clears new-project (and vice-versa)
+    projPath.textContent = repo || 'No folder selected'; projPath.classList.toggle('set', !!repo);
+    if (repo) { clearGithub(); newProjBtn.classList.remove('on'); }   // a local folder and a GitHub repo are mutually exclusive
+    refreshGo(); renderRecent();
+  }
+  function recents() { try { return JSON.parse(localStorage.getItem('cfleet.recent') || '[]'); } catch (_) { return []; } }
+  function pushRecent(p) { const r = [p, ...recents().filter((x) => x !== p)].slice(0, 6); localStorage.setItem('cfleet.recent', JSON.stringify(r)); }
+  function renderRecent() {
+    const r = recents(); recentEl.innerHTML = '';
+    r.forEach((p) => { const c = document.createElement('div'); c.className = 'chip' + (p === repo ? ' on' : ''); c.textContent = p.replace(/\/$/, '').split('/').pop(); c.title = p; c.onclick = () => setRepo(p); recentEl.appendChild(c); });
+    fit();
+  }
+  document.getElementById('pickBtn').onclick = async () => { const p = await window.fleet.pickFolder(); if (p) setRepo(p); };
+  newProjBtn.onclick = () => setNewProject(!newProject);
+
+  // --- GitHub accounts (gh multi-account): connect / disconnect, then account → repo picker ---
+  async function loadAccounts() {
+    let r; try { r = await window.fleet.ghAccounts(); } catch (_) { r = null; }
+    accounts = (r && r.accounts) || [];
+    renderAccounts();
+  }
+  function renderAccounts() {
+    acctsEl.innerHTML = '';
+    accounts.forEach((a) => {
+      const c = document.createElement('div'); c.className = 'chip acct' + (a.user === account ? ' on' : ''); c.dataset.id = a.user;
+      c.title = a.user + (a.active ? '  · active' : '');
+      const nm = document.createElement('span'); nm.textContent = a.user; nm.onclick = () => setAccount(a.user);
+      const x = document.createElement('button'); x.className = 'acctx'; x.textContent = '×'; x.title = 'Disconnect ' + a.user;
+      x.onclick = (e) => { e.stopPropagation(); disconnectAccount(a.user); };
+      c.appendChild(nm); c.appendChild(x); acctsEl.appendChild(c);
+    });
+    const add = document.createElement('div'); add.className = 'chip acct-add';
+    add.textContent = accounts.length ? '+ Connect account' : '+ Connect a GitHub account';
+    add.onclick = connectAccount; acctsEl.appendChild(add);
+    fit();
+  }
+  async function disconnectAccount(user) {
+    if (!window.confirm('Disconnect GitHub account "' + user + '"?')) return;
+    const r = await window.fleet.ghDisconnect(user);
+    if (r && r.error) { errEl.textContent = 'Disconnect failed: ' + r.error; return; }
+    if (account === user) clearGithub();
+    delete repoCache[user];
+    loadAccounts();
+  }
+  // device-code connect modal
+  const ghModal = document.getElementById('ghModal'), ghCode = document.getElementById('ghCode'), ghStatus = document.getElementById('ghStatus');
+  function ghSetStatus(t, err) { ghStatus.textContent = t; ghStatus.style.color = err ? '#ff6b61' : ''; }
+  window.fleet.onDeviceCode((code) => { ghCode.textContent = code; ghSetStatus('A browser is opening — enter this code to authorize.'); });
+  document.getElementById('ghOpen').onclick = () => window.fleet.openExternal('https://github.com/login/device');
+  document.getElementById('ghCancel').onclick = () => { window.fleet.ghConnectCancel(); ghModal.classList.remove('show'); };
+  function connectAccount() {
+    ghCode.textContent = '· · · ·'; ghSetStatus('Starting GitHub sign-in…'); ghModal.classList.add('show');
+    window.fleet.ghConnect().then((r) => {
+      if (r && r.ok) { ghModal.classList.remove('show'); loadAccounts(); }
+      else { ghSetStatus('Failed: ' + ((r && r.error) || 'unknown') + '. Is the GitHub CLI (gh) installed?', true); }
+    });
+  }
+  function clearGithub() { account = ''; repoNWO = ''; [...acctsEl.children].forEach((c) => c.classList.remove('on')); repoSel.innerHTML = '<option>Pick an account…</option>'; repoSel.disabled = false; }
+  function setAccount(id) {
+    account = id; repo = ''; newProject = false; newProjBtn.classList.remove('on');   // choosing GitHub clears the local folder + new-project
+    projPath.textContent = 'No folder selected'; projPath.classList.remove('set');
+    [...acctsEl.children].forEach((c) => c.classList.toggle('on', c.dataset.id === id));
+    renderRecent(); loadRepos(id);
+  }
+  async function loadRepos(acct) {
+    repoNWO = ''; refreshGo();
+    if (repoCache[acct]) return fillRepos(repoCache[acct], acct);
+    repoSel.innerHTML = '<option>Loading repos…</option>'; repoSel.disabled = true; fit();
+    const res = await window.fleet.listAccountRepos(acct);
+    if (account !== acct) return;   // user switched account while loading
+    if (!res || res.error) { repoSel.innerHTML = '<option>' + (res && res.error ? 'error: ' + res.error : 'no repos') + '</option>'; repoSel.disabled = true; fit(); return; }
+    repoCache[acct] = res.repos || []; fillRepos(repoCache[acct], acct);
+  }
+  function fillRepos(repos, acct) {
+    repoSel.disabled = false; repoSel.innerHTML = '';
+    if (!repos.length) { repoSel.innerHTML = '<option>no repos found</option>'; repoSel.disabled = true; fit(); return; }
+    repos.forEach((r) => { const o = document.createElement('option'); o.value = r.nameWithOwner; o.dataset.branch = r.defaultBranch || 'main'; o.textContent = r.name + (String(r.visibility || '').toLowerCase() === 'private' ? '  · private' : ''); repoSel.appendChild(o); });
+    const def = repoSel.options[0];
+    repoSel.value = def.value; selectRepo(); fit();
+  }
+  function selectRepo() { const o = repoSel.selectedOptions[0]; repoNWO = (o && o.value) || ''; repoBranch = (o && o.dataset.branch) || 'main'; refreshGo(); }
+  repoSel.onchange = selectRepo;
+
+  // --- orchestrator toggle + (when off) named worker panes: count + names ---
+  for (let i = 1; i <= 9; i++) { const b = document.createElement('button'); b.textContent = i; b.onclick = () => { count = i; renderGrids(); }; countsEl.appendChild(b); }
+  function renderGrids() {
+    [...countsEl.children].forEach((b, i) => b.classList.toggle('on', i + 1 === count));
+    const prev = {}; [...headsEl.querySelectorAll('input')].forEach((inp) => prev[inp.dataset.i] = inp.value);
+    headsEl.innerHTML = '';
+    for (let i = 0; i < count; i++) {
+      const row = document.createElement('div'); row.className = 'hrow';
+      const tag = document.createElement('div'); tag.className = 'tag'; tag.textContent = 'Pane ' + (i + 1);
+      const inp = document.createElement('input'); inp.dataset.i = i;
+      inp.value = prev[i] !== undefined ? prev[i] : '';
+      inp.placeholder = ['Frontend', 'Backend', 'API', 'Database', 'Auth', 'Tests', 'Docs', 'CI/CD', 'UI'][i] || ('area ' + (i + 1));
+      row.appendChild(tag); row.appendChild(inp); headsEl.appendChild(row);
+    }
+    fit();
+  }
+  function syncOrch() {
+    const on = useOrchEl.checked;
+    if (!on && newProject) setNewProject(false);   // named-pane mode can't be a scratch new-project; clear it
+    gridCfg.style.display = on ? 'none' : '';
+    goEl.textContent = on ? 'Launch fleet' : 'Launch panes';
+    if (!on) renderGrids(); else fit();
+  }
+  useOrchEl.onchange = syncOrch;
+
+  goEl.onclick = async () => {
+    errEl.textContent = '';
+    if (!(repo || repoNWO || newProject)) return;
+    let payload;
+    if (newProject) {   // no folder/repo — orchestrator boots in a scratch repo, retargets once Claude names the project
+      payload = { newProject: true, orchestrator: true, autonomous: document.getElementById('auton').checked };
+      goEl.disabled = true; goEl.textContent = 'Setting up…';
+      const res = await window.fleet.launch(payload);
+      if (!(res && res.ok)) { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; syncOrch(); }
+      return;
+    }
+    const base = repoNWO ? { nameWithOwner: repoNWO, defaultBranch: repoBranch, account } : { repo };
+    if (useOrchEl.checked) {
+      payload = Object.assign({ autonomous: document.getElementById('auton').checked, orchestrator: true }, base);
+    } else {
+      const names = [...headsEl.querySelectorAll('input')].map((inp) => inp.value.trim() || inp.placeholder);   // blank → placeholder
+      payload = Object.assign({ orchestrator: false, count, names }, base);
+    }
+    goEl.disabled = true; goEl.textContent = 'Setting up…';
+    const res = await window.fleet.launch(payload);
+    if (res && res.ok) { if (repo) pushRecent(repo); }
+    else { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; syncOrch(); }
+  };
+
+  renderRecent(); syncOrch(); loadAccounts(); fit();
+</script>
+</body>
+</html>

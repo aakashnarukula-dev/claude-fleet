@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# claude-fleet rebuild hook for Claude Fleet (an Electron app with NO origin remote).
+#
+# Runs (via `bash`) AFTER the orchestrator integrates a batch, with cwd = the _main
+# worktree and CLAUDE_FLEET_BUILD_DIR pointing at it. Its job: push the freshly
+# integrated code into the LIVE checkout (the worktree that has the default branch
+# checked out — the one you run `npm start` from) so your next app launch runs it.
+#
+# SAFETY:
+#  - Never touches the live checkout if it has uncommitted changes (would clobber
+#    your in-progress edits). It just tells you and exits 0.
+#  - Only fast-forwards (never force/rebase), so it can only ever ADD the integrated
+#    commits on top of what's already there.
+#  - Never kills your running app/session. Renderer changes appear on a fresh
+#    session; main-process / native changes need an app restart.
+set -euo pipefail
+
+BDIR="${CLAUDE_FLEET_BUILD_DIR:-$PWD}"
+HEADSHA="$(git -C "$BDIR" rev-parse HEAD)"
+
+# default branch (no origin here, so this resolves to the current branch / main)
+DBR="$(git -C "$BDIR" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
+[ -n "$DBR" ] || DBR=main
+
+# find the worktree that has $DBR checked out — that's the live checkout
+PRIMARY="$(git -C "$BDIR" worktree list --porcelain | awk -v b="refs/heads/$DBR" '
+  /^worktree /{wt=substr($0,10)} $0=="branch "b{print wt; exit}')"
+if [ -z "$PRIMARY" ]; then
+  echo "rebuild: no worktree has '$DBR' checked out — nothing to sync into. (Integrated state is in $BDIR.)"
+  exit 0
+fi
+
+# refuse to sync over uncommitted work
+if ! git -C "$PRIMARY" diff --quiet || ! git -C "$PRIMARY" diff --cached --quiet; then
+  echo "rebuild: live checkout '$PRIMARY' has uncommitted changes — NOT syncing (would clobber your edits)."
+  echo "rebuild: commit or stash there, then re-run: claude-fleet --rebuild"
+  exit 0
+fi
+
+PREV="$(git -C "$PRIMARY" rev-parse HEAD)"
+if [ "$PREV" = "$HEADSHA" ]; then
+  echo "rebuild: live checkout already at integrated tip ($(git -C "$BDIR" rev-parse --short HEAD)) — nothing to do."
+  exit 0
+fi
+
+if git -C "$PRIMARY" merge --ff-only "$HEADSHA" >/dev/null 2>&1; then
+  echo "rebuild: fast-forwarded '$DBR' in $PRIMARY → $(git -C "$BDIR" rev-parse --short HEAD)."
+else
+  echo "rebuild: '$DBR' in $PRIMARY could not fast-forward to the integrated tip (diverged). Skipping; reconcile manually."
+  exit 0
+fi
+
+# if dependencies changed, the node-pty native module may need a rebuild against Electron's ABI
+if ! git -C "$PRIMARY" diff --quiet "$PREV" "$HEADSHA" -- package-lock.json package.json; then
+  echo "rebuild: package manifest changed — rebuilding node-pty (npm run rebuild)…"
+  ( cd "$PRIMARY" && npm run rebuild ) || echo "rebuild: 'npm run rebuild' failed — run it manually if the app can't load node-pty."
+fi
+
+# We only get here when the live checkout ACTUALLY advanced (PREV != HEADSHA — the
+# no-op/already-at-tip path exits early above). Repackage the app (npm run dist) and
+# reinstall it into the INSTALLED location, so the user's double-clicked .app isn't
+# stale. NON-FATAL: a dist/install failure must never abort integration, so the whole
+# thing is wrapped in a function that always returns 0 (set -e would otherwise kill us).
+INSTALL_DEST=""
+repackage_and_install() {
+  echo "rebuild: repackaging the installed app (npm run dist) in $PRIMARY..."
+  ( cd "$PRIMARY" && npm run dist ) || { echo "rebuild: 'npm run dist' failed — installed app NOT refreshed (run 'npm run dist' manually)."; return 0; }
+
+  # find the freshly built bundle (the subdir is arch-dependent → glob, with a fallback)
+  local app="" cand
+  for cand in "$PRIMARY"/dist/*/"Claude Fleet.app" "$PRIMARY"/dist/"Claude Fleet.app"; do
+    if [ -d "$cand" ]; then app="$cand"; break; fi
+  done
+  if [ -z "$app" ]; then
+    echo "rebuild: built, but no 'Claude Fleet.app' found under $PRIMARY/dist — installed app NOT refreshed."
+    return 0
+  fi
+
+  # detect where the app is installed; prefer ~/Applications, else /Applications, else default
+  local dest
+  if [ -d "$HOME/Applications/Claude Fleet.app" ]; then
+    dest="$HOME/Applications/Claude Fleet.app"
+  elif [ -d "/Applications/Claude Fleet.app" ]; then
+    dest="/Applications/Claude Fleet.app"
+  else
+    dest="$HOME/Applications/Claude Fleet.app"
+  fi
+
+  # replace the bundle safely even if the app is running (macOS keeps the in-memory copy;
+  # the user picks up the new code on next launch). ditto if available, else cp -R.
+  mkdir -p "$(dirname "$dest")"
+  rm -rf "$dest"
+  if command -v ditto >/dev/null 2>&1; then
+    ditto "$app" "$dest" || { echo "rebuild: failed to install bundle to '$dest' — installed app NOT refreshed."; return 0; }
+  else
+    cp -R "$app" "$dest" || { echo "rebuild: failed to install bundle to '$dest' — installed app NOT refreshed."; return 0; }
+  fi
+  INSTALL_DEST="$dest"
+  echo "rebuild: reinstalled '$dest' from the freshly built bundle."
+}
+repackage_and_install
+
+if [ -n "$INSTALL_DEST" ]; then
+  echo "rebuild: installed app refreshed → '$INSTALL_DEST'. QUIT and REOPEN it to run the new main-process code (renderer changes also need a fresh session)."
+else
+  echo "rebuild: live code updated. Renderer changes show on a NEW session; restart the app for main-process changes."
+fi

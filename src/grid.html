@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="vendor/xterm.css" />
+<style>
+  :root { --bg:#141518; --bar:#1b1d21; --line:#262931; --fg:#ffffff; --muted:#9aa0aa; --accent:#ff8a5c; --tabbar:#0c0d10; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:#000; overflow:hidden; font:13px -apple-system, system-ui, sans-serif; -webkit-user-select:none; color:var(--fg); }
+  #tabbar { height:38px; -webkit-app-region:drag; background:var(--tabbar); display:flex; align-items:flex-end; padding:0 8px 0 80px; gap:4px; border-bottom:1px solid var(--line); }
+  .tab { -webkit-app-region:no-drag; display:flex; align-items:center; gap:8px; height:30px; padding:0 10px 0 13px; border-radius:8px 8px 0 0;
+    background:#16181c; color:var(--muted); font-size:12px; font-weight:600; cursor:pointer; max-width:200px; }
+  .tab.active { color:#fff; }   /* background set inline to the session's mode color in activate() */
+  .tab .pdot { display:none; width:7px; height:7px; border-radius:50%; flex:none; }
+  .tab.st-idle .pdot { display:inline-block; background:#e0a86b; }
+  .tab.st-failed .pdot { display:inline-block; background:#ff5c57; }
+  .tab.st-permission .pdot { display:inline-block; background:var(--accent); animation:permpulse 1.2s ease-in-out infinite; }   /* most-urgent state across the tab's panes */
+  .tab .x { width:16px; height:16px; border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:14px; color:var(--muted); }
+  .tab.active .x { color:rgba(255,255,255,0.85); }
+  .tab .x:hover { background:rgba(255,255,255,0.18); color:#fff; }
+  .tab.dragging { opacity:.45; }   /* tab being torn off / reordered */
+  /* drop-target: another window's tab bar lights up while a tab is dragged over it (re-dock target) */
+  #tabbar.drop-target { box-shadow: inset 0 -3px 0 0 var(--accent); background:#13161b; }
+  #newtab { -webkit-app-region:no-drag; width:28px; height:28px; border:none; border-radius:7px; background:transparent; color:var(--muted); font-size:18px; cursor:pointer; }
+  #newtab:hover { background:#16181c; color:#fff; }
+  #addgrid { -webkit-app-region:no-drag; display:none; align-self:center; height:28px; margin-left:6px; padding:0 12px; border:1px solid #3a2a20; border-radius:7px; background:#241712; color:var(--accent); font-size:12px; font-weight:700; cursor:pointer; }
+  #addgrid:hover { background:#2e1c14; border-color:var(--accent); }
+  #addgrid:disabled { opacity:.5; cursor:default; }
+  /* lightweight name prompt (Electron disables window.prompt) */
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:60; display:none; align-items:center; justify-content:center; -webkit-app-region:no-drag; }
+  #modal.show { display:flex; }
+  #modalbox { width:340px; background:#16181c; border:1px solid var(--line); border-radius:12px; padding:18px; box-shadow:0 18px 50px rgba(0,0,0,.5); }
+  #modaltitle { font-size:13px; font-weight:700; color:#fff; margin-bottom:12px; }
+  #modalinput { width:100%; padding:9px 11px; border-radius:8px; border:1px solid var(--line); background:#0c0d10; color:var(--fg); font-size:13px; outline:none; }
+  #modalinput:focus { border-color:var(--accent); }
+  #modalbtns { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
+  #modalbtns button { padding:7px 14px; border-radius:8px; border:1px solid var(--line); background:transparent; color:var(--fg); font-size:12px; font-weight:600; cursor:pointer; }
+  #modalok { background:var(--accent); color:#1a0f0a; border-color:var(--accent); }
+  #sessions { position:absolute; top:38px; left:0; right:0; bottom:0; }
+  #sessions.pushed { left:250px; }   /* Files sidebar pushes the grid instead of overlaying it */
+  #sessions.editing { left:var(--edsplit, 50%); }   /* editor sits between sidebar and terminals; terminals fill the right */
+  #edsplit { position:absolute; top:38px; bottom:0; left:var(--edsplit, 50%); width:6px; margin-left:-3px; z-index:22; cursor:col-resize; display:none; }
+  #edsplit.show { display:block; }
+  #edsplit::before { content:''; position:absolute; left:2px; top:0; bottom:0; width:1px; background:var(--line); }
+  #edsplit:hover::before { background:var(--accent); }
+  .session { position:absolute; inset:0; display:none; }
+  .session.active { display:block; }
+  .grid { position:absolute; inset:0; display:flex; flex-direction:column; background:var(--line); }
+  .row { display:flex; flex-direction:row; min-width:0; min-height:0; }
+  .pane { display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; background:var(--bg); }
+  .pbar { -webkit-app-region:no-drag; display:flex; align-items:center; gap:8px; padding:6px 8px 6px 12px; border-bottom:1px solid var(--line); font-size:12px; font-weight:600; flex:none; color:#fff; background:var(--bar); }
+  .pbar .ptitle { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pbar.orchestrator .ptitle { color:#e8915f; }   /* role shown by TEXT colour now, not a filled bar */
+  .pbar.worker .ptitle { color:#7aa2e3; }
+  /* per-pane status dot: a dot means "wants your attention"; working = no dot (clean) */
+  .pbar .pdot { display:none; width:8px; height:8px; border-radius:50%; flex:none; }
+  .pbar.st-idle .pdot { display:block; background:#e0a86b; }                 /* amber: idle / ready for next instruction */
+  .pbar.st-failed .pdot { display:block; background:#ff5c57; }               /* red: failed */
+  .pbar.st-permission .pdot { display:block; background:var(--accent); animation:permpulse 1.2s ease-in-out infinite; }
+  @keyframes permpulse { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+  .pbar .pclose { flex:none; width:18px; height:18px; border-radius:5px; display:flex; align-items:center; justify-content:center; font-size:16px; line-height:1; color:rgba(255,255,255,0.78); cursor:pointer; }
+  .pbar .pclose:hover { background:rgba(255,255,255,0.22); color:#fff; }
+  .term { flex:1; min-height:0; padding:6px 8px; overflow:hidden; }   /* clip the terminal when its pane shrinks (no reflow) */
+  .xterm { height:100%; }
+  /* dividers: thin line + a wider invisible hit area (::after). Vertical dividers live INSIDE a row, so each
+     row resizes its own panes; horizontal dividers sit between rows. No divider spans the whole grid. */
+  .vgutter, .hgutter { flex:none; position:relative; background:var(--line); z-index:6; }
+  .vgutter { width:1px; cursor:col-resize; }
+  .hgutter { height:1px; cursor:row-resize; }
+  .vgutter::after { content:''; position:absolute; top:0; bottom:0; left:-4px; right:-4px; }
+  .hgutter::after { content:''; position:absolute; left:0; right:0; top:-4px; bottom:-4px; }
+  .vgutter:hover, .hgutter:hover { background:var(--accent); }
+  /* file manager + editor */
+  #filesbtn { -webkit-app-region:no-drag; width:32px; height:30px; margin-right:6px; padding:0; border:none; border-radius:7px; background:transparent; color:var(--muted); font-size:15px; cursor:pointer; align-self:center; }
+  #filesbtn:hover, #filesbtn.on { background:#16181c; color:#fff; }
+  #filepanel { position:absolute; top:38px; left:0; bottom:0; width:250px; background:#0c0d10; border-right:1px solid var(--line); z-index:20; display:none; flex-direction:column; }
+  #filepanel.open { display:flex; }
+  #filesbtn svg { display:block; margin:0 auto; }
+  #rootsel { -webkit-app-region:no-drag; margin:8px 8px; padding:6px 8px; border-radius:7px; border:1px solid var(--line); background:#16181c; color:var(--fg); font-size:12px; }
+  #filetree { flex:1; overflow:auto; padding:2px 6px 12px; font-size:12.5px; }
+  #filesearch { -webkit-app-region:no-drag; -webkit-user-select:text; margin:0 8px 8px; padding:6px 9px; border-radius:7px; border:1px solid var(--line); background:#16181c; color:var(--fg); font-size:12px; outline:none; }
+  #filesearch:focus { border-color:var(--accent); }
+  #fileresults { display:none; flex:1; overflow:auto; padding:2px 6px 12px; }
+  #fileresults.show { display:block; }
+  #filepanel.searching #filetree { display:none; }
+  .fres { padding:5px 7px; border-radius:5px; cursor:pointer; }
+  .fres:hover { background:#16181c; }
+  .fres .ff { color:var(--muted); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .fres .fl { font-family:'SF Mono', Menlo, monospace; font-size:11.5px; white-space:pre; overflow:hidden; text-overflow:ellipsis; }
+  .fres .lno { color:var(--muted); margin-right:7px; }
+  .fres mark { background:rgba(255,138,92,0.35); color:#fff; border-radius:2px; }
+  .fhint { color:var(--muted); padding:6px 8px; font-size:12px; }
+  .fitem { display:flex; align-items:center; gap:5px; padding:3px 6px; border-radius:5px; cursor:pointer; color:var(--fg); white-space:nowrap; }
+  .fitem:hover { background:#16181c; }
+  .fitem.sel { background:#1f2937; }
+  .fitem .tw { width:11px; color:var(--muted); flex:none; text-align:center; font-size:10px; }
+  .fitem .ic { flex:none; opacity:.7; }
+  .fchildren { margin-left:11px; }
+  #editor { position:absolute; top:38px; left:250px; right:calc(100% - var(--edsplit, 50%)); bottom:0; z-index:19; background:var(--bg); display:none; flex-direction:column; }
+  #editor.open { display:flex; }
+  #edbar { display:flex; align-items:center; gap:8px; padding:6px 10px; background:var(--bar); border-bottom:1px solid var(--line); font-size:12px; flex:none; }
+  #edpath { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--fg); font-weight:600; }
+  #edbar button { -webkit-app-region:no-drag; padding:5px 12px; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--fg); font-size:12px; font-weight:600; cursor:pointer; }
+  #edbar button:hover { border-color:#3a3e48; }
+  #edsave { background:var(--accent); color:#1a0f0a; border-color:var(--accent); }
+  #edsave:disabled { opacity:.45; }
+  #monaco { flex:1; min-height:0; }
+  /* in-app permission QUEUE — concurrent prompts stack as a dismissible LIST (no longer hide each other) */
+  #permqueue { position:fixed; right:14px; bottom:14px; z-index:70; width:312px; max-height:70vh; overflow-y:auto; display:none; flex-direction:column; gap:8px; -webkit-app-region:no-drag; }
+  #permqueue.show { display:flex; }
+  #permhdr { font-size:11px; font-weight:700; color:var(--muted, #8a8f98); text-transform:uppercase; letter-spacing:.04em; padding:0 2px; }
+  #permlist { display:flex; flex-direction:column; gap:8px; }
+  .permcard { background:#16181c; border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:10px; padding:11px 12px; box-shadow:0 12px 34px rgba(0,0,0,.45); }
+  .permcard .pc-name { font-size:12px; font-weight:700; color:#fff; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .permcard .pc-sub { font-size:11px; color:var(--muted, #8a8f98); margin-top:2px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .permcard .pc-btns { display:flex; gap:6px; margin-top:10px; flex-wrap:wrap; }
+  .permcard .pc-btns button { -webkit-app-region:no-drag; padding:5px 11px; border-radius:7px; border:1px solid var(--line); background:transparent; color:var(--fg); font-size:11px; font-weight:600; cursor:pointer; }
+  .permcard .pc-btns button:hover { border-color:#3a3e48; }
+  .permcard .pc-btns button.pc-yes { background:var(--accent); color:#1a0f0a; border-color:var(--accent); }
+</style>
+</head>
+<body>
+<div id="tabbar"><button id="filesbtn" title="Browse + edit files"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><div id="tabs" style="display:flex; align-items:flex-end; gap:4px;"></div><button id="newtab" title="New session">+</button><button id="addgrid" title="Add a worker pane to this grid session">+ Pane</button></div>
+<div id="modal"><div id="modalbox"><div id="modaltitle"></div><input id="modalinput" autocomplete="off" spellcheck="false" /><div id="modalbtns"><button id="modalcancel">Cancel</button><button id="modalok">Add</button></div></div></div>
+<div id="sessions"></div>
+<div id="filepanel"><select id="rootsel"></select><input id="filesearch" type="text" placeholder="Search text in files…" autocomplete="off" spellcheck="false" /><div id="filetree"></div><div id="fileresults"></div></div>
+<div id="editor"><div id="edbar"><span id="edpath"></span><button id="edsave" disabled>Save ⌘S</button><button id="edclose">✕</button></div><div id="monaco"></div></div>
+<div id="edsplit"></div>
+<div id="permqueue"><div id="permhdr"></div><div id="permlist"></div></div>
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script>
+  // Monaco (VS Code editor), vendored under vendor/monaco/vs and asar-unpacked so its worker loads from disk
+  (function () {
+    const base = new URL('vendor/monaco/vs', location.href).href;
+    self.MonacoEnvironment = { getWorkerUrl: function () {
+      return URL.createObjectURL(new Blob(
+        ["self.MonacoEnvironment={baseUrl:'" + base + "/'};importScripts('" + base + "/base/worker/workerMain.js');"],
+        { type: 'text/javascript' }));
+    } };
+  })();
+</script>
+<script src="vendor/monaco/vs/loader.js"></script>
+<script>
+  const THEME = {
+    background:'#141518', foreground:'#ffffff', cursor:'#ff8a5c', cursorAccent:'#141518', selectionBackground:'rgba(255,138,92,0.40)',
+    black:'#000000', red:'#ff5c57', green:'#5af78e', yellow:'#f3f99d', blue:'#57c7ff', magenta:'#ff6ac1', cyan:'#9aedfe', white:'#f1f1f0',
+    brightBlack:'#686868', brightRed:'#ff5c57', brightGreen:'#5af78e', brightYellow:'#f3f99d', brightBlue:'#57c7ff', brightMagenta:'#ff6ac1', brightCyan:'#9aedfe', brightWhite:'#ffffff',
+  };
+  const sessions = {};   // sid -> { title, color, gridEl, sessEl, tabEl, terms:{}, activePaneId }
+  let activeSid = null;
+  // Re-fitting a terminal to a NEW width reflows xterm's buffer, which mangles Claude's background-colored
+  // output into grey/black "zebra" rows. So when the sidebar/editor/divider changes a pane's width, we DON'T
+  // re-fit — the terminal keeps its columns and just clips (the clipped area is empty). Window resize still fits.
+  let SUPPRESS_FIT = false;
+  function withNoFit(fn) { SUPPRESS_FIT = true; try { fn(); } finally { setTimeout(() => { SUPPRESS_FIT = false; }, 350); } }
+  let sidebarDefaulted = false;   // open the Files sidebar by default on the first session
+  const tabsEl = document.getElementById('tabs');
+  const sessEl = document.getElementById('sessions');
+
+  document.getElementById('newtab').onclick = () => window.fleet.newSession();
+
+  // ---- Chrome-style tab drag: reorder within the bar, tear off into a new window, or dock onto another window ----
+  // The ORIGIN renderer owns the whole gesture (it captured the mousedown, so it keeps getting mousemove/mouseup
+  // even when the cursor is over another window). Reorder is handled here; anything that LEAVES the bar is decided
+  // by main on drop (it alone knows other windows' screen bounds). screen coords drive cross-window hit-testing;
+  // client coords decide whether we're still inside our own bar.
+  const TAB_DRAG_THRESH = 8;
+  const tabbarEl = document.getElementById('tabbar');
+  function inOwnBar(ev) {
+    const r = tabbarEl.getBoundingClientRect();
+    return ev.clientX >= r.left - 50 && ev.clientX <= r.right + 50 && ev.clientY >= r.top - 6 && ev.clientY <= r.bottom + 34;
+  }
+  function reorderTab(tab, clientX) {
+    let before = null;
+    for (const sib of tabsEl.children) {
+      if (sib === tab) continue;
+      const r = sib.getBoundingClientRect();
+      if (clientX < r.left + r.width / 2) { before = sib; break; }
+    }
+    if (before) { if (tab.nextSibling !== before) tabsEl.insertBefore(tab, before); }
+    else if (tab !== tabsEl.lastChild) tabsEl.appendChild(tab);
+  }
+  function initTabDrag(tab, sid) {
+    tab.addEventListener('click', (e) => {
+      if (tab._dragged) { tab._dragged = false; return; }   // swallow the click that terminates a real drag
+      if (e.target.classList.contains('x')) closeTab(sid); else activate(sid);
+    });
+    tab.addEventListener('mousedown', (e) => {
+      if (e.button !== 0 || e.target.classList.contains('x')) return;   // left-button only; × is a click, not a drag
+      e.preventDefault();
+      tab._dragged = false;   // fresh press; cleared so a prior drag that ended off-tab can't swallow this click
+      activate(sid);
+      const startX = e.screenX, startY = e.screenY;
+      let dragging = false, outside = false, lastMove = 0;
+      const onMove = (ev) => {
+        if (!dragging) {
+          if (Math.hypot(ev.screenX - startX, ev.screenY - startY) < TAB_DRAG_THRESH) return;
+          dragging = true; tab._dragged = true; tab.classList.add('dragging');
+        }
+        if (inOwnBar(ev)) {
+          if (outside) { outside = false; window.fleet.tabDragEnd(); }   // came back into the bar
+          reorderTab(tab, ev.clientX);
+        } else {
+          if (!outside) { outside = true; const s = sessions[sid]; window.fleet.tabDragStart({ sid, title: s && s.title, color: s && s.color }); }
+          const now = performance.now();
+          if (now - lastMove > 16) { lastMove = now; window.fleet.tabDragMove({ screenX: ev.screenX, screenY: ev.screenY }); }
+        }
+      };
+      const onUp = (ev) => {
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('mouseup', onUp, true);
+        tab.classList.remove('dragging');
+        if (!dragging) return;                       // never crossed threshold -> it's a click (handled above)
+        if (inOwnBar(ev)) { window.fleet.tabDragEnd(); }   // dropped back in our own bar -> reorder already applied
+        else { window.fleet.tabDrop({ sid, screenX: ev.screenX, screenY: ev.screenY }); }   // main migrates: dock or tear off
+      };
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('mouseup', onUp, true);
+    });
+  }
+
+  window.fleet.onAddSession(({ sid, title, color, panes, mode, migrated }) => {
+    const sess = { title: title || 'project', color: color || '#888', mode: mode || 'dispatch', terms: {}, activePaneId: panes[0] ? panes[0].id : 0, paneCount: panes.length, paneStates: {}, forceRefresh: !!migrated };
+    sessions[sid] = sess;
+    const tab = document.createElement('div'); tab.className = 'tab';
+    tab.innerHTML = `<span class="pdot"></span><span>${escapeHtml(sess.title)}</span><span class="x">×</span>`;
+    initTabDrag(tab, sid);
+    tabsEl.appendChild(tab); sess.tabEl = tab;
+    const sEl = document.createElement('div'); sEl.className = 'session';
+    const grid = document.createElement('div'); grid.className = 'grid';
+    sEl.appendChild(grid); sessEl.appendChild(sEl); sess.sessEl = sEl; sess.gridEl = grid;
+    panes.forEach((p) => buildPane(sid, sess, grid, p));
+    if (!sidebarDefaulted) {       // sidebar open by default — set before layout so terminals size to the pushed width
+      sidebarDefaulted = true;
+      document.getElementById('filepanel').classList.add('open');
+      document.getElementById('filesbtn').classList.add('on');
+      sessEl.classList.add('pushed');
+    }
+    activate(sid); layout(sid);   // make visible first, then size + spawn at the real dimensions (activate loads the file tree)
+  });
+
+  // orchestrator spawned a new worker -> add a pane and re-flow the grid
+  window.fleet.onAddPane(({ sid, pane }) => {
+    const s = sessions[sid]; if (!s) return;
+    s.paneCount = Math.max(s.paneCount, pane.id + 1);
+    buildPane(sid, s, s.gridEl, pane);
+    layout(sid);
+  });
+
+  // split n panes into rows. Columns are capped by available WIDTH so panes never get too narrow:
+  // when the window is narrow, columns drop (down to 1) and panes stack VERTICALLY, each full width.
+  const MIN_PANE_W = 440;   // a terminal narrower than this is cramped → use fewer columns
+  function rowSplit(n, width) {
+    n = Math.max(1, n);
+    let cols = Math.ceil(Math.sqrt(n));                                   // ideal square-ish grid (wide window)
+    if (width > 0) cols = Math.min(cols, Math.max(1, Math.floor(width / MIN_PANE_W)));   // narrow → fewer columns
+    cols = Math.max(1, Math.min(cols, n));
+    const rows = Math.ceil(n / cols);
+    const base = Math.floor(n / rows), extra = n % rows;
+    return Array.from({ length: rows }, (_, r) => base + (r < extra ? 1 : 0));   // earlier rows take the extra
+  }
+
+  // nested-flex layout: grid = vertical stack of rows; each row = horizontal strip of panes. Dividers are LOCAL —
+  // a vertical divider only resizes its own row's panes; a horizontal divider only the two rows it sits between.
+  function layout(sid) {
+    const s = sessions[sid]; if (!s) return;
+    const ids = Object.keys(s.terms).map(Number).sort((a, b) => a - b);
+    const n = ids.length; if (!n) return;
+    const width = s.gridEl.getBoundingClientRect().width || window.innerWidth;
+    const counts = rowSplit(n, width);
+    const shape = counts.join(',') + '|' + ids.join(',');
+    const apply = () => {
+      ids.forEach((id) => {
+        const t = s.terms[id]; if (!t) return;
+        try { t.fit.fit(); if (t.started) t.term.refresh(0, t.term.rows - 1); } catch (_) {}   // refresh clears reflow striping
+        if (!t.started) { window.fleet.termReady({ sid, id, cols: t.term.cols, rows: t.term.rows }); t.started = true; }
+        else window.fleet.termResize({ sid, id, cols: t.term.cols, rows: t.term.rows });
+      });
+    };
+    // rAF gives the crisp foreground fit; the setTimeout is a fallback because rAF is PAUSED when the window is
+    // backgrounded — without it, a worker pane's PTY (spawned on term-ready) would never start until you return.
+    const refit = () => {
+      requestAnimationFrame(apply); setTimeout(apply, 80);
+      // a migrated session re-attaches fresh xterms to already-running PTYs; their replayed buffer reflows but the
+      // normal apply only refreshes panes that were ALREADY started, so the destination renders striped until a
+      // keystroke. Force a full refresh on every started pane once the fit + streamed buffer have settled.
+      if (s.forceRefresh) { s.forceRefresh = false; setTimeout(() => { ids.forEach((id) => { const t = s.terms[id]; if (t && t.started) { try { t.term.refresh(0, t.term.rows - 1); } catch (_) {} } }); }, 120); }
+    };
+    if (s.shape === shape) { refit(); return; }   // structure unchanged (minor resize) — just refit, skip the rebuild
+    s.shape = shape; s.rowFr = counts.map(() => 1); s.colFr = counts.map((c) => Array(c).fill(1));
+    ids.forEach((id) => { const pe = s.terms[id].paneEl; if (pe && pe.parentNode) pe.parentNode.removeChild(pe); });
+    s.gridEl.innerHTML = '';
+    s.rowEls = []; s.rowPanes = [];
+    let k = 0;
+    counts.forEach((cnt, r) => {
+      if (r > 0) s.gridEl.appendChild(makeGutter(s, 'h', r, 0));
+      const row = document.createElement('div'); row.className = 'row';
+      row.style.flexGrow = s.rowFr[r]; row.style.flexBasis = '0';
+      s.rowEls[r] = row; s.rowPanes[r] = [];
+      for (let c = 0; c < cnt; c++) {
+        if (c > 0) row.appendChild(makeGutter(s, 'v', r, c));
+        const pe = s.terms[ids[k++]].paneEl;
+        pe.style.flexGrow = s.colFr[r][c]; pe.style.flexBasis = '0'; pe.style.flexShrink = '1';
+        row.appendChild(pe); s.rowPanes[r].push(pe);
+      }
+      s.gridEl.appendChild(row);
+    });
+    refit();
+  }
+
+  function makeGutter(s, axis, r, c) {
+    const g = document.createElement('div');
+    g.className = axis === 'h' ? 'hgutter' : 'vgutter';
+    g.addEventListener('mousedown', (e) => startDrag(e, s, axis, r, c));
+    return g;
+  }
+
+  // drag a divider: vertical adjusts the two adjacent panes' grow within row r; horizontal adjusts rows r-1/r grow
+  function startDrag(e, s, axis, r, c) {
+    e.preventDefault();
+    if (axis === 'v') {
+      const fr = s.colFr[r], rowW = s.rowEls[r].getBoundingClientRect().width || 1, sum = fr.reduce((x, y) => x + y, 0);
+      const x0 = e.clientX, a0 = fr[c - 1], b0 = fr[c];
+      const mv = (ev) => { const d = (ev.clientX - x0) / rowW * sum; fr[c - 1] = Math.max(0.1, a0 + d); fr[c] = Math.max(0.1, b0 - d); s.rowPanes[r].forEach((pe, i) => pe.style.flexGrow = fr[i]); };
+      endDrag(mv, 'col-resize');
+    } else {
+      const fr = s.rowFr, gridH = s.gridEl.getBoundingClientRect().height || 1, sum = fr.reduce((x, y) => x + y, 0);
+      const y0 = e.clientY, a0 = fr[r - 1], b0 = fr[r];
+      const mv = (ev) => { const d = (ev.clientY - y0) / gridH * sum; fr[r - 1] = Math.max(0.1, a0 + d); fr[r] = Math.max(0.1, b0 - d); s.rowEls.forEach((row, i) => row.style.flexGrow = fr[i]); };
+      endDrag(mv, 'row-resize');
+    }
+  }
+  function endDrag(mv, cursor) {
+    const up = () => { window.removeEventListener('mousemove', mv); window.removeEventListener('mouseup', up); document.body.style.cursor = ''; };
+    document.body.style.cursor = cursor; window.addEventListener('mousemove', mv); window.addEventListener('mouseup', up);
+  }
+
+  // distinct per-pane title colours: 12 well-separated hues, legible on the dark pane bar (--bar).
+  // assigned deterministically by pane id so each pane is stable across re-renders and unique (id 0..8 → 9 distinct).
+  const TITLE_COLORS = ['#ef6f6c','#e8915f','#d7c34a','#a3c557','#6cc070','#4fc4a0','#4dc4c9','#5aa9e6','#7c8ef0','#a98ee6','#d27fd6','#ec6fa6'];
+
+  function buildPane(sid, sess, grid, p) {
+    const pane = document.createElement('div'); pane.className = 'pane';
+    const bar = document.createElement('div'); bar.className = 'pbar ' + p.role;
+    bar.innerHTML = `<span class="pdot"></span><span class="ptitle">${escapeHtml(p.heading)}</span><span class="pclose" title="Close pane">×</span>`;
+    bar.querySelector('.ptitle').style.color = TITLE_COLORS[p.id % TITLE_COLORS.length];   // unique per-pane identity colour, overrides role-based .ptitle CSS
+    bar.querySelector('.pclose').addEventListener('click', (e) => { e.stopPropagation(); closePane(sid, p.id); });
+    const termEl = document.createElement('div'); termEl.className = 'term';
+    pane.appendChild(bar); pane.appendChild(termEl); grid.appendChild(pane);
+
+    const term = new Terminal({ theme: THEME, fontFamily: 'SF Mono, Menlo, monospace', fontSize: 12, cursorBlink: true, allowProposedApi: true, macOptionIsMeta: false, altClickMovesCursor: true, scrollback: 5000 });
+    const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(termEl); fit.fit();
+    sess.terms[p.id] = { term, fit, started: false, paneEl: pane, heading: p.heading, role: p.role };   // PTY spawned later, in layout(), at full size
+    term.write('\x1b[90m  Starting Claude…\x1b[0m');
+    term.onData((data) => window.fleet.termInput({ sid, id: p.id, data }));
+    new ResizeObserver(() => { if (SUPPRESS_FIT) return; try { fit.fit(); window.fleet.termResize({ sid, id: p.id, cols: term.cols, rows: term.rows }); } catch (_) {} }).observe(termEl);
+
+    // focus the CLICKED pane (esp. when activating the window from another app), point file tree at its worktree.
+    // NEVER switch the active SESSION here: a pane belongs to a hidden/inactive tab when sid !== activeSid, and on a
+    // window re-activation (e.g. clicking a notification for ANOTHER tab) that tab's last-DOM-focused textarea fires
+    // focusin — letting it set activeSid would clobber the activate() that the notification just performed. Only
+    // update the active PANE within the session that is already active.
+    const onFocus = () => { if (sid !== activeSid) return; sess.activePaneId = p.id; try { term.focus(); } catch (_) {} focusFileRoot(p.heading); };
+    termEl.addEventListener('mousedown', onFocus);
+    termEl.addEventListener('focusin', onFocus);
+    termEl.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); });
+    termEl.addEventListener('drop', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const files = [...(e.dataTransfer.files || [])];
+      if (files.length) {
+        for (const f of files) {
+          if (f.type && f.type.startsWith('image/')) { const saved = await window.fleet.saveImageBytes(new Uint8Array(await f.arrayBuffer())); if (saved) sendPaste(sid, p.id, saved); }
+          else { const fp = window.fleet.getPathForFile(f); if (fp) sendPaste(sid, p.id, fp); }
+        }
+        return;
+      }
+      const item = [...(e.dataTransfer.items || [])].find((it) => it.type && it.type.startsWith('image/'));
+      if (item) { const f = item.getAsFile(); if (f) { const saved = await window.fleet.saveImageBytes(new Uint8Array(await f.arrayBuffer())); if (saved) sendPaste(sid, p.id, saved); } }
+    });
+  }
+
+  function activate(sid) {
+    activeSid = sid;
+    window.fleet.setActiveSession(sid);   // tell main which tab is now visible (gates per-session notification suppression)
+    Object.entries(sessions).forEach(([id, s]) => {
+      const on = (+id === sid);
+      s.sessEl.classList.toggle('active', on); s.tabEl.classList.toggle('active', on);
+      s.tabEl.style.background = on ? s.color : '';   // active tab highlighted with its mode color
+    });
+    layout(sid);        // re-flow for the current window width (it may have changed while this tab was inactive)
+    focusActive(sid);   // clicking a tab should land the cursor in its terminal — no extra click to type/paste
+    if (document.getElementById('filepanel').classList.contains('open')) loadRoots();   // file tree follows the active tab
+    document.getElementById('addgrid').style.display = (sessions[sid] && sessions[sid].mode === 'grid') ? 'inline-block' : 'none';
+  }
+
+  // lightweight name prompt (window.prompt is disabled in Electron) -> resolves the typed name or null
+  function askName(title, placeholder) {
+    return new Promise((resolve) => {
+      const m = document.getElementById('modal'), inp = document.getElementById('modalinput');
+      document.getElementById('modaltitle').textContent = title; inp.value = ''; inp.placeholder = placeholder || '';
+      m.classList.add('show'); setTimeout(() => inp.focus(), 30);
+      const done = (val) => { m.classList.remove('show'); inp.removeEventListener('keydown', onKey); m.onmousedown = null; document.getElementById('modalok').onclick = null; document.getElementById('modalcancel').onclick = null; resolve(val); };
+      const ok = () => done(inp.value.trim() || null), cancel = () => done(null);
+      const onKey = (e) => { if (e.key === 'Enter') { e.preventDefault(); ok(); } else if (e.key === 'Escape') { e.preventDefault(); cancel(); } };
+      inp.addEventListener('keydown', onKey);
+      document.getElementById('modalok').onclick = ok; document.getElementById('modalcancel').onclick = cancel;
+      m.onmousedown = (e) => { if (e.target === m) cancel(); };   // click backdrop to dismiss
+    });
+  }
+
+  // + Pane: add one more autonomous worker to the running grid session (no restart)
+  document.getElementById('addgrid').onclick = async () => {
+    if (activeSid == null || !sessions[activeSid] || sessions[activeSid].mode !== 'grid') return;
+    const name = await askName('New worker pane', 'e.g. Checkout');
+    if (!name) return;
+    const btn = document.getElementById('addgrid'); btn.disabled = true;
+    const r = await window.fleet.addGridWorker({ sid: activeSid, name });
+    btn.disabled = false;
+    if (r && r.error) window.alert(r.error);   // success arrives as an add-pane event (onAddPane reflows the grid)
+  };
+
+  // re-flow the active session when the window is resized: a narrow window stacks panes vertically (full width each)
+  let _resizeT = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(_resizeT);
+    _resizeT = setTimeout(() => { if (activeSid != null && sessions[activeSid]) layout(activeSid); }, 120);
+  });
+
+  function focusActive(sid) {
+    const s = sessions[sid]; if (!s) return;
+    const t = s.terms[s.activePaneId] || Object.values(s.terms)[0];
+    if (t) requestAnimationFrame(() => { try { t.term.focus(); } catch (_) {} });
+  }
+
+  async function closeTab(sid) {
+    if (!sessions[sid]) return;
+    if (!(await window.fleet.confirmClose('session', sessions[sid].title))) return;
+    doCloseTab(sid);
+  }
+  function doCloseTab(sid) {
+    const s = sessions[sid]; if (!s) return;
+    window.fleet.closeSession(sid);
+    s.tabEl.remove(); s.sessEl.remove(); delete sessions[sid];
+    if (activeSid === sid) { const ids = Object.keys(sessions); if (ids.length) activate(+ids[ids.length - 1]); else { activeSid = null; window.fleet.setActiveSession(null); window.fleet.lastTabClosed(); } }
+  }
+
+  // close a single pane: kill its pty, drop its terminal, reflow the grid (last pane closes the session).
+  // The Orchestrator can't be closed while its workers are still running — close the workers first.
+  async function closePane(sid, paneId) {
+    const s = sessions[sid]; if (!s || !s.terms[paneId]) return;
+    const t = s.terms[paneId];
+    if (t.role === 'orchestrator') {
+      const workers = Object.values(s.terms).filter((x) => x.role === 'worker').length;
+      if (workers > 0) { window.alert('Close the worker panes first — the Orchestrator can’t be closed while its workers are still running.'); return; }
+    }
+    const lastPane = Object.keys(s.terms).length === 1;   // closing the last pane closes the whole project
+    if (!(await window.fleet.confirmClose(lastPane ? 'session' : 'pane', lastPane ? s.title : t.heading))) return;
+    window.fleet.closePane(sid, paneId);
+    try { t.term.dispose(); } catch (_) {} if (t.paneEl) t.paneEl.remove();
+    delete s.terms[paneId];
+    if (s.paneStates) delete s.paneStates[paneId];
+    if (!Object.keys(s.terms).length) { doCloseTab(sid); return; }   // already confirmed — no second prompt
+    if (s.activePaneId === paneId) s.activePaneId = +Object.keys(s.terms)[0];
+    refreshTabState(s);
+    layout(sid);
+  }
+
+  // ⌘W: act on what's focused. Editor open → close it. A worker pane → close that pane. Orchestrator with workers →
+  // blocked (handled in closePane). Orchestrator alone → closes the project, then jumps to another tab or config.
+  window.fleet.onCmdW(() => {
+    if (document.activeElement && document.activeElement.closest && document.activeElement.closest('#editor')) { closeEditor(); return; }
+    if (activeSid == null) return;
+    const s = sessions[activeSid]; if (!s) return;
+    const id = (s.activePaneId != null && s.terms[s.activePaneId]) ? s.activePaneId : +Object.keys(s.terms)[0];
+    if (id != null && !Number.isNaN(id)) closePane(activeSid, id);
+  });
+
+  window.fleet.onPtyData(({ sid, id, data }) => {
+    const s = sessions[sid]; if (!s || !s.terms[id]) return;
+    const t = s.terms[id]; t.term.write(data);
+    clearTimeout(t.detT); t.detT = setTimeout(() => reportState(sid, id), 250);   // re-check this pane's state shortly after output
+  });
+
+  // detect a pane's LIVE state from its actual on-screen text (xterm buffer) — accurate, unlike scanning the raw
+  // stream (old spinner text lingered there and falsely read as "working" on focus/redraw).
+  const PERM_Y = /\b1\.\s*Yes\b/i, PERM_M = /(Do you want to|Would you like to|Esc to cancel|don'?t ask again)/i;
+  const WORKING_RE = /esc to interrupt|to run in background|[↑↓]\s*[\d.]+\s*k?\s*tokens|…\s*\((?:\d+m\s*)?\d+s/i;
+  function readScreen(term) {
+    try { const b = term.buffer.active, start = Math.max(0, b.length - term.rows); let out = '';
+      for (let i = start; i < b.length; i++) { const ln = b.getLine(i); if (ln) out += ln.translateToString(true) + '\n'; }
+      return out; } catch (_) { return ''; }
+  }
+  function reportState(sid, id) {
+    const s = sessions[sid]; if (!s) return; const t = s.terms[id]; if (!t || !t.started) return;
+    const scr = readScreen(t.term);
+    let state = 'idle';
+    if (PERM_Y.test(scr) && PERM_M.test(scr)) state = 'permission';
+    else if (WORKING_RE.test(scr)) state = 'working';
+    if (t.lastReported === state) return;
+    t.lastReported = state;
+    window.fleet.paneActivity({ sid, id, state, screen: state === 'permission' ? scr : '' });
+  }
+  setInterval(() => { Object.keys(sessions).forEach((sid) => { const s = sessions[sid]; if (s) Object.keys(s.terms).forEach((id) => reportState(+sid, +id)); }); }, 1500);
+  window.fleet.onPtyExit(({ sid, id }) => { const s = sessions[sid]; if (s && s.terms[id]) s.terms[id].term.write('\r\n\x1b[2m[ session ended ]\x1b[0m\r\n'); });
+  window.fleet.onFleetError(({ sid, msg }) => { const s = sessions[sid]; if (s) Object.values(s.terms).forEach((t) => t.term.write('\r\n\x1b[31m  ' + msg + '\x1b[0m\r\n')); });
+  // a pane changed state → status dot on its header + on its tab (tab shows the most-urgent pane state)
+  const STATE_RANK = { permission: 3, failed: 2, idle: 1, working: 0 };
+  function applyStateClass(el, state) { if (!el) return; el.classList.remove('st-permission', 'st-failed', 'st-idle'); if (state === 'permission' || state === 'failed' || state === 'idle') el.classList.add('st-' + state); }
+  function refreshTabState(s) { let top = 'working'; Object.values(s.paneStates || {}).forEach((st) => { if ((STATE_RANK[st] || 0) > (STATE_RANK[top] || 0)) top = st; }); applyStateClass(s.tabEl, top); }
+  window.fleet.onPaneState(({ sid, id, state }) => {
+    const s = sessions[sid]; if (!s) return;
+    if (!s.paneStates) s.paneStates = {};
+    s.paneStates[id] = state;
+    const t = s.terms[id]; if (t && t.paneEl) applyStateClass(t.paneEl.querySelector('.pbar'), state);
+    refreshTabState(s);
+  });
+  // clicked a permission notification → jump to that tab + pane and focus it
+  function jumpToPane(sid, id) {
+    const s = sessions[sid]; if (!s) return;
+    if (activeSid !== sid) activate(sid);
+    s.activePaneId = id;
+    const t = s.terms[id]; if (t) requestAnimationFrame(() => { try { t.term.focus(); } catch (_) {} });
+  }
+  window.fleet.onFocusPane(({ sid, id }) => jumpToPane(sid, id));
+
+  // in-app permission QUEUE: pending prompts from main stack as a dismissible LIST (concurrent prompts no longer
+  // hide each other). Each card routes its answer back to ITS OWN sid:id, so answers never cross-wire between panes.
+  const permQueue = new Map();   // "sid:id" -> { sid, id, name, title, options:{yes,always,no} }
+  const permqEl = document.getElementById('permqueue');
+  const permlistEl = document.getElementById('permlist');
+  const permhdrEl = document.getElementById('permhdr');
+  function renderPermQueue() {
+    const items = Array.from(permQueue.values());
+    permqEl.classList.toggle('show', items.length > 0);
+    if (!items.length) { permlistEl.innerHTML = ''; return; }
+    permhdrEl.textContent = items.length === 1 ? 'Permission needed' : items.length + ' permissions pending';
+    permlistEl.innerHTML = '';
+    items.forEach((p) => {
+      const card = document.createElement('div'); card.className = 'permcard';
+      const name = document.createElement('div'); name.className = 'pc-name'; name.textContent = p.name || 'A pane';
+      const sub = document.createElement('div'); sub.className = 'pc-sub'; sub.textContent = (p.title || '') + ' · asking to proceed — click to open';
+      name.onclick = sub.onclick = () => jumpToPane(p.sid, p.id);
+      const btns = document.createElement('div'); btns.className = 'pc-btns';
+      const o = p.options || {};
+      const mk = (label, digit, cls) => { const b = document.createElement('button'); b.textContent = label; if (cls) b.className = cls; b.onclick = () => answerPerm(p.sid, p.id, digit); btns.appendChild(b); };
+      if (o.yes != null) mk('Yes', o.yes, 'pc-yes');
+      if (o.always != null) mk('Always', o.always);
+      if (o.no != null) mk('No', o.no);
+      if (o.yes == null && o.always == null && o.no == null) { const b = document.createElement('button'); b.textContent = 'Open pane'; b.onclick = () => jumpToPane(p.sid, p.id); btns.appendChild(b); }
+      card.appendChild(name); card.appendChild(sub); card.appendChild(btns);
+      permlistEl.appendChild(card);
+    });
+  }
+  function answerPerm(sid, id, digit) {
+    window.fleet.answerPane(sid, id, digit);   // main writes the digit + Enter to that pane's pty
+    permQueue.delete(sid + ':' + id);          // dismiss now (snappy); main also pushes a remove on state change
+    renderPermQueue();
+  }
+  window.fleet.onPermPrompt((d) => {
+    if (!d) return;
+    const key = d.sid + ':' + d.id;
+    if (d.remove) permQueue.delete(key);
+    else permQueue.set(key, { sid: d.sid, id: d.id, name: d.name, title: d.title, options: d.options || {} });
+    renderPermQueue();
+  });
+
+  // this session was MOVED to another window: dispose THIS window's view objects (xterm) and drop the tab — but do
+  // NOT kill the PTYs (main keeps them running and re-routes their output to the destination window). The destination
+  // rebuilds the session from the live PTYs via the normal add-session path. If we just emptied the window, main closes it.
+  window.fleet.onRemoveSession(({ sid }) => {
+    const s = sessions[sid]; if (!s) return;
+    Object.values(s.terms).forEach((t) => { try { t.term.dispose(); } catch (_) {} });
+    if (s.tabEl) s.tabEl.remove();
+    if (s.sessEl) s.sessEl.remove();
+    delete sessions[sid];
+    Array.from(permQueue.keys()).forEach((k) => { if (k.indexOf(sid + ':') === 0) permQueue.delete(k); }); renderPermQueue();
+    if (activeSid === sid) { const ids = Object.keys(sessions); activeSid = ids.length ? +ids[ids.length - 1] : null; if (activeSid != null) activate(activeSid); else window.fleet.setActiveSession(null); }
+  });
+  // another window's tab bar lights up while a tab is dragged over it (re-dock target feedback)
+  window.fleet.onTabbarHighlight(({ on }) => tabbarEl.classList.toggle('drop-target', !!on));
+
+  ['dragover', 'drop'].forEach((ev) => window.addEventListener(ev, (e) => e.preventDefault()));
+
+  // Cmd/Ctrl+V -> paste clipboard text or image into the active pane
+  window.addEventListener('keydown', async (e) => {
+    if (document.activeElement && document.activeElement.closest && document.activeElement.closest('#editor, #filepanel, #modal')) return;  // let the editor / sidebar search / name prompt own their shortcuts
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'v' || e.key === 'V')) {
+      e.preventDefault(); e.stopPropagation();
+      const s = sessions[activeSid]; if (!s) return;
+      const res = await window.fleet.readClipboard();
+      if (res && res.image) sendPaste(activeSid, s.activePaneId, res.image);
+      else if (res && res.text) sendPaste(activeSid, s.activePaneId, res.text);
+    }
+  }, true);
+
+
+  function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c])); }
+
+  // deliver text/file-paths as a BRACKETED PASTE (ESC[200~ … ESC[201~) — the same way a real terminal hands a
+  // drag-drop to the program. Claude Code only converts an image path into [Image] when it arrives as a paste;
+  // raw keystrokes are treated as literal path text.
+  function sendPaste(sid, id, text) { window.fleet.termInput({ sid, id, data: '\x1b[200~' + text + '\x1b[201~' }); }
+
+  // ---------------------------------------------------------------- file manager + Monaco editor
+  const filesBtn = document.getElementById('filesbtn');
+  const filePanel = document.getElementById('filepanel');
+  const rootSel = document.getElementById('rootsel');
+  const fileTree = document.getElementById('filetree');
+  const fileSearch = document.getElementById('filesearch');
+  const fileResults = document.getElementById('fileresults');
+  const edPanel = document.getElementById('editor');
+  const edPath = document.getElementById('edpath');
+  const edSave = document.getElementById('edsave');
+  const edSplit = document.getElementById('edsplit');
+  let monaco = null, mEditor = null, monacoLoading = false, fmFile = null, lastSel = null;
+
+  // sidebar/editor changes resize the panes but DON'T re-fit the terminals (withNoFit) — that avoids the reflow zebra
+  function closeEditor() { withNoFit(() => { edPanel.classList.remove('open'); sessEl.classList.remove('editing'); edSplit.classList.remove('show'); }); }
+  filesBtn.onclick = () => {
+    withNoFit(() => {
+      const open = filePanel.classList.toggle('open'); filesBtn.classList.toggle('on', open);
+      sessEl.classList.toggle('pushed', open);     // push the grid; terminals clip (no reflow) into the remaining width
+      if (open) loadRoots(); else { edPanel.classList.remove('open'); sessEl.classList.remove('editing'); edSplit.classList.remove('show'); }
+    });
+  };
+  document.getElementById('edclose').onclick = closeEditor;
+  edSave.onclick = saveFile;
+
+  // draggable divider between the editor (left) and the terminals (right) — suppress fit while dragging
+  edSplit.addEventListener('mousedown', (e) => {
+    e.preventDefault(); SUPPRESS_FIT = true;
+    const onMove = (ev) => { const x = Math.max(540, Math.min(window.innerWidth - 300, ev.clientX)); document.documentElement.style.setProperty('--edsplit', (x / window.innerWidth * 100).toFixed(2) + '%'); };
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); document.body.style.cursor = ''; setTimeout(() => { SUPPRESS_FIT = false; }, 350); if (mEditor) mEditor.layout(); };
+    document.body.style.cursor = 'col-resize'; window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
+  });
+
+  // focusing a grid points the file tree at THAT grid's worktree (its root in the dropdown)
+  function focusFileRoot(heading) {
+    if (!filePanel.classList.contains('open') || !heading) return;
+    const opt = [...rootSel.options].find((o) => o.textContent === heading);
+    if (opt && rootSel.value !== opt.value) { rootSel.value = opt.value; openRoot(opt.value); }
+  }
+
+  async function loadRoots() {
+    if (activeSid == null) { rootSel.innerHTML = ''; fileTree.innerHTML = '<div class="fitem">no session</div>'; return; }
+    const roots = await window.fleet.fsRoots(activeSid);
+    rootSel.innerHTML = '';
+    (roots || []).forEach((r) => { const o = document.createElement('option'); o.value = r.path; o.textContent = r.label; rootSel.appendChild(o); });
+    rootSel.onchange = () => openRoot(rootSel.value);
+    if (roots && roots.length) openRoot(roots[0].path); else fileTree.innerHTML = '<div class="fitem">no folders</div>';
+  }
+  async function openRoot(dir) { exitSearch(); fileTree.innerHTML = ''; await renderDir(dir, fileTree); }
+
+  // global content search across the active root (ripgrep in main, Node fallback). Debounced; Esc/empty clears.
+  let _searchT = null;
+  fileSearch.addEventListener('input', () => {
+    clearTimeout(_searchT);
+    const q = fileSearch.value.trim();
+    if (!q) { exitSearch(); return; }
+    _searchT = setTimeout(() => runSearch(q), 250);
+  });
+  fileSearch.addEventListener('keydown', (e) => { if (e.key === 'Escape') { fileSearch.value = ''; exitSearch(); } });
+  function exitSearch() { filePanel.classList.remove('searching'); fileResults.classList.remove('show'); fileResults.innerHTML = ''; }
+  async function runSearch(q) {
+    if (activeSid == null || !rootSel.value) return;
+    const root = rootSel.value;
+    filePanel.classList.add('searching'); fileResults.classList.add('show');
+    fileResults.innerHTML = '<div class="fhint">Searching…</div>';
+    const res = await window.fleet.fsSearch(activeSid, root, q);
+    if (fileSearch.value.trim() !== q) return;   // a newer query superseded this one
+    if (!res || res.error) { fileResults.innerHTML = '<div class="fhint" style="color:#ff6b61">' + escapeHtml((res && res.error) || 'error') + '</div>'; return; }
+    renderSearch(res.results || [], q, root);
+  }
+  function renderSearch(results, q, root) {
+    fileResults.innerHTML = '';
+    if (!results.length) { fileResults.innerHTML = '<div class="fhint">No matches</div>'; return; }
+    results.forEach((r) => {
+      const row = document.createElement('div'); row.className = 'fres';
+      const rel = r.file.startsWith(root) ? r.file.slice(root.length).replace(/^\//, '') : r.file;
+      row.innerHTML = '<div class="ff">' + escapeHtml(rel) + '</div><div class="fl"><span class="lno">' + r.line + '</span>' + hlMatch(r.text, q) + '</div>';
+      row.onclick = () => openFile(r.file, null, r.line);
+      fileResults.appendChild(row);
+    });
+  }
+  function hlMatch(text, q) {
+    const t = escapeHtml(text);
+    try { return t.replace(new RegExp('(' + q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'ig'), '<mark>$1</mark>'); } catch (_) { return t; }
+  }
+
+  async function renderDir(dir, container) {
+    const res = await window.fleet.fsList(activeSid, dir);
+    if (!res || res.error) { container.innerHTML = '<div class="fitem" style="color:#ff6b61">' + escapeHtml((res && res.error) || 'error') + '</div>'; return; }
+    res.entries.forEach((e) => {
+      const item = document.createElement('div'); item.className = 'fitem';
+      item.innerHTML = '<span class="tw">' + (e.dir ? '▸' : '') + '</span><span class="ic">' + (e.dir ? '📁' : '📄') + '</span><span>' + escapeHtml(e.name) + '</span>';
+      container.appendChild(item);
+      if (e.dir) {
+        const kids = document.createElement('div'); kids.className = 'fchildren'; kids.style.display = 'none'; let loaded = false;
+        container.appendChild(kids);
+        item.onclick = async () => {
+          const open = kids.style.display === 'none';
+          kids.style.display = open ? '' : 'none'; item.querySelector('.tw').textContent = open ? '▾' : '▸';
+          if (open && !loaded) { loaded = true; await renderDir(e.path, kids); }
+        };
+      } else item.onclick = () => openFile(e.path, item);
+    });
+  }
+
+  const LANG = { js:'javascript', mjs:'javascript', cjs:'javascript', jsx:'javascript', ts:'typescript', tsx:'typescript', json:'json', html:'html', htm:'html', css:'css', scss:'scss', less:'less', md:'markdown', py:'python', sh:'shell', bash:'shell', zsh:'shell', yml:'yaml', yaml:'yaml', xml:'xml', svg:'xml', java:'java', kt:'kotlin', rs:'rust', go:'go', c:'c', h:'c', cpp:'cpp', cc:'cpp', rb:'ruby', php:'php', sql:'sql', toml:'ini', ini:'ini', env:'ini', gradle:'groovy' };
+  function langFor(file) { return LANG[(file.split('.').pop() || '').toLowerCase()] || 'plaintext'; }
+
+  async function openFile(file, itemEl, line) {
+    const res = await window.fleet.fsRead(activeSid, file);
+    if (!res || res.error) { window.alert((res && res.error) || 'cannot open file'); return; }
+    if (lastSel) lastSel.classList.remove('sel'); if (itemEl) { itemEl.classList.add('sel'); lastSel = itemEl; }
+    ensureMonaco(() => {
+      fmFile = file;
+      const old = mEditor.getModel(); const model = monaco.editor.createModel(res.content, langFor(file));
+      mEditor.setModel(model); if (old) old.dispose();
+      withNoFit(() => { edPanel.classList.add('open'); sessEl.classList.add('editing'); edSplit.classList.add('show'); });  // editor docks by the sidebar; terminals clip, no reflow
+      setDirty(false); mEditor.layout();
+      if (line) { try { mEditor.revealLineInCenter(line); mEditor.setPosition({ lineNumber: line, column: 1 }); } catch (_) {} }   // jump to a search hit
+      mEditor.focus();
+    });
+  }
+  function setDirty(d) { edSave.disabled = !d; edPath.textContent = (d ? '● ' : '') + (fmFile ? fmFile.split('/').slice(-2).join('/') : ''); }
+  async function saveFile() {
+    if (!fmFile || !mEditor) return;
+    const res = await window.fleet.fsWrite(activeSid, fmFile, mEditor.getValue());
+    if (res && res.ok) setDirty(false); else window.alert((res && res.error) || 'save failed');
+  }
+
+  function ensureMonaco(cb) {
+    if (mEditor) return cb();
+    if (monacoLoading) { setTimeout(() => ensureMonaco(cb), 120); return; }
+    monacoLoading = true;
+    require.config({ paths: { vs: new URL('vendor/monaco/vs', location.href).href } });
+    require(['vs/editor/editor.main'], () => {
+      monaco = window.monaco;
+      mEditor = monaco.editor.create(document.getElementById('monaco'), { theme: 'vs-dark', automaticLayout: true, fontSize: 13, minimap: { enabled: false }, fontFamily: 'SF Mono, Menlo, monospace', scrollBeyondLastLine: false });
+      mEditor.onDidChangeModelContent(() => setDirty(true));
+      mEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveFile);
+      monacoLoading = false; cb();
+    });
+  }
+</script>
+</body>
+</html>

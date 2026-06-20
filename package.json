@@ -1,0 +1,46 @@
+{
+  "name": "claude-fleet",
+  "version": "2.0.0",
+  "description": "Claude Fleet — a desktop terminal-grid that runs many Claude Code agents in parallel git worktrees, with one orchestrator that splits a goal across workers, integrates, and ships.",
+  "main": "src/main.js",
+  "author": "aakashnarukula-dev",
+  "license": "MIT",
+  "homepage": "https://github.com/aakashnarukula-dev/claude-fleet",
+  "scripts": {
+    "start": "electron .",
+    "rebuild": "electron-rebuild -f -w node-pty",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.aakash.claudefleet",
+    "productName": "Claude Fleet",
+    "directories": {
+      "buildResources": "build"
+    },
+    "mac": {
+      "target": "dir",
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "identity": null
+    },
+    "files": [
+      "src/**/*",
+      "bin/**"
+    ],
+    "asarUnpack": [
+      "src/vendor/monaco/**",
+      "bin/**"
+    ]
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.1",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "monaco-editor": "^0.52.2"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "node-pty": "^1.0.0"
+  }
+}

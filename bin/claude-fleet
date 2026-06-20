@@ -1,0 +1,1257 @@
+#!/usr/bin/env bash
+#
+# claude-fleet — Dispatch-mode engine for the Claude Fleet app.
+#
+# One ORCHESTRATOR (a detached checkout at the project's default-branch tip) decomposes a goal,
+# spawns its own WORKERS — each in an isolated git worktree on a session-namespaced branch — then
+# integrates each worker's branch and pushes. Project knowledge lives in the repo's CLAUDE.md +
+# Claude Code auto-memory (shared across all worktrees of the repo), so sessions don't start from scratch.
+#
+# The Electron app drives these subcommands. CLAUDE_FLEET_REPO selects the project; CLAUDE_FLEET_SESSION
+# namespaces this run's worktrees/branches/status so multiple sessions don't collide.
+#
+#   --orchestrator         emit JSON for the solo orchestrator pane (creates the _main worktree)
+#   --spawn-file H FILE [--effort L]  (orchestrator) spawn a worker; brief read from FILE — static, so auto-approved.
+#                          Optional --effort L (low|medium|high|xhigh) hints the worker's reasoning effort
+#                          (default = app decides, currently 'high' for workers); omit to use the default.
+#   --spawn H TASK... [--effort L]     (orchestrator) spawn a worker with an inline task.
+#                          Optional --effort L (low|medium|high|xhigh) — see --spawn-file.
+#   --handoff T FILE       route a requirement straight INTO sibling pane T (it runs it) — no human copy-paste;
+#                          RE-ARMS T as tracked PENDING work even if T was already --merged/--done (so --statuses
+#                          shows it active and --next WAITS for its re-signalled --done instead of ALL DONE).
+#                          FAILS LOUDLY (non-zero) if T's slug/worktree is gone — then spawn a FRESH worker.
+#   --spawn-grid N FILE    (grid mode) open a NEW worker pane N seeded with the brief in FILE (no pane owned it)
+#   --next                 block until a worker is ready; print its slug (or FAILED:<slug>); exit 3 = ALL DONE,
+#                          exit 5 = TIMEOUT (only when CLAUDE_FLEET_NEXT_TIMEOUT>0 seconds is set)
+#   --ready                print EVERY slug ready to integrate now (.done, unmerged) — enables batch integration
+#   --watch                like --next but never exits on ALL DONE (waits for follow-up changes); a recorded
+#                          need must persist >=CLAUDE_FLEET_NEED_GRACE sec (default 8) before it wakes the orchestrator
+#   --merged S             mark slug S integrated (also clears a FAILED slug once the orchestrator has handled it)
+#   --done                 (inside a worker worktree) signal finished; re-arms if it was already merged
+#   --failed               (inside a worker worktree) signal it could NOT finish — orchestrator re-plans, doesn't hang
+#   --conflicts            list files touched by >1 unmerged worker (pre-merge collision radar)
+#   --need TEXT            (inside a worker worktree) record a prerequisite another task must produce first
+#   --needs                list recorded prerequisites (slug: text) for the orchestrator to schedule
+#   --unneed               (inside a worker worktree) retract a need this worker recorded by mistake
+#   --status TEXT          (inside a worker worktree) post a one-line live progress note
+#   --statuses             show the live progress board (slug: status) across the fleet
+#   --rebuild              (orchestrator) rebuild + reinstall the project's app from the integrated state, ONCE
+#                          per batch — runs .claude-fleet/rebuild or $CLAUDE_FLEET_REBUILD_CMD; no-op if neither
+#   --clean                remove this session's worktrees + branches
+#   --gc                   garbage-collect FULLY-INTEGRATED <repo>-fleet[-*] session folders (folder-only). Removes a
+#                          session's worktree dir ONLY when guarded: not the live session, parent repo present, every
+#                          fleet/s<sid>/* branch merged into the default branch, and no worktree dirty. SKIPs otherwise.
+#                          Runs automatically (same guards) when --next reports ALL DONE; CLAUDE_FLEET_NO_AUTOGC=1 opts out.
+#   --gc-all [root]        like --gc but sweeps EVERY <repo>-fleet[-*] folder under a ROOT dir (default: parent of
+#                          CLAUDE_FLEET_REPO, i.e. ~/Developer), deriving the parent repo + sid per folder. Reaps
+#                          finished/orphaned sessions across ALL repos — folders left behind by an app quit/crash with
+#                          no --next ALL DONE moment. Same G0-G4 guards; honors CLAUDE_FLEET_GC_EXCLUDE (colon-sep dirs).
+#
+set -euo pipefail
+
+REPO="${CLAUDE_FLEET_REPO:-$PWD}"; REPO="${REPO%/}"   # project repo (any git repo); the app always passes CLAUDE_FLEET_REPO
+SESSION="${CLAUDE_FLEET_SESSION:-}"                                        # per-tab id; isolates worktrees/branches/status
+FLEET="${REPO}-fleet${SESSION:+-$SESSION}"                                 # worktrees live beside the repo
+STATUS="$FLEET/.status"; MANIFEST="$STATUS/manifest"
+BR_PREFIX="fleet${SESSION:+/s$SESSION}"                                    # worker branch prefix
+DBR="main"                                                                 # default branch, set by set_default_branch
+
+die() { printf 'claude-fleet: %s\n' "$*" >&2; exit 1; }
+slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'; }
+json_str() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"; }   # JSON-encode a string
+
+has_origin() { git -C "$REPO" remote get-url origin >/dev/null 2>&1; }
+fetch_origin() { has_origin && git -C "$REPO" fetch --prune origin >&2 2>/dev/null || true; }   # start from latest
+
+set_default_branch() {
+  # `|| true` is REQUIRED: under set -euo pipefail a repo with no origin/HEAD would otherwise abort silently.
+  DBR="$(git -C "$REPO" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
+  [ -n "$DBR" ] || DBR="$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"   # no origin -> current branch
+  [ -n "$DBR" ] || DBR="main"
+}
+
+# DATA-LOSS FIX (2026-06-18): when there is NO 'origin' remote, the documented `git push origin HEAD:$DBR` step is
+# skipped, so integrated merge commits live ONLY on the orchestrator's DETACHED `_main` HEAD — they were NEVER written
+# into the canonical repo's real branch ref (refs/heads/$DBR). On teardown/prune those commits became unreachable →
+# dangling → GC-pending, and shipped work silently vanished from main (we recovered a whole Android UI rewrite from
+# `git fsck --lost-found`). This advances the CANONICAL branch ref to the integrated `_main` HEAD, FAST-FORWARD ONLY.
+# The fleet `_main` worktree shares the canonical repo's .git object store, so the commit objects are already present;
+# we only need to move the ref. Returns 0 on success/no-op, non-zero (LOUD) if it cannot safely advance — never a
+# silent leave-on-detached-HEAD. No-op when an origin EXISTS (that path still ships via push, unchanged).
+# Print the `git status --porcelain` lines for a worktree, EXCLUDING known-junk paths that are not real edits:
+#   * a `node_modules` entry (we symlink a shared node_modules into worktrees; it can show as modified/deleted)
+#   * UNTRACKED `.playwright-mcp/` artifacts (browser-mcp scratch output)
+# Anything else — a modified/staged TRACKED file, or any other untracked path — is preserved, so a real edit still
+# trips the clobber guard. Used by advance_canonical_branch to decide "clean enough to advance" without clobbering.
+real_porcelain() { # <worktree-dir>  -> prints the offending (real-edit) porcelain lines, empty when clean-for-advance
+  local wt="$1"
+  git -C "$wt" status --porcelain 2>/dev/null | awk '
+    {
+      path = $0; sub(/^.../, "", path)    # strip the 2-char status + 1 space (porcelain v1: "XY <path>")
+      # node_modules itself (top-level entry), with or without a trailing slash
+      if (path == "node_modules" || path == "node_modules/") next
+      # untracked .playwright-mcp artifacts ("?? .playwright-mcp/...")
+      if ($0 ~ /^\?\? \.playwright-mcp\//) next
+      print
+    }'
+}
+
+advance_canonical_branch() {
+  has_origin && return 0                                   # origin path unchanged: workers/orchestrator push to it
+  local odir="$FLEET/_main"
+  [ -d "$odir" ] || return 0                               # nothing integrated locally (e.g. grid mode pushes per-worker)
+  set_default_branch                                       # ensure $DBR reflects the canonical default branch
+  local head target
+  head="$(git -C "$odir" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  [ -n "$head" ] || { printf 'claude-fleet: WARN cannot resolve _main HEAD (%s) — canonical %s NOT advanced.\n' "$odir" "$DBR" >&2; return 1; }
+
+  if ! target="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$DBR" 2>/dev/null)"; then
+    # No local branch ref yet — create it pointing at the integrated HEAD (the commits exist; just name them).
+    git -C "$REPO" update-ref "refs/heads/$DBR" "$head" \
+      && { printf 'claude-fleet: created canonical %s at %s (integrated state).\n' "$DBR" "${head:0:12}" >&2; return 0; }
+    printf 'claude-fleet: REFUSED — could not create canonical %s ref.\n' "$DBR" >&2; return 1
+  fi
+
+  [ "$head" = "$target" ] && return 0                       # already up to date — nothing to do
+
+  # Locate the worktree (if any) that currently has $DBR checked out — usually the canonical repo itself. Updating
+  # the ref out from under a live checkout would desync its index/working tree, so any ref move must go THROUGH it.
+  local dbr_wt=""
+  dbr_wt="$(git -C "$REPO" worktree list --porcelain 2>/dev/null \
+    | awk -v b="refs/heads/$DBR" 'BEGIN{RS="";FS="\n"} { wt=""; for(i=1;i<=NF;i++){ if($i ~ /^worktree /) wt=substr($i,10); if($i=="branch "b){print wt; exit} } }')"
+
+  # If $DBR is checked out, it must be clean of REAL edits before we touch it. B2: a symlinked/committed node_modules
+  # showing as modified/deleted and untracked .playwright-mcp/ artifacts are NOT real edits — real_porcelain filters
+  # them out. Any OTHER modified/staged tracked file (or other untracked path) still trips the clobber guard.
+  local dirty=""
+  if [ -n "$dbr_wt" ] && [ -d "$dbr_wt" ]; then
+    dirty="$(real_porcelain "$dbr_wt")"
+    if [ -n "$dirty" ]; then
+      printf 'claude-fleet: REFUSED to advance canonical %s — checkout at %s has UNCOMMITTED changes:\n%s\n  To reconcile: commit or stash these in %s, then re-run (or: git -C %s merge --ff-only %s).\n' \
+        "$DBR" "$dbr_wt" "$dirty" "$dbr_wt" "$dbr_wt" "${head:0:12}" >&2
+      return 1
+    fi
+  fi
+
+  # Is the integrated HEAD a TRUE fast-forward over $DBR (current $DBR tip is an ancestor of HEAD)?
+  if git -C "$REPO" merge-base --is-ancestor "$target" "$head" 2>/dev/null; then
+    # Fast-forward path.
+    if [ -n "$dbr_wt" ] && [ -d "$dbr_wt" ]; then
+      git -C "$dbr_wt" merge --ff-only "$head" >/dev/null 2>&1 \
+        && { printf 'claude-fleet: advanced canonical %s to %s (ff in worktree %s).\n' "$DBR" "${head:0:12}" "$dbr_wt" >&2; return 0; }
+      printf 'claude-fleet: REFUSED — ff of canonical %s in %s failed; resolve manually:\n  git -C %s merge --ff-only %s\n' "$DBR" "$dbr_wt" "$dbr_wt" "$head" >&2; return 1
+    fi
+    # $DBR is not checked out anywhere — safe to move the ref directly (ff-only, guarded above).
+    git -C "$REPO" update-ref "refs/heads/$DBR" "$head" "$target" \
+      && { printf 'claude-fleet: advanced canonical %s to %s (fast-forward).\n' "$DBR" "${head:0:12}" >&2; return 0; }
+    printf 'claude-fleet: REFUSED — update-ref of canonical %s failed (ref moved concurrently?); resolve manually:\n  git -C %s update-ref refs/heads/%s %s\n' "$DBR" "$REPO" "$DBR" "$head" >&2; return 1
+  fi
+
+  # NON-FAST-FORWARD: the canonical branch diverged from the integrated HEAD. B1: rather than REFUSING outright, if the
+  # checkout is clean of real edits, auto-reconcile with a no-ff MERGE of the integrated HEAD into $DBR (preserving all
+  # commits on both sides). This needs $DBR checked out in a worktree (so the merge updates ref + tree together). On a
+  # REAL conflict, abort the merge and fall back to the original REFUSED behavior — never leave a half-merged tree.
+  if [ -n "$dbr_wt" ] && [ -d "$dbr_wt" ]; then
+    if git -C "$dbr_wt" merge --no-ff --no-edit \
+         -m "claude-fleet: integrate fleet _main ${head:0:12} into $DBR" "$head" >/dev/null 2>&1; then
+      printf 'claude-fleet: reconciled canonical %s with integrated %s (no-ff merge in worktree %s).\n' "$DBR" "${head:0:12}" "$dbr_wt" >&2
+      return 0
+    fi
+    # Merge failed (conflict or other) — abort to restore a clean tree, then refuse loudly.
+    git -C "$dbr_wt" merge --abort >/dev/null 2>&1 || true
+    printf 'claude-fleet: REFUSED to advance canonical %s — integrated HEAD %s is NOT a fast-forward over %s (%s) and the auto-merge hit a CONFLICT (aborted, tree restored).\n  Resolve manually in %s:\n    git -C %s merge --no-ff %s\n  then re-run; or commits will be lost on teardown.\n' \
+      "$DBR" "${head:0:12}" "$DBR" "${target:0:12}" "$dbr_wt" "$dbr_wt" "$head" >&2
+    return 1
+  fi
+
+  # Non-ff and $DBR is NOT checked out in any worktree — we cannot safely run a merge with a working tree. Refuse loudly
+  # with the exact reconciliation command (check out $DBR somewhere, or merge in the canonical repo).
+  printf 'claude-fleet: REFUSED to advance canonical %s — integrated HEAD %s is NOT a fast-forward over %s (%s) and %s is not checked out in any worktree to merge into.\n  Reconcile in the canonical repo: git -C %s merge --no-ff %s\n  before tearing down the fleet, or commits will be lost.\n' \
+    "$DBR" "${head:0:12}" "$DBR" "${target:0:12}" "$DBR" "$REPO" "$head" >&2
+  return 1
+}
+
+reset_state() { rm -rf "$STATUS"; mkdir -p "$STATUS"; : > "$MANIFEST"; }
+
+# symlink heavy gitignored DEPENDENCY dirs from the main checkout into a new worktree so they're SHARED, not
+# copied (a worktree already shares .git; this shares node_modules/etc too) — keeps each worktree small.
+# Only dependency caches (read-heavy, safe to share); NOT build outputs (dist/target) which differ per branch.
+link_shared_dirs() { # <worktree-dir>
+  local dir="$1" d
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  for d in node_modules .venv venv vendor/bundle; do
+    [ -d "$REPO/$d" ] || continue            # main checkout has it
+    [ -e "$dir/$d" ] && continue             # worktree already has one (tracked) — don't clobber
+    case "$d" in */*) mkdir -p "$dir/${d%/*}" 2>/dev/null || true ;; esac
+    ln -s "$REPO/$d" "$dir/$d" 2>/dev/null || true
+  done
+}
+
+# ---------------------------------------------------------------- prompts
+
+# the worker the orchestrator spawned with a concrete task (starts immediately)
+spawn_worker_prompt() { # heading slug dir task
+  local heading="$1" slug="$2" dir="$3" task="$4"
+  cat <<EOF
+You are a worker in a claude-fleet run. This pane is "${heading}".
+You are in the git worktree ${dir}, on branch ${BR_PREFIX}/${slug} (cut from the orchestrator's latest integrated state).
+
+FIRST read CLAUDE.md (repo root) and your auto-memory for this project — follow its conventions, build/test
+commands, and rules. Don't re-explore or re-derive what's already documented there.
+
+Your task (assigned by the orchestrator):
+${task}
+
+Do this task now. PARALLELIZE FOR SPEED: if the task splits into INDEPENDENT pieces (different files/areas, no
+ordering dependency), run them as parallel inline subagents (the Task/Agent tool — several agents in ONE
+message), not serially. You have ONE worktree, so NEVER run parallel agents that edit the same file — batch
+same-file changes into a single pass; reserve parallelism for genuinely independent pieces. Collect + verify, then:
+- Commit to this branch (${BR_PREFIX}/${slug}). SEPARATE PLAIN git commands — \`git add <files>\` then
+  \`git commit -m "..."\` — never \`git -C <path> ...\`, never chain with \`&&\` (run each on its own).
+  Use a CLEAR commit message (what changed + why) — the orchestrator reads it to resolve any merge conflict.
+- Do NOT checkout the default branch, do NOT push, do NOT touch other branches — the orchestrator integrates this.
+- If you discover something durable (a build quirk, a gotcha, a "don't touch X"), add it to CLAUDE.md or memory.
+- When fully finished and committed, run exactly: claude-fleet --done
+- Optional progress ping (lets the orchestrator see live status):  claude-fleet --status "<short note>"
+- FIX-FIRST, ESCALATE-THE-REST: actually FIX every part you can reach — anything in your worktree/scope fence, plus
+  anything the user assigns you DIRECTLY (even a tool/file outside the repo, e.g. ~/.local/bin/claude-fleet — a
+  direct ask IS in scope; do it, don't punt). NEVER diagnose-and-route fixable work and leave it unfixed. Only
+  AFTER fixing what you can, escalate the parts that are GENUINELY out of scope AND that you did NOT fix. When you
+  report, state plainly what you FIXED vs what you ESCALATED (and to whom) — don't present a punt as completion.
+- For the remaining work that ISN'T yours to do here (out of your scope fence, a shared file, a prerequisite another
+  task must produce first, and you did not fix it) you have TWO channels — use them instead of editing out-of-scope
+  or emitting paste-text:
+    * ASK THE ORCHESTRATOR to schedule/spawn it:  claude-fleet --need "<what's needed + why + which files>"
+      This is how you tell the orchestrator what to do. It WORKS EVEN AFTER you've finished and been integrated —
+      a post-merge --need still surfaces as a follow-up request the orchestrator acts on (spawns a worker / hands
+      off). You never message the orchestrator or other workers any other way. Recorded a --need by MISTAKE
+      (e.g. the user said "sent by mistake")? Retract it immediately with  claude-fleet --unneed  so the
+      orchestrator's settle window absorbs it before it acts.
+    * HAND IT STRAIGHT TO THE SIBLING PANE that owns those files (it runs it autonomously): write the brief to
+      /tmp/cfleet_handoff_${slug}.txt, then  claude-fleet --handoff "<sibling heading/slug>"
+      /tmp/cfleet_handoff_${slug}.txt  (list siblings: claude-fleet --statuses).
+  If it belongs to a sibling AND the orchestrator should track it, do both — BUT scope your --need to ONLY the parts
+  you did NOT hand off, and for anything you DID hand off say "ALREADY HANDED OFF to <slug>". claude-fleet auto-links
+  your handoff to your need so --needs flags it "[ALREADY HANDED OFF → <slug>]" and the orchestrator TRACKS it
+  without RE-DISPATCHING (otherwise the sibling gets told the same thing twice).
+- If you genuinely CANNOT finish (blocked or broken), don't hang — run exactly:  claude-fleet --failed
+- INCOMING WORK WHILE YOU'RE BUSY: a new task can land in this pane any time — typed by the user, or --handoff'd
+  from a sibling worker — while you're mid-task. NEVER drop, abandon, or interrupt what you're already doing.
+  Capture every incoming task with TodoWrite so none are lost, then:
+    * INDEPENDENT of your current work (different files/areas, no ordering dependency) and non-blocking → launch an
+      inline sub-agent (Task/Agent tool) to do it IN PARALLEL, or queue it and start it the moment you finish.
+    * DEPENDS on your current work, or touches the SAME files → queue it and do it AFTER you finish — you have ONE
+      worktree, so a parallel agent on the same files would clobber your in-flight edits.
+  Finish → commit → claude-fleet --done for EACH task (re-run --done after every one); keep the pane alive for more.
+
+Start now.
+EOF
+}
+
+# the orchestrator: starts solo, reads project memory, decomposes goals, spawns workers, integrates + ships
+spawn_orchestrator_prompt() { # dir dbr seed(0/1)
+  local dir="$1" dbr="$2" seed="$3" seedstep="" newproj=""
+  if [ "${CLAUDE_FLEET_NEW_PROJECT:-}" = 1 ]; then
+    newproj="NO PROJECT FOLDER chosen yet. This is a brand-new project session.
+FIRST: ask the user what they want to build (ONE short question). Wait for their answer.
+Derive a short kebab-case folder name from their idea (e.g. 'recipe-box').
+Write the user's FULL description to /tmp/cfleet_newproj_goal.txt (Write tool).
+Then run EXACTLY:  claude-fleet --new-project <folder-name> /tmp/cfleet_newproj_goal.txt
+Do NOT spawn any workers, do NOT create folders yourself, do NOT proceed until you've run --new-project. The app
+will create ~/Developer/<folder-name>, relaunch you targeting it, and re-send the goal so you start building
+automatically.
+
+"
+  fi
+  if [ "$seed" = 1 ]; then
+    seedstep="
+STEP 0 — SEED PROJECT MEMORY (this project has no CLAUDE.md yet). Before any goal: briefly explore the repo and
+write a concise CLAUDE.md at the repo root — build/run/test commands, the architecture map, key conventions, and
+any hard rules a teammate would need. Keep it under ~150 lines. Commit it on ${dbr} (and 'git push origin
+HEAD:${dbr}' if an 'origin' remote exists) so the workers you spawn inherit it. Then continue.
+"
+  fi
+  cat <<EOF
+${newproj}You are the ORCHESTRATOR for a claude-fleet run on the project at ${REPO}.
+You are in ${dir}, a DETACHED checkout at ${dbr}'s tip. You start ALONE and create your own workers.
+
+BIAS TO ACTION: do NOT over-deliberate before dispatching. For a simple single-area goal, skip heavy
+decomposition — pick the cheaper tool (see below) and start IMMEDIATELY, then go to --watch. Reserve multi-phase
+dependency planning for goals that genuinely need it. Spawning fast beats a perfect upfront plan; you can
+always spawn more workers after.
+
+WORKER vs PARALLEL AGENT — pick the cheaper tool, DEFAULT to the Agent for small jobs. A fleet --spawn-file worker
+is EXPENSIVE to start (cuts a git worktree + boots a whole fresh claude pane = tens of seconds to minutes before
+its first output). For a SMALL job — one or a few files, low risk, in-repo, no independent parallel threads needed
+— do NOT spawn a fleet worker. Instead launch a parallel Agent (the Agent tool / a subagent) directly in your own
+checkout, let it make + verify the change, then commit + integrate it yourself. That is the DEFAULT for small
+single-area changes and is far faster. Reserve fleet --spawn-file workers for SUBSTANTIAL, multi-file, or genuinely
+parallelizable work — independent threads that each need their own isolated worktree. When unsure and the change
+is small: parallel Agent, not a worker. (This generalizes the trivial-self-discovered-fix exception below.)
+
+MATCH EFFORT TO THE TASK — decide per dispatch, do NOT default everything to one level. When you spawn a fleet
+worker, pass --effort to fit the job: 'low' for mechanical/trivial edits (rename, copy tweak, one-line fix, config
+bump), 'medium' for small contained changes, 'high' for normal multi-file feature work (the default if you say
+nothing), 'xhigh' ONLY for genuinely architectural / high-risk / deeply-cross-cutting work that needs maximum
+reasoning. Low effort starts and finishes much faster, so under-spend on simple tasks and reserve xhigh for the
+few that truly earn it. Judge each task on the go; a batch of workers may legitimately span several effort levels.
+
+PROJECT MEMORY — read it first, keep it current:
+- Read CLAUDE.md (repo root) if present, plus your auto-memory (MEMORY.md), to recover everything already known
+  about this project. Do NOT re-explore what's documented there.
+- After integrating work, record durable facts (build/test commands, architecture, gotchas, "don't touch X")
+  into CLAUDE.md and/or memory. This is how the next session starts smart and we stop re-explaining / wasting tokens.
+${seedstep}
+TREAT EVERY GOAL I SEND AS A PERSISTENT TODO — track them with the TodoWrite tool, and NEVER drop one. When a NEW
+goal arrives while work is already running, do NOT reflexively wait for the current one to finish. FIRST judge
+whether the new goal is INDEPENDENT of everything in flight (different files/areas/products/repos, and it doesn't
+need an in-flight worker's output):
+  • INDEPENDENT → dispatch it RIGHT NOW, IN PARALLEL — spawn its worker(s) immediately alongside the running
+    ones. Each worker is its own isolated worktree, so unrelated goals run concurrently. (E.g. "migrate the repo
+    to another account" and "fix this UI bug" are unrelated → fire BOTH at once; don't make one wait on the other.)
+  • DEPENDENT / overlapping (needs another goal's output, or touches the same files) → queue it and run it after
+    the blocker integrates.
+DEFAULT TO PARALLEL. Only serialize when there's a real dependency or file overlap. Never sit idle on a new goal
+just because an earlier one is still draining — drain the running phase and dispatch the independent new goal in
+the same breath.
+
+HARD RULE — you COORDINATE, you NEVER implement. No feature/fix work in this pane. The only repo edits you make
+here are: seeding/curating CLAUDE.md, and resolving MERGE CONFLICTS while integrating. Everything else is a
+worker's job — even a one-line change → spawn a worker. This applies to the FIRST goal AND every follow-up.
+
+EXCEPTION — trivial self-discovered fixes: for a TINY, fully in-scope, low-risk fix you discover yourself during
+integration/verification (e.g. a one-line crash fix, a wrong resource ref), you MAY launch a lightweight parallel
+Agent (the Agent tool / a subagent) to make + verify the fix directly, instead of a full --spawn-file worker,
+PROVIDED: (a) the change is genuinely small and in-scope, (b) it does NOT touch files an in-flight worker is
+currently editing (else queue it or fold it into that worker to avoid clobbering), and (c) it is built/verified
+before integrating. Anything non-trivial, cross-cutting, or overlapping active worker files still goes through a
+real fleet worker. NOTE: a fleet --spawn-file worker only commits inside a repo worktree, so for edits OUTSIDE the
+repo (e.g. tooling/config files) you MUST use a parallel Agent, not a fleet worker.
+
+SPAWN-FIRST — when my goal NAMES the threads/pages/products to work on (e.g. "we'll work on X, Y, and a new Z"),
+spawn ONE long-lived worker per named thread RIGHT AWAY. Do NOT ask me for task specs, scope, product details, or
+ordering before spawning — my workflow is to brief each worker DIRECTLY IN ITS PANE. Write a generic per-thread
+brief (scope fence + project rules + "WAIT for the user to type the task in this pane, then implement → bust-cache
+→ commit → claude-fleet --done"), fan all independent threads out in ONE phase, then go straight to --watch. Only
+ask me a question when it actually blocks INTEGRATION (e.g. a merge-conflict intent) — never to START work.
+
+For EACH goal I give you (now and every time after — repeat this whole cycle):
+1. Decompose into subtasks, then map DEPENDENCIES: does any subtask need another's output — a function, type,
+   API/contract, shared file, or scaffolding that another subtask creates? Group the subtasks into PHASES:
+     • All independent (no shared output, no overlapping files) → ONE phase: fan them all out together.
+     • Some build on a foundation → that foundation is PHASE 1; the subtasks that depend on it come in a LATER
+       phase. Keep each phase as parallel as possible (everything with no unmet dependency runs together).
+   Every worker you spawn is cut from your LATEST INTEGRATED STATE, so later-phase workers automatically build on
+   the finished code from earlier phases. That's why ordering matters — and why workers never need to talk.
+2. Run ONE phase at a time. For each subtask IN THE CURRENT PHASE: write its brief to /tmp/cfleet_<slug>.txt
+   (Write tool), then:  claude-fleet --spawn-file "<short 1-3 word heading>" /tmp/cfleet_<slug>.txt
+   PLAIN literal args only — NEVER \`claude-fleet --spawn "h" "\$(cat file)"\`, no \$(...), backticks, or pipes
+   (command substitution can't be auto-approved and will pause for manual permission). --spawn-file avoids that.
+3. DRAIN the current phase — run  claude-fleet --next  (blocks until a worker is ready). Then BATCH-INTEGRATE so
+   you push + deploy ONCE for the whole batch, not once per worker (PLAIN git in ${dir}, no -C, no &&):
+     claude-fleet --ready                  → EVERY slug ready right now.
+     claude-fleet --conflicts              → any file touched by >1 ready branch. Merge THOSE branches one at a
+                                           time and resolve carefully; merge the non-overlapping rest freely.
+     For each ready slug S:  git merge --no-ff ${BR_PREFIX}/S
+       On conflict, read BOTH sides first — git log --oneline ${dbr}..${BR_PREFIX}/S — then resolve preserving
+       both intents. If one merge is too tangled, skip it, integrate the rest, handle the straggler on its own.
+     Verify ONCE with the project's build/test (per CLAUDE.md); run the cache-bust step if CLAUDE.md defines one.
+     git push origin HEAD:${dbr}  ONCE     (auto-deploy is expected; skip only if there is no 'origin' remote — when
+                                           there's no origin, claude-fleet --merged below advances the canonical
+                                           ${dbr} ref to your integrated state automatically, so the commits are
+                                           never stranded on your detached HEAD; if it prints REFUSED, STOP and
+                                           resolve before --clean or the work will be lost)
+     claude-fleet --rebuild  ONCE          if this batch changed the app's OWN code (e.g. frontend src/ or native
+                                           src-tauri/), rebuild + reinstall the running app from the integrated
+                                           state so the live app isn't stale — DON'T punt this to the user. It is
+                                           a no-op when the project configures no rebuild (.claude-fleet/rebuild
+                                           or \$CLAUDE_FLEET_REBUILD_CMD), and you skip it when the batch touched
+                                           no app code (docs/config/test-only).
+     claude-fleet --merged S               for EACH integrated slug.
+   If --next prints  FAILED:S  → that worker gave up: do NOT merge it. Re-plan (respawn with a fresh brief, or
+   drop it), then  claude-fleet --merged S  to clear it. (Optional: export CLAUDE_FLEET_NEXT_TIMEOUT=1800 so
+   --next prints TIMEOUT instead of blocking forever on a silently-dead pane.  claude-fleet --statuses shows the
+   live progress board anytime.)
+   Then run  claude-fleet --needs  — a worker may record a prerequisite (a type/API/scaffold another task must
+   produce) OR a follow-up REQUEST it can't do itself (cross-cutting work outside its scope fence, a shared-file
+   change, "spawn a worker to do X"). Schedule it as a NEW subtask (this phase if independent, else the next).
+   Entries tagged "(post-merge follow-up)" come from an ALREADY-INTEGRATED worker — still act on them: SPAWN a new
+   worker (or --handoff to the sibling that owns those files), THEN  claude-fleet --need-clear <slug>  so it stops
+   re-surfacing. Don't declare the goal done while an unhandled need remains.
+   A need line tagged "[ALREADY HANDED OFF → X]" is ALREADY running in sibling X (the recording worker handed it off
+   itself) — do NOT spawn or --handoff those parts again (you'd tell X the same thing twice); only schedule the parts
+   NOT already handed off, then  claude-fleet --need-clear <slug>  once X re-signals --done.
+   HANDOFF SAFETY:  claude-fleet --handoff <slug> <file>  RE-ARMS the target as tracked PENDING work even if it was
+   already --merged — it clears the merged/done state and drops a .handoff marker, so --statuses shows it active and
+   --next will WAIT for its re-signalled --done instead of reporting ALL DONE. So a handoff is ALWAYS followed by a
+   tracked pending unit of work — never a silent loss. If --handoff exits NON-ZERO (unknown slug, or the pane's
+   worktree is gone = dead), the work is NOT queued: SPAWN A FRESH worker for that brief instead. Never assume a
+   failed handoff was delivered.
+   "ALL DONE" (exit code 3) = the CURRENT phase is fully integrated. If more phases remain, go back to step 2 for
+   the next phase — its workers will now see the finished foundation. Otherwise continue.
+4. Report a summary, write anything durable into CLAUDE.md/memory, then WAIT for my next goal. When it comes, do
+   this whole cycle AGAIN with fresh workers — never do the work here yourself.
+5. Between goals run  claude-fleet --watch  — FIRST  export CLAUDE_FLEET_WATCH_NEEDS=1  so it ALSO wakes on a
+   worker's request, not just on re-signalled work. When it prints slug S, re-integrate + ship it (step 3). When it
+   prints  NEED:S , a worker (often an already-integrated one) is asking for follow-up work: run  claude-fleet
+   --needs , act on S's request (SPAWN a worker for it, or --handoff to the sibling that owns those files), then
+   claude-fleet --need-clear S  so it stops re-firing. Either way, run  claude-fleet --watch  again afterward. If I
+   type a new GOAL into this pane instead, stop watching and dispatch it via steps 1-3.
+
+Wait for my goal.
+EOF
+}
+
+# ---------------------------------------------------------------- subcommands
+
+# emit JSON for the solo orchestrator pane; creates the _main detached worktree and detects whether to seed memory
+cmd_orchestrator() {
+  [ -d "$REPO/.git" ] || die "not a git repository: $REPO"
+  fetch_origin
+  set_default_branch
+  reset_state
+  local odir="$FLEET/_main"
+  if [ ! -d "$odir" ]; then
+    git -C "$REPO" worktree add --detach "$odir" "origin/$DBR" >&2 2>/dev/null \
+      || git -C "$REPO" worktree add --detach "$odir" "$DBR" >&2
+  fi
+  link_shared_dirs "$odir"
+  local seed=0
+  [ -f "$odir/CLAUDE.md" ] || [ -f "$odir/.claude/CLAUDE.md" ] || seed=1
+  printf '[{"role":"orchestrator","slug":"orchestrator","heading":"Orchestrator","dir":%s,"prompt":%s}]\n' \
+    "$(json_str "$odir")" "$(json_str "$(spawn_orchestrator_prompt "$odir" "$DBR" "$seed")")"
+}
+
+# spawn a worker for a subtask; writes a .spawn marker the app turns into a pane.
+# Reads optional EFFORT (low|medium|high|xhigh, already validated by the caller): when set, the marker JSON
+# gains an "effort" field so the app can launch the worker at that reasoning effort; when empty the marker is
+# emitted exactly as before (no extra field).
+_do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
+  local heading="$1" task="$2" effort="${EFFORT:-}"
+  [ -n "$heading" ] || die "spawn needs <heading> <task>"
+  [ -d "$STATUS" ] || die "no active session"
+  local slug base k=2 branch dir
+  slug="$(slugify "$heading")"; [ -n "$slug" ] || slug="worker"; base="$slug"
+  while [ -d "$FLEET/$slug" ] || grep -qx "$slug" "$MANIFEST" 2>/dev/null; do slug="$base-$k"; k=$((k + 1)); done
+  branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
+  # cut from the orchestrator's LATEST INTEGRATED STATE (_main HEAD) so dependency-phased workers build on the
+  # finished foundation from earlier phases — works with or without a remote. Fall back to origin/DBR then DBR.
+  local base; base="$(git -C "$FLEET/_main" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  [ -n "$base" ] || base="origin/$DBR"
+  git -C "$REPO" worktree add -b "$branch" "$dir" "$base" >/dev/null 2>&1 \
+    || git -C "$REPO" worktree add -b "$branch" "$dir" "$DBR" >&2
+  link_shared_dirs "$dir"
+  printf '%s\n' "$slug" >> "$MANIFEST"
+  rm -f "$STATUS/$slug.done" "$STATUS/$slug.merged" "$STATUS/$slug.closed" "$STATUS/$slug.working"   # fresh worker: clear any stale closed/done/merged/working state if the slug is reused
+  # Optional "effort" field: only emitted when a (validated) effort was passed, so a spawn WITHOUT --effort
+  # produces the original marker shape byte-for-byte. json_str keeps it valid regardless of the value.
+  local effort_field=""
+  [ -n "$effort" ] && effort_field=",\"effort\":$(json_str "$effort")"
+  printf '{"slug":%s,"heading":%s,"dir":%s,"prompt":%s%s}' \
+    "$(json_str "$slug")" "$(json_str "$heading")" "$(json_str "$dir")" \
+    "$(json_str "$(spawn_worker_prompt "$heading" "$slug" "$dir" "$task")")" "$effort_field" > "$STATUS/$slug.spawn"
+  printf 'Spawned worker "%s" (%s).\n' "$heading" "$slug"
+}
+
+# validate + capture an optional "--effort LEVEL" flag from a spawn subcommand's args, in a position-tolerant way
+# (it may trail the positional args, e.g. --spawn "H" "task" --effort high). Echoes the remaining (non-effort)
+# args one per line so the caller can re-read them; sets EFFORT for _do_spawn to pick up.
+EFFORT=""
+parse_effort_args() { # <args...>  -> sets EFFORT, prints remaining args (NUL-safe enough for our literal use)
+  EFFORT=""
+  local -a rest=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --effort)
+        [ -n "${2:-}" ] || die "--effort needs a level (low|medium|high|xhigh)"
+        case "$2" in low|medium|high|xhigh) EFFORT="$2" ;; *) die "invalid --effort '$2' (use low|medium|high|xhigh)" ;; esac
+        shift 2 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  ARGS_REST=("${rest[@]+"${rest[@]}"}")   # remaining positional args, effort stripped out
+}
+cmd_spawn() {                                                              # inline task (short) [+ optional --effort]
+  parse_effort_args "$@"; set -- ${ARGS_REST[@]+"${ARGS_REST[@]}"}
+  local heading="${1:-}"; shift || true; _do_spawn "$heading" "$*"
+}
+# read the (long/quote-heavy) brief from a FILE so the spawn command stays static and auto-approves
+# (claude-fleet --spawn "h" "$(cat file)" contains command substitution and would prompt every time).
+cmd_spawn_file() { # <heading> <task-file> [--effort LEVEL]
+  parse_effort_args "$@"; set -- ${ARGS_REST[@]+"${ARGS_REST[@]}"}
+  local heading="${1:-}" path="${2:-}"
+  [ -n "$path" ] || die "--spawn-file needs <heading> <task-file>"
+  [ -f "$path" ] || die "task file not found: $path"
+  _do_spawn "$heading" "$(cat "$path")"
+}
+
+# route a requirement DIRECTLY to a sibling pane (by product name OR slug): writes <slug>.task, which the app
+# types into that pane and submits — so a pane that realizes work belongs to a sibling HANDS IT OFF and the
+# sibling RUNS it, instead of printing paste-text for the human to copy. Brief read from a FILE so the command
+# stays static (no command-substitution permission prompt). Works in both modes.
+#
+# A handoff must NEVER silently no-op. If the target was already --merged (or --done/--failed), copying a .task
+# alone left ALL its done/merged state intact, so --next skipped it and reported ALL DONE — the handed-off work was
+# untracked and lost (observed live 2026-06-15). So --handoff now RE-ARMS the target as tracked PENDING work:
+# clears its merged/done/failed state and drops a .handoff marker. --statuses then shows it active, --next WAITS
+# for its re-signalled --done (no premature ALL DONE), and its eventual --done makes it --ready for integration.
+# If the slug is unknown or its worktree is gone (pane dead), it FAILS LOUDLY (non-zero) telling the orchestrator
+# to spawn a FRESH worker — never a silent success that does nothing.
+cmd_handoff() { # <target-pane> <task-file>
+  local target="$1" path="$2"
+  [ -n "$target" ] && [ -n "$path" ] || die "--handoff needs <target-pane> <task-file>"
+  [ -f "$path" ] || die "task file not found: $path"
+  [ -d "$STATUS" ] || die "no active fleet"
+  local slug; slug="$(slugify "$target")"
+  grep -qx "$slug" "$MANIFEST" 2>/dev/null \
+    || die "no sibling pane '$target' (slug '$slug') in this fleet — handoff CANNOT deliver; spawn a FRESH worker for this brief instead. (panes: claude-fleet --statuses)"
+  # Liveness guard: the pane's worktree must still exist. If it was removed (e.g. --clean'd), the pane is dead and
+  # a handoff would vanish — fail loudly so the orchestrator spawns fresh rather than trusting a lost handoff.
+  [ -d "$FLEET/$slug" ] || die "pane '$target' (slug '$slug') has no worktree at $FLEET/$slug — it is DEAD; handoff CANNOT deliver, spawn a FRESH worker for this brief instead."
+  # Liveness guard 2: the pane's WINDOW may have been CLOSED while its worktree lingers on disk. The app drops a
+  # <slug>.closed marker when the pane's pty dies (user closed it / claude exited), so the worktree-exists check above
+  # is not enough — a handoff would write a .task no live claude ever reads (the "black hole"). Fail loudly.
+  [ -f "$STATUS/$slug.closed" ] && die "pane '$target' (slug '$slug') was CLOSED — its claude is no longer running; handoff CANNOT deliver, spawn a FRESH worker for this brief instead."
+  cp "$path" "$STATUS/$slug.task"             # the app types this into the pane (unchanged contract)
+  cp "$path" "$STATUS/$slug.handoff"          # marker: outstanding handed-off unit of work, keeps --next tracking it
+  rm -f "$STATUS/$slug.merged" "$STATUS/$slug.done" "$STATUS/$slug.failed"   # RE-ARM: tracked, pending, not ALL DONE
+  # DEDUP: if this handoff came FROM a worker worktree, link it to that worker so a
+  # co-recorded --need covering the same work isn't ALSO re-dispatched by the
+  # orchestrator (observed double-tell 2026-06-15). --needs surfaces this link as
+  # "[ALREADY HANDED OFF → <slug>]" so the orchestrator tracks without re-telling.
+  local src_branch src_slug
+  src_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  case "$src_branch" in
+    "$BR_PREFIX"/*) src_slug="${src_branch#"$BR_PREFIX"/}"; printf '%s\n' "$slug" >> "$STATUS/$src_slug.handoff_to" ;;
+  esac
+  printf 'Handed off to "%s" (%s) — RE-ARMED as tracked pending work; it will run this now, then re-signal --done.\n' "$target" "$slug"
+}
+
+cmd_done() {
+  [ -d "$STATUS" ] || die "no active fleet"
+  local branch slug
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
+  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  rm -f "$STATUS/$slug.merged" "$STATUS/$slug.failed" "$STATUS/$slug.handoff" "$STATUS/$slug.working"   # re-arm; supersedes prior FAILED; clears any outstanding handoff; clears the app's live .working bridge (explicit --done supersedes it)
+  # P3: auto-record files this worker touched so the orchestrator can detect cross-branch overlaps (--conflicts)
+  set_default_branch
+  local cbase
+  cbase="$(git merge-base HEAD "origin/$DBR" 2>/dev/null || git merge-base HEAD "$DBR" 2>/dev/null || true)"
+  [ -n "$cbase" ] && git diff --name-only "$cbase" HEAD > "$STATUS/$slug.claims" 2>/dev/null || true
+  touch "$STATUS/$slug.done"
+  printf 'Marked "%s" done. Orchestrator will integrate it.\n' "$slug"
+}
+
+cmd_next() {
+  [ -f "$MANIFEST" ] || die "no manifest — is a fleet running?"
+  local s pending failed all_merged
+  local timeout="${CLAUDE_FLEET_NEXT_TIMEOUT:-0}" start=$SECONDS   # seconds; 0 = block forever (default, back-compat)
+  while true; do
+    pending=""; failed=""; all_merged=1
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      # A CLOSED pane (window closed / pty died; app dropped <slug>.closed) is DEAD — its claude can no longer signal
+      # --done. Treat it like merged: skip it so it neither blocks --next nor keeps ALL DONE from firing. (Don't report
+      # it as work; the orchestrator should spawn fresh if it still needs that thread.)
+      [ -f "$STATUS/$s.closed" ] && continue
+      # An outstanding .handoff keeps a worker tracked as ACTIVE even if a .merged marker lingers — never report
+      # ALL DONE while handed-off work hasn't re-signalled --done. (A re-armed handoff has .merged removed anyway;
+      # this is belt-and-suspenders so ALL DONE can never fire over a pending handoff.)
+      # A re-activated worker: an already-integrated (.merged/.done) pane that picked up a NEW in-pane task is RUNNING
+      # again with no fresh .done yet — the app bridges this with a live `<slug>.working` marker. Count it as ACTIVE so
+      # --next keeps BLOCKING (never reports ALL DONE while a worker is mid-task), but it has nothing to integrate yet,
+      # so don't surface it as `pending`. A later --done clears .working and supersedes this (and clears .merged here too).
+      if [ -f "$STATUS/$s.working" ] && [ ! -f "$STATUS/$s.done" ] && [ ! -f "$STATUS/$s.failed" ]; then all_merged=0; continue; fi
+      [ -f "$STATUS/$s.merged" ] && [ ! -f "$STATUS/$s.handoff" ] && continue
+      all_merged=0
+      if [ -f "$STATUS/$s.failed" ]; then failed="$s"; break; fi
+      if [ -f "$STATUS/$s.done" ]; then pending="$s"; break; fi
+    done < "$MANIFEST"
+    if [ -n "$pending" ]; then printf '%s\n' "$pending"; exit 0; fi
+    if [ -n "$failed" ]; then printf 'FAILED:%s\n' "$failed"; exit 0; fi
+    if [ "$all_merged" -eq 1 ]; then
+      # Post-integration: every worker is merged. Auto-gc THIS session, heavily guarded (G1-G4 in gc_one_session) —
+      # it can never remove the live session or unmerged work; a guard failure just prints SKIP. Then report ALL DONE.
+      gc_auto_current
+      echo "ALL DONE"; exit 3
+    fi
+    if [ "$timeout" -gt 0 ] && [ "$((SECONDS - start))" -ge "$timeout" ]; then echo "TIMEOUT"; exit 5; fi
+    sleep 0.7
+  done
+}
+
+# like --next but NEVER exits on all-merged: the orchestrator stays blocked, waiting for a follow-up
+# (a worker that re-runs claude-fleet --done after the initial batch was already integrated)
+cmd_watch() {
+  [ -f "$MANIFEST" ] || die "no manifest — is a fleet running?"
+  local s watch_needs="${CLAUDE_FLEET_WATCH_NEEDS:-0}" NEED_GRACE="${CLAUDE_FLEET_NEED_GRACE:-8}"
+  while true; do
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      # A CLOSED pane is DEAD — skip it so it neither wakes the watcher (stale .done/.failed) nor blocks. (Mirrors --next.)
+      [ -f "$STATUS/$s.closed" ] && continue
+      # A recorded need wakes the watcher even from an already-integrated worker
+      # (a post-merge follow-up request). OPT-IN via CLAUDE_FLEET_WATCH_NEEDS=1 so
+      # it doesn't change the legacy contract for orchestrators that only parse
+      # slug / FAILED:slug. Orchestrator must --need-clear after handling, else the
+      # same NEED re-fires on the next --watch.
+      # SETTLE WINDOW: a .need must persist for >=NEED_GRACE seconds before it wakes the
+      # orchestrator, so a need recorded then retracted (--unneed / --need-clear) within the
+      # window never fires (prevents acting on a mis-sent need). Tunable via CLAUDE_FLEET_NEED_GRACE.
+      # A long-standing need just fires on the next loop pass — no lasting delay.
+      if [ "$watch_needs" = "1" ] && [ -f "$STATUS/$s.need" ]; then
+        nmt="$(stat -f %m "$STATUS/$s.need" 2>/dev/null || stat -c %Y "$STATUS/$s.need" 2>/dev/null || echo 0)"
+        if [ "$(( $(date +%s) - nmt ))" -ge "$NEED_GRACE" ]; then printf 'NEED:%s\n' "$s"; exit 0; fi
+      fi
+      # A re-activated worker (.working, no fresh .done) is RUNNING again — stay blocked waiting for its eventual --done;
+      # don't let a lingering stale .merged make us skip it as integrated. (--watch never fires ALL DONE anyway; this
+      # just keeps the active-pane bookkeeping consistent with --next.)
+      if [ -f "$STATUS/$s.working" ] && [ ! -f "$STATUS/$s.done" ] && [ ! -f "$STATUS/$s.failed" ]; then continue; fi
+      # outstanding .handoff = still active even if a stale .merged lingers (see --next)
+      [ -f "$STATUS/$s.merged" ] && [ ! -f "$STATUS/$s.handoff" ] && continue
+      if [ -f "$STATUS/$s.failed" ]; then printf 'FAILED:%s\n' "$s"; exit 0; fi
+      if [ -f "$STATUS/$s.done" ]; then printf '%s\n' "$s"; exit 0; fi
+    done < "$MANIFEST"
+    sleep 0.7
+  done
+}
+
+# Integrate a worker. Clears its transient live .status, but PRESERVES any .need —
+# a recorded need is a request to the orchestrator that can outlive the worker's own
+# merge (cross-cutting follow-up work). Clear needs explicitly with --need-clear.
+cmd_merged() {
+  [ -n "${1:-}" ] || die "--merged needs a slug"; [ -d "$STATUS" ] || die "no active fleet"
+  touch "$STATUS/$1.merged"; rm -f "$STATUS/$1.status" "$STATUS/$1.handoff" "$STATUS/$1.working"; printf 'Marked "%s" integrated.\n' "$1"
+  # DATA-LOSS FIX: when there is no origin to push to, the orchestrator integrated this slug into its DETACHED `_main`
+  # HEAD only. Persist that integrated state onto the canonical branch ref NOW (ff-only) so the commits are reachable
+  # from refs/heads/$DBR and survive teardown. With an origin, this is a no-op (the push path is unchanged). If it
+  # CANNOT safely advance (non-ff / dirty checkout), it prints a LOUD REFUSED line and we `die` so the orchestrator
+  # stops and resolves rather than continuing toward a teardown that would strand the commits.
+  advance_canonical_branch || die "could not advance canonical $DBR to the integrated state (see REFUSED line above) — resolve before continuing; do NOT --clean or the integrated commits will be lost."
+}
+
+# print every slug ready to integrate right now (.done, not yet merged, not failed). The orchestrator drains the
+# whole batch in ONE merge+verify+push instead of one deploy per worker. Read-only; never blocks.
+cmd_ready() {
+  [ -f "$MANIFEST" ] || die "no manifest — is a fleet running?"
+  local s
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    [ -f "$STATUS/$s.merged" ] && continue
+    [ -f "$STATUS/$s.failed" ] && continue
+    [ -f "$STATUS/$s.done" ] && printf '%s\n' "$s"
+  done < "$MANIFEST"
+}
+
+# (inside a worker worktree) signal this worker CANNOT finish; --next/--watch surface FAILED:<slug> so the
+# orchestrator re-plans (respawn or drop) instead of blocking forever. Cleared when the orchestrator runs --merged.
+cmd_failed() {
+  [ -d "$STATUS" ] || die "no active fleet"
+  local branch slug
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
+  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  rm -f "$STATUS/$slug.done" "$STATUS/$slug.handoff"   # a failed worker surfaces via FAILED:<slug>; no outstanding handoff left to track
+  touch "$STATUS/$slug.failed"
+  printf 'Marked "%s" FAILED. Orchestrator will re-plan instead of waiting.\n' "$slug"
+}
+
+# P3: report files claimed (touched) by more than one not-yet-merged worker — pre-merge collision radar.
+# Prints "<path>: slugA slugB ..." per overlapping file; prints nothing when there are no overlaps.
+cmd_conflicts() {
+  [ -f "$MANIFEST" ] || die "no manifest — is a fleet running?"
+  local s f
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    [ -f "$STATUS/$s.merged" ] && continue
+    [ -f "$STATUS/$s.claims" ] || continue
+    while IFS= read -r f; do [ -n "$f" ] && printf '%s\t%s\n' "$f" "$s"; done < "$STATUS/$s.claims"
+  done < "$MANIFEST" | sort | awk -F'\t' '
+    $1!=pf { if (n>1) print pf": "slugs; pf=$1; slugs=""; n=0 }
+    { slugs=slugs (slugs==""?"":" ") $2; n++ }
+    END { if (n>1) print pf": "slugs }'
+}
+
+# P5: (inside a worker worktree) record a prerequisite this task needs another task to produce first.
+cmd_need() {
+  [ -d "$STATUS" ] || die "no active fleet"
+  [ -n "${1:-}" ] || die "--need needs a description"
+  local branch slug
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
+  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  printf '%s\n' "$1" > "$STATUS/$slug.need"
+  printf 'Recorded need for "%s": %s\n' "$slug" "$1"
+}
+
+# P5: list recorded prerequisites/requests the orchestrator should schedule.
+# Surfaces needs from ALL workers, INCLUDING already-integrated (.merged) ones — a
+# --need recorded after a worker's own work shipped is a follow-up request (cross-
+# cutting work it can't do under its scope fence, a shared-file change, "spawn a
+# worker to do X") the orchestrator must still act on. Entries from merged workers
+# are tagged so the orchestrator has context. Cleared explicitly via --need-clear.
+cmd_needs() {
+  [ -f "$MANIFEST" ] || die "no manifest — is a fleet running?"
+  local s tag hoff
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    [ -f "$STATUS/$s.need" ] || continue
+    [ -f "$STATUS/$s.merged" ] && tag=" (post-merge follow-up)" || tag=""
+    hoff=""
+    [ -f "$STATUS/$s.handoff_to" ] && hoff=" [ALREADY HANDED OFF → $(paste -sd, "$STATUS/$s.handoff_to" 2>/dev/null) — those parts are RUNNING in that sibling; TRACK ONLY, do NOT re-dispatch/re-handoff; --need-clear once it re-signals --done]"
+    printf '%s%s%s: %s\n' "$s" "$tag" "$hoff" "$(cat "$STATUS/$s.need")"
+  done < "$MANIFEST"
+}
+
+# P7: (orchestrator) mark a worker's recorded need handled so it stops surfacing in
+# --needs / --watch. Run after you've scheduled it (spawned a worker / handed off)
+# or decided it's moot. Needs now PERSIST across --merged on purpose, so this is the
+# only thing that clears them.
+cmd_need_clear() {
+  [ -n "${1:-}" ] || die "--need-clear needs a slug"
+  [ -d "$STATUS" ] || die "no active fleet"
+  rm -f "$STATUS/$1.need" "$STATUS/$1.handoff_to"
+  printf 'Cleared need for "%s".\n' "$1"
+}
+
+# (inside a worker worktree) RETRACT a need this worker recorded by mistake — the worker-facing
+# counterpart to the orchestrator's --need-clear. Resolves its own slug from the branch. Run this
+# promptly after a mis-sent --need so the settle window in --watch absorbs it before it fires.
+cmd_unneed() {
+  [ -d "$STATUS" ] || die "no active fleet"
+  local branch slug
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
+  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  rm -f "$STATUS/$slug.need" "$STATUS/$slug.handoff_to"
+  printf 'Retracted need for "%s".\n' "$slug"
+}
+
+# P6: (inside a worker worktree) post a one-line live progress note.
+cmd_status() {
+  [ -d "$STATUS" ] || die "no active fleet"
+  [ -n "${1:-}" ] || die "--status needs a message"
+  local branch slug
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
+  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  printf '%s\n' "$1" > "$STATUS/$slug.status"
+  printf 'Status for "%s": %s\n' "$slug" "$1"
+}
+
+# P6: the live progress board — one line per unmerged worker (slug: status).
+cmd_statuses() {
+  [ -f "$MANIFEST" ] || die "no manifest — is a fleet running?"
+  local s st
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    # A CLOSED pane is DEAD (window closed / pty died) — surface it as such so the orchestrator spawns fresh instead of
+    # waiting on or handing off to it. Shown even if a stale .merged lingers.
+    if [ -f "$STATUS/$s.closed" ]; then printf '%s: %s\n' "$s" "(closed)"; continue; fi
+    # show a re-armed handoff target as active even if a stale .merged lingers (see --next)
+    # a re-activated worker (live .working from the app, no fresh --done) is also active even if a stale .merged lingers
+    [ -f "$STATUS/$s.merged" ] && [ ! -f "$STATUS/$s.handoff" ] && [ ! -f "$STATUS/$s.working" ] && continue
+    # Prefer an explicit --status line. Else, if the app dropped a live `.working` marker (a re-activated already-integrated
+    # worker running a new in-pane task with no fresh --done yet), surface it as (working) so the orchestrator sees it's
+    # still busy. Then handoff, then the default.
+    if [ -f "$STATUS/$s.status" ]; then st="$(cat "$STATUS/$s.status")"; elif [ -f "$STATUS/$s.working" ]; then st="(working)"; elif [ -f "$STATUS/$s.handoff" ]; then st="(handed-off work pending)"; else st="(no status yet)"; fi
+    printf '%s: %s\n' "$s" "$st"
+  done < "$MANIFEST"
+}
+
+cmd_clean() {
+  [ -d "$REPO/.git" ] || die "not a git repository: $REPO"
+  # SAFETY GUARD 1 — never clean the session you're running INSIDE. Worker/orchestrator panes live under $FLEET
+  # ($FLEET/_main, $FLEET/<slug>). Cleaning $FLEET from in there self-deletes the LIVE session out from under the
+  # running panes (this WIPED a live session on 2026-06-18: a worker's verify ran --clean with its own SESSION env,
+  # rm -rf'ing its own fleet dir incl. _main). Refuse even under CLAUDE_FLEET_FORCE — a force-clean of your own
+  # live session is never what you want; legit cleans (from the app, or another session's dir) are unaffected.
+  case "$PWD/" in
+    "$FLEET"/*) die "refusing --clean: cwd ($PWD) is INSIDE the session being cleaned ($FLEET). This would delete the live session you're running in. Run --clean from OUTSIDE the fleet dir (the app does), never from a worker/orchestrator pane." ;;
+  esac
+  # SAFETY GUARD 2 — sanity-check the target really is a session fleet dir before any rm -rf. Guards against a
+  # mis-set REPO/SESSION pointing $FLEET at the repo, $HOME, or /. Must be a namespaced "<repo>-fleet-<session>".
+  [ -n "$SESSION" ] || die "refusing --clean: CLAUDE_FLEET_SESSION is empty — won't clean an unnamespaced fleet dir ($FLEET)."
+  case "$FLEET" in
+    "$HOME"|"$HOME"/|/|"$REPO") die "refusing --clean: computed fleet dir ($FLEET) is not a session worktree dir." ;;
+    *-fleet-*) : ;;
+    *) die "refusing --clean: computed fleet dir ($FLEET) does not look like a '<repo>-fleet-<session>' dir." ;;
+  esac
+  # SAFETY GUARD 3 (DATA-LOSS) — never prune a worktree/branch that holds commits NOT reachable from canonical $DBR.
+  # Tearing those down strands the commits (no ref points at them → dangling → GC), which is exactly how a shipped
+  # rewrite vanished from main on 2026-06-18. We FIRST try to persist any integrated `_main` state onto $DBR
+  # (no-op if origin exists or already in sync), THEN refuse to clean if anything under this fleet — the orchestrator
+  # `_main` HEAD, any worker worktree HEAD, or any fleet/* branch tip — is still ahead of $DBR. Override with
+  # CLAUDE_FLEET_FORCE_ORPHAN=1 ONLY when you have deliberately decided to discard that work.
+  set_default_branch
+  advance_canonical_branch || true   # best-effort: persist integrated _main onto $DBR before we inspect reachability
+  if [ "${CLAUDE_FLEET_FORCE_ORPHAN:-}" != 1 ]; then
+    local dbr_sha unreachable="" wt head br
+    dbr_sha="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$DBR" 2>/dev/null || true)"
+    if [ -n "$dbr_sha" ]; then
+      # worktree HEADs (orchestrator _main + each worker dir)
+      while IFS= read -r wt; do
+        case "$wt" in
+          "$FLEET"/*)
+            head="$(git -C "$wt" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+            [ -n "$head" ] || continue
+            git -C "$REPO" merge-base --is-ancestor "$head" "$dbr_sha" 2>/dev/null \
+              || unreachable="$unreachable  $wt (HEAD ${head:0:12})\n"
+            ;;
+        esac
+      done < <(git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}')
+      # fleet/* branch tips (a worker may have committed but never been integrated)
+      while IFS= read -r br; do
+        [ -n "$br" ] || continue
+        head="$(git -C "$REPO" rev-parse --verify --quiet "$br" 2>/dev/null || true)"
+        [ -n "$head" ] || continue
+        git -C "$REPO" merge-base --is-ancestor "$head" "$dbr_sha" 2>/dev/null \
+          || unreachable="$unreachable  $br (tip ${head:0:12})\n"
+      done < <(git -C "$REPO" for-each-ref --format='%(refname:short)' "refs/heads/$BR_PREFIX")
+    else
+      unreachable="  (canonical $DBR ref does not exist — refusing to prune anything before main is established)\n"
+    fi
+    if [ -n "$unreachable" ]; then
+      printf 'claude-fleet: REFUSED --clean — the following hold commits NOT reachable from canonical %s:\n' "$DBR" >&2
+      printf '%b' "$unreachable" >&2
+      die "integrate/advance these into $DBR first (the orchestrator should --merged them), or set CLAUDE_FLEET_FORCE_ORPHAN=1 to DISCARD this work intentionally. Refusing to strand commits."
+    fi
+  fi
+  if [ "${CLAUDE_FLEET_FORCE:-}" != 1 ]; then
+    printf 'Remove this session'\''s fleet worktrees + %s/* branches? [y/N] ' "$BR_PREFIX"
+    read -r ans; [ "$ans" = y ] || [ "$ans" = Y ] || { echo "aborted"; exit 0; }
+  fi
+  git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}' | while IFS= read -r wt; do
+    case "$wt" in "$FLEET"/*) git -C "$REPO" worktree remove --force "$wt" || true ;; esac
+  done
+  git -C "$REPO" worktree prune
+  git -C "$REPO" for-each-ref --format='%(refname:short)' "refs/heads/$BR_PREFIX" | while IFS= read -r br; do
+    [ -n "$br" ] && git -C "$REPO" branch -D "$br" || true
+  done
+  rm -rf "$FLEET"
+  echo "fleet cleaned."
+}
+
+# ---------------------------------------------------------------- gc (guarded auto-clean of finished sessions)
+#
+# --gc garbage-collects FULLY-INTEGRATED fleet session FOLDERS for the configured CLAUDE_FLEET_REPO. A session's
+# worktree folder is removed ONLY IF all four guards pass; any failing guard => SKIP with a reason, NEVER forced.
+#   G1. Not the session you are currently inside (cwd not under the candidate fleet dir; sid != $CLAUDE_FLEET_SESSION).
+#   G2. The parent/original repo folder exists and is a git repo.
+#   G3. EVERY branch of that session (fleet/s<sid>/*) is FULLY merged into the repo's default branch.
+#   G4. No worktree in that session has uncommitted changes.
+# Deletion is folder-only-safe: `git worktree remove --force` each registered worktree under the session dir, then
+# `rm -rf` the session dir, then `git worktree prune`. Fully-merged branches are left in place (folders are the goal).
+#
+# gc_one_session inspects + (if all guards pass) removes ONE session. Args: <fleet-dir> <sid>. It NEVER reads the
+# global $FLEET/$SESSION/$BR_PREFIX — it is given an explicit target so the auto-hook and the manual sweep share it.
+# Prints exactly one line: "REMOVED <dir>" or "SKIP <dir> (<reason>)". Returns 0 on remove, 1 on skip (non-fatal).
+gc_one_session() { # <fleet-dir> <sid>
+  local gdir="$1" sid="$2" gbr_prefix br_glob
+  gbr_prefix="fleet${sid:+/s$sid}"; br_glob="refs/heads/$gbr_prefix"
+
+  # Hard path assertions BEFORE anything destructive: the target must be a "<repo>-fleet[-<sid>]" dir beside the repo,
+  # never $HOME, /, or the parent repo itself. (Mirrors cmd_clean's GUARD 2; defense-in-depth for the rm -rf below.)
+  case "$gdir" in
+    ""|"$HOME"|"$HOME"/|/|"$REPO") printf 'SKIP %s (not a session worktree dir)\n' "$gdir"; return 1 ;;
+    "$REPO"-fleet|"$REPO"-fleet-*) : ;;   # must be a fleet dir for THIS repo, beside it
+    *) printf 'SKIP %s (does not look like a "<repo>-fleet[-<sid>]" dir for %s)\n' "$gdir" "$REPO"; return 1 ;;
+  esac
+  [ -d "$gdir" ] || { printf 'SKIP %s (no such directory)\n' "$gdir"; return 1; }
+
+  # EXCLUDE — caller-supplied skip list (colon-separated absolute dirs in CLAUDE_FLEET_GC_EXCLUDE). The app passes the
+  # sessions it is about to RESTORE so a startup sweep never reaps a folder being reopened. Belt-and-suspenders with G0
+  # (a restored pane becomes LIVE once its pty holds a cwd inside; the exclude covers the spawn-race window before that).
+  case ":${CLAUDE_FLEET_GC_EXCLUDE:-}:" in
+    *":$gdir:"*) printf 'SKIP %s (excluded by caller)\n' "$gdir"; return 1 ;;
+  esac
+
+  # G0 — LIVENESS guard. A session is LIVE if ANY running process has a current working directory at or under the
+  # candidate fleet dir (panes run `claude` with cwd inside $gdir/_main, $gdir/<slug>, etc.). This protects ANY live
+  # session — including a DIFFERENT concurrently-running app window on the same repo — not just the current process
+  # (G1 only covers self). FAIL-SAFE: if lsof is unavailable we CANNOT confirm the session is dead, so we SKIP.
+  if ! command -v lsof >/dev/null 2>&1; then
+    printf 'SKIP %s (cannot verify liveness — lsof unavailable; remove manually if the session is closed)\n' "$gdir"; return 1
+  fi
+  # `lsof -nP -d cwd -F n` prints one `n<path>` line per process cwd; strip the leading `n` and test each against $gdir.
+  local _cwd _live=0
+  while IFS= read -r _cwd; do
+    case "$_cwd" in n*) _cwd="${_cwd#n}" ;; *) continue ;; esac
+    case "$_cwd" in "$gdir"|"$gdir"/*) _live=1; break ;; esac
+  done < <(lsof -nP -d cwd -F n 2>/dev/null)
+  if [ "$_live" = 1 ]; then
+    printf 'SKIP %s (session appears LIVE — a process has its cwd inside it; refusing to delete a running session)\n' "$gdir"; return 1
+  fi
+
+  # G1 — never gc the session you are currently INSIDE (reuse/extend cmd_clean's self-wipe guard). Two checks:
+  #   (a) cwd is under the candidate fleet dir; (b) this process's own CLAUDE_FLEET_SESSION matches this sid.
+  case "$PWD/" in "$gdir"/*) printf 'SKIP %s (cwd is INSIDE this session — refusing self-wipe)\n' "$gdir"; return 1 ;; esac
+  if [ -n "${CLAUDE_FLEET_SESSION:-}" ] && [ "${CLAUDE_FLEET_SESSION}" = "$sid" ]; then
+    printf 'SKIP %s (this is the live session you are running — refusing self-wipe)\n' "$gdir"; return 1
+  fi
+
+  # G2 — parent/original repo must exist and be a git repo. If it's gone, CANCEL (we cannot check merge state safely).
+  [ -d "$REPO/.git" ] || { printf 'SKIP %s (parent repo %s missing — cannot verify merge state)\n' "$gdir" "$REPO"; return 1; }
+
+  set_default_branch
+  local dbr_sha
+  dbr_sha="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$DBR" 2>/dev/null || true)"
+  [ -n "$dbr_sha" ] || { printf 'SKIP %s (canonical %s ref does not exist — not safe to gc)\n' "$gdir" "$DBR"; return 1; }
+
+  # G3 — every fleet/s<sid>/* branch must be FULLY merged into $DBR (0 commits ahead). If ANY has unmerged work, SKIP.
+  local br ahead
+  while IFS= read -r br; do
+    [ -n "$br" ] || continue
+    ahead="$(git -C "$REPO" rev-list --count "$DBR..$br" 2>/dev/null || echo 1)"
+    [ "$ahead" = 0 ] || { printf 'SKIP %s (branch %s has unmerged work — %s commit(s) not in %s)\n' "$gdir" "$br" "$ahead" "$DBR"; return 1; }
+  done < <(git -C "$REPO" for-each-ref --format='%(refname:short)' "$br_glob" 2>/dev/null)
+
+  # G4 — no registered worktree UNDER this session dir may have uncommitted changes (real git status, not filtered:
+  # for gc we want a strict empty tree). Enumerate worktrees the same way cmd_clean does, scoped to this session dir.
+  local wt
+  while IFS= read -r wt; do
+    [ -n "$wt" ] || continue
+    case "$wt" in
+      "$gdir"/*)
+        if [ -d "$wt" ] && [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+          printf 'SKIP %s (worktree %s has uncommitted changes)\n' "$gdir" "$wt"; return 1
+        fi
+        ;;
+    esac
+  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+
+  # All guards passed — folder-only-safe teardown. Remove each registered worktree under this session dir, rm the
+  # dir, prune. (Branches are fully merged so they may remain; removing folders is the goal.)
+  while IFS= read -r wt; do
+    [ -n "$wt" ] || continue
+    case "$wt" in "$gdir"/*) git -C "$REPO" worktree remove --force "$wt" >/dev/null 2>&1 || true ;; esac
+  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+  rm -rf "$gdir"
+  git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+  printf 'REMOVED %s\n' "$gdir"
+  return 0
+}
+
+# Auto-hook: after a session is fully integrated, gc THIS session (same G1-G4 guards). Called from the
+# post-integration ALL DONE path. It can NEVER remove the live session (G1) or unmerged work (G3); a guard failure
+# just prints SKIP and is non-fatal. OPT-OUT with CLAUDE_FLEET_NO_AUTOGC=1.
+gc_auto_current() {
+  [ "${CLAUDE_FLEET_NO_AUTOGC:-}" = 1 ] && return 0
+  [ -d "$REPO/.git" ] || return 0
+  # Sweep ALL sibling sessions of this repo (NOT just the current one). The orchestrator runs --next from INSIDE
+  # $FLEET, so we must NOT bail when cwd is inside $FLEET — that would prevent reaping fully-merged, clean, NON-LIVE
+  # SIBLING sessions. The current session is never deleted: it is LIVE (G0 — our own panes hold cwds inside it) and
+  # also matches G1 ($PWD inside $gdir / $CLAUDE_FLEET_SESSION == sid). Any OTHER live session is protected by G0.
+  gc_sweep_repo >&2 || true
+}
+
+# gc_sweep_repo: iterate every <repo>-fleet[-*] session folder for the configured repo, deriving the sid per folder,
+# and call gc_one_session on each (which removes only those passing G0-G4). Shared by --gc and the auto hook.
+# Returns 0 if at least one candidate folder was found, 1 if none existed.
+gc_sweep_repo() {
+  local parent base gdir sid found=0
+  parent="$(dirname "$REPO")"; base="$(basename "$REPO")"
+  shopt -s nullglob
+  for gdir in "$parent/$base"-fleet "$parent/$base"-fleet-*; do
+    [ -d "$gdir" ] || continue
+    found=1
+    # derive sid: "<base>-fleet-<sid>" -> <sid>; "<base>-fleet" -> "" (unnamespaced)
+    case "$gdir" in
+      "$parent/$base"-fleet-*) sid="${gdir##*-fleet-}" ;;
+      *) sid="" ;;
+    esac
+    gc_one_session "$gdir" "$sid" || true
+  done
+  shopt -u nullglob
+  [ "$found" = 1 ]
+}
+
+# --gc: sweep every <repo>-fleet[-*] session folder for the configured repo, gc'ing only those passing G0-G4.
+cmd_gc() {
+  [ -d "$REPO/.git" ] || die "not a git repository: $REPO"
+  local base; base="$(basename "$REPO")"
+  gc_sweep_repo || echo "claude-fleet --gc: no $base-fleet* session folders to sweep."
+}
+
+# --gc-all: sweep EVERY <repo>-fleet[-<sid>] session folder under a ROOT dir (default: the parent of CLAUDE_FLEET_REPO,
+# i.e. ~/Developer), deriving the parent repo + sid from each folder name and gc'ing each via gc_one_session (G0-G4 +
+# exclude guards). Unlike --gc (one configured repo), this reaps finished/orphaned sessions across ALL repos — so a
+# folder left behind by an app quit/crash (no --next ALL DONE moment) gets reclaimed on the next app launch. Each
+# folder runs in a SUBSHELL with REPO overridden so $REPO/set_default_branch resolve per-folder and never leak.
+# Root override: arg $1 or CLAUDE_FLEET_GC_ROOT. Honors CLAUDE_FLEET_GC_EXCLUDE (colon-separated dirs to skip).
+cmd_gc_all() { # [root]
+  local root="${1:-${CLAUDE_FLEET_GC_ROOT:-$(dirname "$REPO")}}"
+  [ -d "$root" ] || die "gc-all: root dir not found: $root"
+  local gdir repo sid found=0
+  shopt -s nullglob
+  for gdir in "$root"/*-fleet "$root"/*-fleet-*; do
+    [ -d "$gdir" ] || continue
+    found=1
+    # derive parent repo + sid from the folder name: "<repo>-fleet-<sid>" -> repo,sid ; "<repo>-fleet" -> repo,"" .
+    # Real fleet sids are NUMERIC (the app's nextSid). Requiring that rejects non-fleet dirs that merely contain
+    # "-fleet-" in their name — e.g. the "claude-fleet-app" repo itself — without relying on the git-repo check below.
+    case "$gdir" in
+      *-fleet-*)
+        repo="${gdir%-fleet-*}"; sid="${gdir##*-fleet-}"
+        case "$sid" in ''|*[!0-9]*) continue ;; esac
+        ;;
+      *-fleet)   repo="${gdir%-fleet}";   sid="" ;;
+      *) continue ;;
+    esac
+    # parent repo must exist + be a git repo, else we cannot verify merge state safely — SKIP (never rm a folder we
+    # can't vet against its main). Mirrors gc_one_session's G2.
+    if [ ! -d "$repo/.git" ]; then printf 'SKIP %s (parent repo %s is not a git repo)\n' "$gdir" "$repo"; continue; fi
+    # gc_one_session returns 1 on any guard SKIP (non-fatal); guard with || true so set -e doesn't abort the sweep.
+    ( REPO="$repo"; gc_one_session "$gdir" "$sid" ) || true
+  done
+  shopt -u nullglob
+  [ "$found" = 1 ] || echo "claude-fleet --gc-all: no *-fleet* session folders under $root."
+}
+
+# Rebuild + reinstall the project's app from the LATEST INTEGRATED STATE, ONCE per batch (a full app build is
+# expensive — the orchestrator calls this after the post-batch push, only when the batch changed app code).
+# Project-agnostic: runs the project's configured rebuild command and streams its output live. Resolution order:
+#   1. $CLAUDE_FLEET_REBUILD_CMD       — a shell command string (highest precedence; run via `bash -c`)
+#   2. <build-dir>/.claude-fleet/rebuild — a script committed in the repo (run via `bash`, no +x needed)
+# No rebuild command configured => NO-OP (exit 0); never fail a project that doesn't define one (e.g. a web app
+# that auto-deploys on push). <build-dir> = the orchestrator's _main worktree (the pushed/integrated tip) if it
+# exists, else $REPO. Set CLAUDE_FLEET_REBUILD_DRYRUN=1 to print the resolved command without running it.
+cmd_rebuild() {
+  local bdir="$FLEET/_main"
+  [ -d "$bdir" ] || bdir="$REPO"
+  local cmd="" kind=""
+  if [ -n "${CLAUDE_FLEET_REBUILD_CMD:-}" ]; then
+    cmd="$CLAUDE_FLEET_REBUILD_CMD"; kind="\$CLAUDE_FLEET_REBUILD_CMD"
+  elif [ -f "$bdir/.claude-fleet/rebuild" ]; then
+    cmd="$bdir/.claude-fleet/rebuild"; kind="$cmd"
+  fi
+  if [ -z "$cmd" ]; then
+    printf 'claude-fleet --rebuild: no rebuild command configured (no $CLAUDE_FLEET_REBUILD_CMD, no %s/.claude-fleet/rebuild) — skipping.\n' "$bdir"
+    exit 0
+  fi
+  if [ "${CLAUDE_FLEET_REBUILD_DRYRUN:-}" = 1 ]; then
+    printf 'claude-fleet --rebuild: DRYRUN — would run [%s] in %s\n' "$cmd" "$bdir"; exit 0
+  fi
+  printf 'claude-fleet --rebuild: rebuilding app in %s via %s\n' "$bdir" "$kind" >&2
+  if [ -n "${CLAUDE_FLEET_REBUILD_CMD:-}" ]; then
+    ( cd "$bdir" && bash -c "$cmd" )
+  else
+    ( cd "$bdir" && CLAUDE_FLEET_BUILD_DIR="$bdir" bash "$cmd" )
+  fi
+  printf 'claude-fleet --rebuild: done.\n' >&2
+}
+
+# New-project bootstrap (run by the SCRATCH orchestrator under CLAUDE_FLEET_NEW_PROJECT=1). The scratch
+# orchestrator asks the user what to build, derives a folder name, writes the goal to GOALFILE, then calls this.
+# We drop an ATOMIC marker file the app watches for ($STATUS/project.retarget) carrying the chosen <name> and the
+# goal text; the app then creates ~/Developer/<name>, relaunches the orchestrator targeting it, and re-sends the
+# goal so building starts automatically.
+# LOCKED interop (the app parses these EXACT strings): marker path "$STATUS/project.retarget"; JSON keys "name"
+# and "goal". Do NOT rename them.
+cmd_new_project() { # <name> <goalfile>
+  local name="${1:-}" goalfile="${2:-}"
+  [ -n "$name" ] || die "--new-project needs <name> <goalfile>"
+  [ -n "$goalfile" ] || die "--new-project needs <name> <goalfile>"
+  [ -r "$goalfile" ] || die "goal file not readable: $goalfile"
+  [ -d "$STATUS" ] || die "no active session (no $STATUS) — --new-project must run inside a scratch fleet session"
+  # sanitize/validate the folder name: kebab-ish, no slashes, no leading dots, non-empty.
+  local safe; safe="$(slugify "$name")"
+  [ -n "$safe" ] || die "could not derive a safe folder name from '$name' (use a short kebab-case name like 'recipe-box')"
+  case "$safe" in */*|.*) die "invalid folder name '$name' (slashes / leading dots not allowed)" ;; esac
+  local goal; goal="$(cat "$goalfile")"
+  # write ATOMICALLY: build into .tmp then mv, so the app's watcher never reads a partial marker.
+  local tmp="$STATUS/project.retarget.tmp"
+  printf '{"name":%s,"goal":%s}\n' "$(json_str "$safe")" "$(json_str "$goal")" > "$tmp"
+  mv -f "$tmp" "$STATUS/project.retarget"
+  printf 'New project "%s" — app is creating it and relaunching.\n' "$safe"
+}
+
+
+# a generic autonomous grid worker for ANY repo: owns a named feature/area, driven by the repo's
+# own CLAUDE.md. Same todo / parallelize / handoff / spawn mechanics; framed by feature/module, not product/page.
+generic_worker_prompt() { # heading slug dir [initial_requirement]
+  local heading="$1" slug="$2" dir="$3" req="${4:-}"
+  local intro closing repdesc
+  repdesc="$(git -C "$REPO" remote get-url origin 2>/dev/null || echo "$REPO")"
+  if [ -n "$req" ]; then
+    intro="YOUR FIRST REQUIREMENT was handed to you from a sibling pane — this area had no pane yet, so you're it.
+START the loop below on it NOW, without waiting and WITHOUT asking permission:
+
+${req}
+
+The loop, run end-to-end:"
+    closing="Once that ships, wait for my next requirement for \"${heading}\" and run the loop again for each one."
+  else
+    intro="Wait for my requirement for \"${heading}\". When I give it, run this loop end-to-end WITHOUT asking permission
+for anything:"
+    closing="Do this whole loop again for each follow-up requirement I give you for \"${heading}\".
+Acknowledge and ask me what the requirement for \"${heading}\" is."
+  fi
+  cat <<EOF
+You are an AUTONOMOUS worker in a Claude Fleet run on the repo ${repdesc}. This pane OWNS the "${heading}"
+feature/area/module of this project.
+You are in the git worktree ${dir}, on branch ${BR_PREFIX}/${slug} (cut from origin/${DBR}).
+
+FIRST read CLAUDE.md (repo root) + your auto-memory and FOLLOW that repo's rules — its build/test/deploy commands,
+conventions, and any "don't touch X". Don't re-derive what's already documented there.
+
+TREAT EVERY REQUIREMENT I SEND AS A PERSISTENT TODO — NEVER drop or forget one mid-conversation. Keep a running
+list with the TodoWrite tool: each requirement I give for "${heading}" becomes a todo item. I may send several
+before you finish the first — ADD each new one immediately, keep working what's in flight, then work down the rest
+IN ORDER until the list is empty. Run the full loop below for each item; mark it done only after it ships.
+
+PARALLELIZE BY DEPENDENCY — break each requirement into TodoWrite items, then MAP which items block which (does an
+item need another's output, or edit the same file?). Items with NO unmet dependency AND NO shared file → run them
+AT ONCE as parallel inline subagents (Task/Agent tool, several in ONE message). An item that DEPENDS on another or
+edits the SAME file → it WAITS until its blocker finishes (ONE worktree → parallel same-file edits clobber; batch
+those into one pass). As blockers complete, fire the newly-unblocked items in parallel, until the list is empty.
+
+STAY IN YOUR LANE — you OWN the "${heading}" area. Many features WITHIN your area stay here and run as inline
+parallel subagents in this ONE worktree — never split your own area across panes. If a requirement belongs to a
+DIFFERENT feature/area/module (another pane owns those files), do NOT edit it and do NOT print ready-to-paste text.
+Route it (write the full, self-contained requirement to /tmp/cfleet_handoff.txt first):
+- A pane ALREADY owns it (in  git branch --list '${BR_PREFIX}/*' ) → hand it straight in:
+    claude-fleet --handoff "<that pane's name/slug>" /tmp/cfleet_handoff.txt
+- NO pane owns it yet → spawn one for that area:
+    claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff.txt
+Either way, tell me which pane you routed it to. Only work YOU own stays here.
+
+${intro}
+1. MAKE THE CHANGES needed to satisfy my requirement. Edit freely — never pause to ask.
+2. VERIFY it actually works: run the repo's build/test or inspect the result per CLAUDE.md. If CLAUDE.md defines a
+   cache-bust or build step, run it and commit the result too.
+3. REPORT the verdict clearly:
+   - Requirement MET  -> print "✓ REQUIREMENT MET — <one line on what you verified>. Ready to push." then continue.
+   - NOT met / broken -> print "✗ NOT MET — <reason>" and keep fixing. NEVER push unmet or broken work.
+4. COMMIT on this branch — SEPARATE PLAIN git commands: \`git add <files>\` then \`git commit -m "..."\`.
+5. CHECK THE NEIGHBOURING GRIDS' branches before shipping — they share this repo's .git, so sibling branches are
+   visible with NO fetch:  git branch --list '${BR_PREFIX}/*' . If a sibling touched files you also touched, merge
+   their branch in and resolve so you don't clobber them.
+6. SHIP TO ${DBR}:
+     git fetch origin
+     git merge origin/${DBR}            (resolve conflicts; preserve both intents)
+     git push origin HEAD:${DBR}        (if rejected as non-fast-forward, fetch + merge origin/${DBR} again, re-push)
+   Report the pushed commit. (If this repo auto-deploys on push, it will go live.)
+7. UPDATE MEMORY: record a concise, durable note of what you changed for "${heading}" (what shipped, why, any
+   gotcha) in your auto-memory under a "${heading}" topic — so the next session doesn't re-explore. Only touch
+   CLAUDE.md for project-wide rules/architecture (it's committed + shared; don't churn it from multiple grids).
+
+${closing}
+EOF
+}
+
+# the autonomous grid worker prompt for any repo
+grid_worker_prompt() { generic_worker_prompt "$@"; }
+
+# Grid mode: N named, autonomous worker panes for the selected repo; each verifies + pushes to its default branch
+cmd_grid_plan() { # <N> <name1> <name2> ...
+  local n="$1"; shift
+  [ -n "$n" ] || die "--grid-plan needs a count"
+  [ -d "$REPO/.git" ] || die "not a git repository: $REPO"
+  fetch_origin
+  set_default_branch
+  reset_state
+  local -a W_SLUG W_HEAD W_DIR
+  local idx=0 name slug branch dir
+  for name in "$@"; do
+    idx=$((idx + 1)); [ "$idx" -le "$n" ] || break
+    slug="$(slugify "$name")"; [ -n "$slug" ] || slug="grid-$idx"
+    branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
+    if [ -d "$dir" ]; then :
+    elif git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$REPO" worktree add "$dir" "$branch" >&2
+    else
+      git -C "$REPO" worktree add -b "$branch" "$dir" "origin/$DBR" >/dev/null 2>&1 \
+        || git -C "$REPO" worktree add -b "$branch" "$dir" "$DBR" >&2
+    fi
+    link_shared_dirs "$dir"
+    rm -f "$STATUS/$slug.done" "$STATUS/$slug.merged"
+    printf '%s\n' "$slug" >> "$MANIFEST"
+    W_SLUG+=("$slug"); W_HEAD+=("$name"); W_DIR+=("$dir")
+  done
+  printf '['
+  local first=1 i
+  for i in "${!W_SLUG[@]}"; do
+    [ "$first" = 1 ] && first=0 || printf ','
+    printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}' \
+      "$(json_str "${W_SLUG[$i]}")" "$(json_str "${W_HEAD[$i]}")" "$(json_str "${W_DIR[$i]}")" \
+      "$(json_str "$(grid_worker_prompt "${W_HEAD[$i]}" "${W_SLUG[$i]}" "${W_DIR[$i]}")")"
+  done
+  printf ']\n'
+}
+
+# Grid mode: add ONE more named worker to an ALREADY-RUNNING fleet (no state reset). Emits a single
+# JSON object the app turns into a new pane — same shape as one element of --grid-plan's array.
+cmd_grid_add() { # <name>
+  local name="$1"
+  [ -n "$name" ] || die "--grid-add needs a worker name"
+  [ -d "$REPO/.git" ] || die "not a git repository: $REPO"
+  [ -d "$STATUS" ] || die "no active grid session"
+  fetch_origin
+  set_default_branch
+  local slug base k=2 branch dir
+  slug="$(slugify "$name")"; [ -n "$slug" ] || slug="grid"; base="$slug"
+  while [ -d "$FLEET/$slug" ] || grep -qx "$slug" "$MANIFEST" 2>/dev/null; do slug="$base-$k"; k=$((k + 1)); done
+  branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
+  git -C "$REPO" worktree add -b "$branch" "$dir" "origin/$DBR" >/dev/null 2>&1 \
+    || git -C "$REPO" worktree add -b "$branch" "$dir" "$DBR" >&2
+  link_shared_dirs "$dir"
+  rm -f "$STATUS/$slug.done" "$STATUS/$slug.merged"
+  printf '%s\n' "$slug" >> "$MANIFEST"
+  printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}\n' \
+    "$(json_str "$slug")" "$(json_str "$name")" "$(json_str "$dir")" \
+    "$(json_str "$(grid_worker_prompt "$name" "$slug" "$dir")")"
+}
+
+# Grid mode: a worker SPAWNS a brand-new worker pane for an area NO pane owns yet, seeded with the
+# requirement (read from FILE so the command stays static). Writes a .spawn marker — the same channel the
+# dispatch orchestrator uses — which the app turns into a new pane that starts working immediately.
+cmd_grid_spawn() { # <name> <task-file>
+  local name="$1" path="$2"
+  [ -n "$name" ] && [ -n "$path" ] || die "--spawn-grid needs <area-name> <task-file>"
+  [ -f "$path" ] || die "task file not found: $path"
+  [ -d "$STATUS" ] || die "no active grid session"
+  fetch_origin
+  set_default_branch
+  local slug base k=2 branch dir req
+  req="$(cat "$path")"
+  slug="$(slugify "$name")"; [ -n "$slug" ] || slug="grid"; base="$slug"
+  while [ -d "$FLEET/$slug" ] || grep -qx "$slug" "$MANIFEST" 2>/dev/null; do slug="$base-$k"; k=$((k + 1)); done
+  branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
+  git -C "$REPO" worktree add -b "$branch" "$dir" "origin/$DBR" >/dev/null 2>&1 \
+    || git -C "$REPO" worktree add -b "$branch" "$dir" "$DBR" >&2
+  link_shared_dirs "$dir"
+  rm -f "$STATUS/$slug.done" "$STATUS/$slug.merged"
+  printf '%s\n' "$slug" >> "$MANIFEST"
+  printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}' \
+    "$(json_str "$slug")" "$(json_str "$name")" "$(json_str "$dir")" \
+    "$(json_str "$(grid_worker_prompt "$name" "$slug" "$dir" "$req")")" > "$STATUS/$slug.spawn"
+  printf 'Spawned new product pane "%s" (%s), seeded with the requirement. It is working now.\n' "$name" "$slug"
+}
+
+# ---------------------------------------------------------------- dispatch
+case "${1:-}" in
+  --orchestrator) cmd_orchestrator ;;
+  --grid-plan)    shift; cmd_grid_plan "$@" ;;
+  --grid-add)     shift; cmd_grid_add "${1:-}" ;;
+  --spawn)        shift; cmd_spawn "$@" ;;
+  --spawn-file)   shift; cmd_spawn_file "$@" ;;
+  --handoff)      shift; cmd_handoff "${1:-}" "${2:-}" ;;
+  --spawn-grid)   shift; cmd_grid_spawn "${1:-}" "${2:-}" ;;
+  --done)         cmd_done ;;
+  --next)         cmd_next ;;
+  --watch)        cmd_watch ;;
+  --merged)       shift; cmd_merged "${1:-}" ;;
+  --ready)        cmd_ready ;;
+  --failed)       cmd_failed ;;
+  --conflicts)    cmd_conflicts ;;
+  --need)         shift; cmd_need "${1:-}" ;;
+  --needs)        cmd_needs ;;
+  --need-clear)   shift; cmd_need_clear "${1:-}" ;;
+  --unneed)       cmd_unneed ;;
+  --status)       shift; cmd_status "${1:-}" ;;
+  --statuses)     cmd_statuses ;;
+  --rebuild)      cmd_rebuild ;;
+  --new-project)  shift; cmd_new_project "${1:-}" "${2:-}" ;;
+  --clean)        cmd_clean ;;
+  --gc)           cmd_gc ;;
+  --gc-all)       shift; cmd_gc_all "${1:-}" ;;
+  -h|--help)      awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0" ;;
+  *)              die "unknown arg: ${1:-} (try --help)" ;;
+esac
