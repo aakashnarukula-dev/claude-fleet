@@ -209,11 +209,19 @@
   }
   // device-code connect modal
   const ghModal = document.getElementById('ghModal'), ghCode = document.getElementById('ghCode'), ghStatus = document.getElementById('ghStatus');
+  const GH_DEVICE_URL = 'https://github.com/login/device';
+  let ghOpened = false;
   function ghSetStatus(t, err) { ghStatus.textContent = t; ghStatus.style.color = err ? '#ff6b61' : ''; }
-  window.fleet.onDeviceCode((code) => { ghCode.textContent = code; ghSetStatus('A browser is opening — enter this code to authorize.'); });
-  document.getElementById('ghOpen').onclick = () => window.fleet.openExternal('https://github.com/login/device');
+  // gh's own browser-open is suppressed (BROWSER=true) — open the device page ONCE, instantly, the moment the code lands.
+  window.fleet.onDeviceCode((code) => {
+    ghCode.textContent = code;
+    if (!ghOpened) { ghOpened = true; window.fleet.openExternal(GH_DEVICE_URL); }
+    ghSetStatus('Browser opened — enter this code to authorize.');
+  });
+  document.getElementById('ghOpen').onclick = () => window.fleet.openExternal(GH_DEVICE_URL);
   document.getElementById('ghCancel').onclick = () => { window.fleet.ghConnectCancel(); ghModal.classList.remove('show'); };
   function connectAccount() {
+    ghOpened = false;   // allow a fresh auto-open for this attempt
     ghCode.textContent = '· · · ·'; ghSetStatus('Starting GitHub sign-in…'); ghModal.classList.add('show');
     window.fleet.ghConnect().then((r) => {
       if (r && r.ok) { ghModal.classList.remove('show'); loadAccounts(); }

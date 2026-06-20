@@ -3,6 +3,7 @@ const path = require('path');
 const os = require('os');
 const fsmod = require('fs');
 const { execFile, execFileSync } = require('child_process');
+const https = require('https');
 
 // Keep the app LIVE in the background: macOS otherwise throttles the renderer (pauses requestAnimationFrame,
 // clamps timers) when the window isn't focused — which stalls pane/PTY spawning until you return. These switches
@@ -597,26 +598,51 @@ ipcMain.handle('gh-accounts', () => new Promise((resolve) => {
 // Connect a new account: drive `gh auth login --web` in a PTY (TTY = reliable interactive output), parse the
 // XXXX-XXXX one-time code, push it to the config window for the device-code modal, auto-answer gh's prompts, and
 // resolve on exit. Browser opening is handled by gh itself (and the modal offers a fallback "Open" button).
-let ghConnectTerm = null;
-ipcMain.handle('gh-connect', () => new Promise((resolve) => {
-  if (!pty) return resolve({ ok: false, error: 'node-pty not loaded' });
-  let buf = '', code = '', done = false; const answered = {};
-  const term = ghConnectTerm = pty.spawn('bash', ['-lc', 'gh auth login --hostname github.com --git-protocol https --web --skip-ssh-key'],
-    { name: 'xterm-256color', cols: 80, rows: 30, env: cmdEnv() });
-  const finish = (res) => { if (done) return; done = true; clearTimeout(timer); ghConnectTerm = null; try { term.kill(); } catch (_) {} resolve(res); };
-  const timer = setTimeout(() => finish({ ok: false, error: 'timed out waiting for GitHub authorization' }), 180000);
-  term.onData((d) => {
-    buf += d;
-    if (!code) { const m = buf.match(/\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/); if (m) { code = m[1]; if (configWin) configWin.webContents.send('gh-device-code', code); } }
-    // auto-advance gh's prompts: "Press Enter to open …" and any other "? …" question → accept the default.
-    if (!answered.enter && /Press Enter/i.test(buf)) { answered.enter = true; try { term.write('\r'); } catch (_) {} }
-    if (!answered.git && /Authenticate Git/i.test(buf)) { answered.git = true; try { term.write('\r'); } catch (_) {} }
+// Connect a new account via the GitHub OAuth DEVICE FLOW, called directly against GitHub's API (no `gh auth login`
+// process to drive/kill — so a Cancel can never corrupt gh's config, and the code always comes straight from the API
+// response). We reuse the GitHub CLI's public device-flow client id (the same one `gh auth login` uses). The token is
+// handed to gh ONLY at the very end via `gh auth login --with-token` (an atomic write we never interrupt).
+const GH_CLIENT_ID = 'Iv1.b507a08c87ecfe98';   // GitHub CLI's public OAuth client id (device flow)
+function ghApiPost(reqPath, params) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(params).toString();
+    const req = https.request({ host: 'github.com', path: reqPath, method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body), 'User-Agent': 'claude-fleet' } },
+      (res) => { let d = ''; res.on('data', (c) => (d += c)); res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } }); });
+    req.on('error', reject); req.write(body); req.end();
   });
-  term.onExit(({ exitCode }) => finish(exitCode === 0 ? { ok: true } : { ok: false, error: code ? 'authorization not completed' : 'gh auth login failed (is gh installed?)' }));
-}));
+}
+function storeGhToken(token) {   // hand the token to gh (atomic write; never killed)
+  return new Promise((resolve) => {
+    const p = execFile('gh', ['auth', 'login', '--hostname', 'github.com', '--git-protocol', 'https', '--with-token'],
+      { env: cmdEnv() }, (err) => resolve(!err));
+    try { p.stdin.write(token + '\n'); p.stdin.end(); } catch (_) {}
+  });
+}
+let ghPollAbort = null;
+ipcMain.handle('gh-connect', async () => {
+  try {
+    const dev = await ghApiPost('/login/device/code', { client_id: GH_CLIENT_ID, scope: 'repo read:org gist workflow' });
+    if (!dev || !dev.device_code) return { ok: false, error: (dev && (dev.error_description || dev.error)) || 'could not start device flow' };
+    if (configWin) configWin.webContents.send('gh-device-code', dev.user_code);
+    let interval = ((dev.interval || 5) + 1) * 1000;
+    const expiry = Date.now() + (dev.expires_in || 900) * 1000;
+    let aborted = false; ghPollAbort = () => { aborted = true; };
+    while (!aborted && Date.now() < expiry) {
+      await new Promise((r) => setTimeout(r, interval));
+      if (aborted) break;
+      const tok = await ghApiPost('/login/oauth/access_token', { client_id: GH_CLIENT_ID, device_code: dev.device_code, grant_type: 'urn:ietf:params:oauth:grant-type:device_code' });
+      if (tok && tok.access_token) { ghPollAbort = null; const ok = await storeGhToken(tok.access_token); return ok ? { ok: true } : { ok: false, error: 'authorized, but saving the token to gh failed' }; }
+      if (tok && tok.error === 'slow_down') { interval += 5000; continue; }
+      if (tok && tok.error && tok.error !== 'authorization_pending') { ghPollAbort = null; return { ok: false, error: tok.error_description || tok.error }; }
+    }
+    ghPollAbort = null;
+    return { ok: false, error: aborted ? 'cancelled' : 'timed out waiting for authorization' };
+  } catch (e) { ghPollAbort = null; return { ok: false, error: String((e && e.message) || e) }; }
+});
 
-// Cancel an in-flight connect (user closed the modal): kill the gh PTY.
-ipcMain.handle('gh-connect-cancel', () => { try { ghConnectTerm && ghConnectTerm.kill(); } catch (_) {} ghConnectTerm = null; return true; });
+// Cancel an in-flight connect (user closed the modal): just stop polling. No process is killed, so gh's config is safe.
+ipcMain.handle('gh-connect-cancel', () => { try { ghPollAbort && ghPollAbort(); } catch (_) {} ghPollAbort = null; return true; });
 
 // Disconnect an account.
 ipcMain.handle('gh-disconnect', (_e, account) => new Promise((resolve) => {
