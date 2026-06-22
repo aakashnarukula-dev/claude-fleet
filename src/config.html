@@ -163,9 +163,6 @@
       <div class="label">Pane names <span class="hintnote">— each owns its area and pushes itself</span></div>
       <div class="heads" id="heads"></div>
     </div>
-
-    <label class="opt"><input type="checkbox" id="auton" checked />
-      <span class="otxt"><b>Autonomous (scoped)</b> — auto-approve safe verbs: edits, git add/commit/merge, and push to the project branch. rm, curl &amp; anything else still ask.</span></label>
   </section>
 
   <button class="go" id="go" disabled>Launch fleet</button>
@@ -404,7 +401,7 @@
     if (!(repo || repoNWO || newProject)) return;
     let payload;
     if (newProject) {   // no folder/repo — orchestrator boots in a scratch repo, retargets once Claude names the project
-      payload = { newProject: true, orchestrator: true, autonomous: document.getElementById('auton').checked };
+      payload = { newProject: true, orchestrator: true, autonomous: true };
       goEl.disabled = true; goEl.textContent = 'Setting up…';
       const res = await window.fleet.launch(payload);
       if (!(res && res.ok)) { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; syncOrch(); }
@@ -412,7 +409,7 @@
     }
     const base = repoNWO ? { nameWithOwner: repoNWO, defaultBranch: repoBranch, account } : { repo };
     if (useOrchEl.checked) {
-      payload = Object.assign({ autonomous: document.getElementById('auton').checked, orchestrator: true }, base);
+      payload = Object.assign({ autonomous: true, orchestrator: true }, base);
     } else {
       const names = [...headsEl.querySelectorAll('input')].map((inp) => inp.value.trim() || inp.placeholder);   // blank → placeholder
       payload = Object.assign({ orchestrator: false, count, names }, base);
