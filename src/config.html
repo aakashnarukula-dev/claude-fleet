@@ -224,12 +224,14 @@
   // to clear it — instead of a long path string. Falls back to a faint hint when nothing's set.
   function setProjLabel() {
     projPath.innerHTML = '';
-    if (newProject) {
-      projPath.appendChild(folderChip('New project', null));
-    } else if (repo) {
+    if (repo) {
+      // A folder: the "Choose folder…" button is generic, so name the choice in a chip.
       projPath.appendChild(folderChip(repo.replace(/\/+$/, '').split('/').pop() || repo, repo));
     } else {
-      const s = document.createElement('span'); s.className = 'projhint'; s.textContent = 'No folder selected';
+      // New project: the highlighted button is the indicator (click it again to turn off) — no
+      // duplicate chip. Otherwise the plain "no selection" hint.
+      const s = document.createElement('span'); s.className = 'projhint';
+      s.textContent = newProject ? 'Claude will create the project' : 'No folder selected';
       projPath.appendChild(s);
     }
   }
