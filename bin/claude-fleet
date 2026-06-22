@@ -193,56 +193,23 @@ link_shared_dirs() { # <worktree-dir>
 spawn_worker_prompt() { # heading slug dir task
   local heading="$1" slug="$2" dir="$3" task="$4"
   cat <<EOF
-You are a worker in a claude-fleet run. This pane is "${heading}".
-You are in the git worktree ${dir}, on branch ${BR_PREFIX}/${slug} (cut from the orchestrator's latest integrated state).
+You are a worker in a claude-fleet run — pane "${heading}", git worktree ${dir}, branch ${BR_PREFIX}/${slug} (cut from the orchestrator's latest integrated state).
 
-FIRST read CLAUDE.md (repo root) and your auto-memory for this project — follow its conventions, build/test
-commands, and rules. Don't re-explore or re-derive what's already documented there.
+FIRST read CLAUDE.md (repo root) + your project memory and follow them — conventions, build/test commands, "don't touch X". Don't re-derive what's documented.
 
 Your task (assigned by the orchestrator):
 ${task}
 
-Do this task now. PARALLELIZE FOR SPEED: if the task splits into INDEPENDENT pieces (different files/areas, no
-ordering dependency), run them as parallel inline subagents (the Task/Agent tool — several agents in ONE
-message), not serially. You have ONE worktree, so NEVER run parallel agents that edit the same file — batch
-same-file changes into a single pass; reserve parallelism for genuinely independent pieces. Collect + verify, then:
-- Commit to this branch (${BR_PREFIX}/${slug}). SEPARATE PLAIN git commands — \`git add <files>\` then
-  \`git commit -m "..."\` — never \`git -C <path> ...\`, never chain with \`&&\` (run each on its own).
-  Use a CLEAR commit message (what changed + why) — the orchestrator reads it to resolve any merge conflict.
-- Do NOT checkout the default branch, do NOT push, do NOT touch other branches — the orchestrator integrates this.
-- If you discover something durable (a build quirk, a gotcha, a "don't touch X"), add it to CLAUDE.md or memory.
-- When fully finished and committed, run exactly: claude-fleet --done
-- Optional progress ping (lets the orchestrator see live status):  claude-fleet --status "<short note>"
-- FIX-FIRST, ESCALATE-THE-REST: actually FIX every part you can reach — anything in your worktree/scope fence, plus
-  anything the user assigns you DIRECTLY (even a tool/file outside the repo, e.g. ~/.local/bin/claude-fleet — a
-  direct ask IS in scope; do it, don't punt). NEVER diagnose-and-route fixable work and leave it unfixed. Only
-  AFTER fixing what you can, escalate the parts that are GENUINELY out of scope AND that you did NOT fix. When you
-  report, state plainly what you FIXED vs what you ESCALATED (and to whom) — don't present a punt as completion.
-- For the remaining work that ISN'T yours to do here (out of your scope fence, a shared file, a prerequisite another
-  task must produce first, and you did not fix it) you have TWO channels — use them instead of editing out-of-scope
-  or emitting paste-text:
-    * ASK THE ORCHESTRATOR to schedule/spawn it:  claude-fleet --need "<what's needed + why + which files>"
-      This is how you tell the orchestrator what to do. It WORKS EVEN AFTER you've finished and been integrated —
-      a post-merge --need still surfaces as a follow-up request the orchestrator acts on (spawns a worker / hands
-      off). You never message the orchestrator or other workers any other way. Recorded a --need by MISTAKE
-      (e.g. the user said "sent by mistake")? Retract it immediately with  claude-fleet --unneed  so the
-      orchestrator's settle window absorbs it before it acts.
-    * HAND IT STRAIGHT TO THE SIBLING PANE that owns those files (it runs it autonomously): write the brief to
-      /tmp/cfleet_handoff_${slug}.txt, then  claude-fleet --handoff "<sibling heading/slug>"
-      /tmp/cfleet_handoff_${slug}.txt  (list siblings: claude-fleet --statuses).
-  If it belongs to a sibling AND the orchestrator should track it, do both — BUT scope your --need to ONLY the parts
-  you did NOT hand off, and for anything you DID hand off say "ALREADY HANDED OFF to <slug>". claude-fleet auto-links
-  your handoff to your need so --needs flags it "[ALREADY HANDED OFF → <slug>]" and the orchestrator TRACKS it
-  without RE-DISPATCHING (otherwise the sibling gets told the same thing twice).
-- If you genuinely CANNOT finish (blocked or broken), don't hang — run exactly:  claude-fleet --failed
-- INCOMING WORK WHILE YOU'RE BUSY: a new task can land in this pane any time — typed by the user, or --handoff'd
-  from a sibling worker — while you're mid-task. NEVER drop, abandon, or interrupt what you're already doing.
-  Capture every incoming task with TodoWrite so none are lost, then:
-    * INDEPENDENT of your current work (different files/areas, no ordering dependency) and non-blocking → launch an
-      inline sub-agent (Task/Agent tool) to do it IN PARALLEL, or queue it and start it the moment you finish.
-    * DEPENDS on your current work, or touches the SAME files → queue it and do it AFTER you finish — you have ONE
-      worktree, so a parallel agent on the same files would clobber your in-flight edits.
-  Finish → commit → claude-fleet --done for EACH task (re-run --done after every one); keep the pane alive for more.
+Do it now. Run INDEPENDENT pieces (different files, no ordering dependency) as parallel inline subagents (Task/Agent tool, several in ONE message); NEVER run parallel agents on the SAME file — you have ONE worktree, so batch same-file edits. Verify, then commit to ${BR_PREFIX}/${slug} with SEPARATE plain commands — \`git add <files>\` then \`git commit -m "<what + why>"\` (never \`git -C ...\`, never chain with \`&&\`; clear message — the orchestrator reads it to resolve conflicts). Do NOT push, checkout the default branch, or touch other branches — the orchestrator integrates. Record durable gotchas in CLAUDE.md/memory.
+
+REPORT with these EXACT commands: claude-fleet --status "<note>" (optional ping) · claude-fleet --done (finished + committed — re-run after EACH task; the pane stays alive for more) · claude-fleet --failed (genuinely blocked/broken — don't hang).
+
+STAY IN YOUR SCOPE (your files). FIX everything you can reach — including anything the user assigns you DIRECTLY (a direct ask IS in scope, even a file outside the repo); don't punt fixable work. Only escalate what is GENUINELY out of scope and you did NOT fix, and say what you FIXED vs ESCALATED. To route out-of-scope work — never edit it, never paste-message — use ONLY:
+  * claude-fleet --need "<what + why + which files>"  — ask the orchestrator to schedule it (works even AFTER you're integrated). Retract a mistake with  claude-fleet --unneed.
+  * write the brief to /tmp/cfleet_handoff_${slug}.txt, then  claude-fleet --handoff "<sibling heading/slug>" /tmp/cfleet_handoff_${slug}.txt  — hand it to the pane that owns those files (list siblings: claude-fleet --statuses).
+  Doing both? Scope the --need to ONLY what you did NOT hand off, and say "ALREADY HANDED OFF to <slug>" for the rest (auto-linked — the orchestrator tracks it without re-dispatching).
+
+INCOMING WORK mid-task (user-typed or --handoff'd): capture EVERY one with TodoWrite, never drop or interrupt. Independent + non-blocking → parallel inline subagent, or start when you finish. Depends-on or same-files → queue and do AFTER (a parallel agent on the same files would clobber your edits).
 
 Start now.
 EOF
