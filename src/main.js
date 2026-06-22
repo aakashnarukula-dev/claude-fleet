@@ -207,6 +207,10 @@ function shQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
 function gridDims(n) { const cols = Math.ceil(Math.sqrt(n)); return { cols, rows: Math.ceil(n / cols) }; }
 const DEFAULT_REPO = os.homedir();   // fallback only (headless tests); the config window always passes a real repo
 function repoFor(repo) { return repo ? String(repo).replace(/\/+$/, '') : DEFAULT_REPO; }
+// Session worktrees live in ONE place (not beside each repo). MUST match bin/claude-fleet's
+// FLEET=$SESSIONS_DIR/$(basename REPO)-fleet-$SESSION — the watcher reads that dir's .status.
+const SESSIONS_DIR = process.env.CLAUDE_FLEET_SESSIONS_DIR || path.join(os.homedir(), 'Developer', 'Fleet-Sessions');
+function fleetDir(repo, sid) { return path.join(SESSIONS_DIR, `${path.basename(String(repo).replace(/\/+$/, ''))}-fleet-${sid}`); }
 function sessionEnv(sid, repo) { return Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: repo }); }
 
 // Per-account chip color, derived deterministically from the account name — no hardcoded account list.
@@ -316,7 +320,7 @@ app.whenReady().then(() => {
       });
       // fleet dirs of the saved sessions — protected from the sweep on Restore (they're being reopened) and skipped on
       // Start fresh (they're explicitly --clean'd below). Engine derives the same path as ${repo}-fleet-${sid}.
-      const savedDirs = saved.map((ss) => `${ss.repo || DEFAULT_REPO}-fleet-${ss.sid}`);
+      const savedDirs = saved.map((ss) => fleetDir(ss.repo || DEFAULT_REPO, ss.sid));
       if (choice === 0) { restoreSessions(saved); gcAll(savedDirs); return; }
       // Start fresh: discard the previous sessions' worktrees so <repo>-fleet-N folders don't pile up
       saved.forEach((ss) => execFile(FLEET_CLI, ['--clean'], { env: Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(ss.sid), CLAUDE_FLEET_REPO: ss.repo || DEFAULT_REPO, CLAUDE_FLEET_FORCE: '1' }) }, () => {}));
@@ -508,7 +512,7 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
     autonomous: useOrch ? !!autonomous : true,
     newProject: scratch,                          // scratch session: orchestrator boots with CLAUDE_FLEET_NEW_PROJECT=1; retargets on .retarget
     panes: [], planReady: false, pending: {}, slugIdx: {},
-    statusDir: path.join(`${repoPath}-fleet-${sid}`, '.status'),   // matches engine FLEET=${REPO}-fleet-${SESSION}
+    statusDir: path.join(fleetDir(repoPath, sid), '.status'),   // matches engine FLEET=${REPO}-fleet-${SESSION}
     watcher: null,
   };
   const win = targetGridWin();   // new session lands in the focused/last grid window (or a fresh one)
@@ -546,7 +550,7 @@ function restoreSessions(saved) {
     const title = ss.title || projTitle(ss.repo), color = ss.color || tabColor(title);
     const s = {
       repo: ss.repo, title, color, mode: ss.mode || 'dispatch', bypass: !!ss.bypass, autonomous: !!ss.autonomous, panes: [], planReady: true,
-      pending: {}, slugIdx: {}, statusDir: path.join(`${ss.repo}-fleet-${sid}`, '.status'), watcher: null,
+      pending: {}, slugIdx: {}, statusDir: path.join(fleetDir(ss.repo, sid), '.status'), watcher: null,
     };
     panes.forEach((p) => { s.panes[p.id] = { role: p.role, slug: p.slug, heading: p.heading, dir: p.dir, prompt: '', resume: true }; if (p.slug) s.slugIdx[p.slug] = p.id; });
     sessions[sid] = s;
@@ -1056,7 +1060,7 @@ function spawnPane(sid, idx, cols, rows) {
     CLAUDE_CODE_EFFORT_LEVEL: effort,
     // share ONE Rust build cache across this session's worktrees (Tauri/cargo) instead of a multi-GB target/ per
     // pane. Lives inside the fleet dir, so it's reclaimed when the session closes. cargo locks it for concurrency.
-    CARGO_TARGET_DIR: path.join(`${s.repo}-fleet-${sid}`, '.cargo-target'),
+    CARGO_TARGET_DIR: path.join(fleetDir(s.repo, sid), '.cargo-target'),
     PATH: extraPath + (process.env.PATH ? ':' + process.env.PATH : ''),
   });
   // new-project scratch session: the CLI emits the new-project brief (name → retarget) when this is set.
@@ -1198,17 +1202,18 @@ function slugifyProjectName(name) {
 function teardownScratch(sid) {
   const s = sessions[sid]; if (!s) return;
   const scratchRepo = path.join(os.homedir(), 'Developer', `.cfleet-scratch-${sid}`);
-  const scratchFleetDir = `${scratchRepo}-fleet-${sid}`;
-  const guard = path.join(os.homedir(), 'Developer', '.cfleet-scratch-');
-  // BELT-AND-SUSPENDERS: every path we touch MUST be under the .cfleet-scratch- prefix, or we abort without deleting.
-  if (!scratchRepo.startsWith(guard) || !scratchFleetDir.startsWith(guard) || (s.repo && s.repo !== scratchRepo)) {
+  const scratchFleetDir = fleetDir(scratchRepo, sid);   // now under SESSIONS_DIR/.cfleet-scratch-<sid>-fleet-<sid>
+  const guard = path.join(os.homedir(), 'Developer', '.cfleet-scratch-');   // guards the scratch REPO dir
+  const fleetGuard = path.join(SESSIONS_DIR, '.cfleet-scratch-');           // guards the scratch SESSION worktree dir
+  // BELT-AND-SUSPENDERS: every path we touch MUST be under a .cfleet-scratch- prefix, or we abort without deleting.
+  if (!scratchRepo.startsWith(guard) || !scratchFleetDir.startsWith(fleetGuard) || (s.repo && s.repo !== scratchRepo)) {
     console.error('[cfleet] teardownScratch ABORT: path not under .cfleet-scratch- (sid=' + sid + ', repo=' + s.repo + ')');
     return;
   }
   if (s.watcher) { try { s.watcher.close(); } catch (_) {} }
   s.panes.forEach((_p, i) => { const t = ptys[`${sid}:${i}`]; if (t) { try { t.kill(); } catch (_) {} delete ptys[`${sid}:${i}`]; } delete ptyBuf[`${sid}:${i}`]; });
   // remove the scratch worktree dir AND the scratch repo itself — both guarded by the startsWith assertion above
-  try { if (scratchFleetDir.startsWith(guard)) fsmod.rmSync(scratchFleetDir, { recursive: true, force: true }); } catch (_) {}
+  try { if (scratchFleetDir.startsWith(fleetGuard)) fsmod.rmSync(scratchFleetDir, { recursive: true, force: true }); } catch (_) {}
   try { if (scratchRepo.startsWith(guard)) fsmod.rmSync(scratchRepo, { recursive: true, force: true }); } catch (_) {}
   delete sessions[sid];
   sidWin.delete(Number(sid));
@@ -1247,7 +1252,7 @@ function launchOrchestratorSession({ repoPath, title, color, autonomous, seedGoa
   sessions[sid] = {
     repo: repoPath, title, color, mode: 'dispatch', bypass: false, autonomous: !!autonomous, newProject: false,
     panes: [], planReady: false, pending: {}, slugIdx: {},
-    statusDir: path.join(`${repoPath}-fleet-${sid}`, '.status'), watcher: null,
+    statusDir: path.join(fleetDir(repoPath, sid), '.status'), watcher: null,
     seedGoal: (seedGoal && String(seedGoal).trim()) || '',
   };
   const win = targetGridWin();

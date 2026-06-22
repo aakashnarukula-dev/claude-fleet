@@ -51,7 +51,10 @@ set -euo pipefail
 
 REPO="${CLAUDE_FLEET_REPO:-$PWD}"; REPO="${REPO%/}"   # project repo (any git repo); the app always passes CLAUDE_FLEET_REPO
 SESSION="${CLAUDE_FLEET_SESSION:-}"                                        # per-tab id; isolates worktrees/branches/status
-FLEET="${REPO}-fleet${SESSION:+-$SESSION}"                                 # worktrees live beside the repo
+# All session worktrees live in ONE place (not scattered beside each repo). Overridable for tests.
+SESSIONS_DIR="${CLAUDE_FLEET_SESSIONS_DIR:-$HOME/Developer/Fleet-Sessions}"
+mkdir -p "$SESSIONS_DIR" 2>/dev/null || true
+FLEET="$SESSIONS_DIR/$(basename "$REPO")-fleet${SESSION:+-$SESSION}"        # e.g. ~/Developer/Fleet-Sessions/gyftalala-fleet-1
 STATUS="$FLEET/.status"; MANIFEST="$STATUS/manifest"
 BR_PREFIX="fleet${SESSION:+/s$SESSION}"                                    # worker branch prefix
 DBR="main"                                                                 # default branch, set by set_default_branch
@@ -171,7 +174,7 @@ advance_canonical_branch() {
   return 1
 }
 
-reset_state() { rm -rf "$STATUS"; mkdir -p "$STATUS"; : > "$MANIFEST"; }
+reset_state() { rm -rf "$STATUS"; mkdir -p "$STATUS"; : > "$MANIFEST"; printf '%s\n' "$REPO" > "$STATUS/repo"; }
 
 # symlink heavy gitignored DEPENDENCY dirs from the main checkout into a new worktree so they're SHARED, not
 # copied (a worktree already shares .git; this shares node_modules/etc too) — keeps each worktree small.
@@ -193,7 +196,7 @@ link_shared_dirs() { # <worktree-dir>
 # Workers read it from their launch prompt instead of carrying the whole thing inline. Generic
 # across workers: <your-slug> = last segment of your branch; the per-worker task arrives inline.
 ensure_worker_protocol() {
-  mkdir -p "$STATUS"
+  mkdir -p "$STATUS"; printf '%s\n' "$REPO" > "$STATUS/repo"
   cat > "$STATUS/worker-protocol.md" <<EOF
 # Worker operating manual (claude-fleet)
 
@@ -847,15 +850,16 @@ cmd_clean() {
 # global $FLEET/$SESSION/$BR_PREFIX — it is given an explicit target so the auto-hook and the manual sweep share it.
 # Prints exactly one line: "REMOVED <dir>" or "SKIP <dir> (<reason>)". Returns 0 on remove, 1 on skip (non-fatal).
 gc_one_session() { # <fleet-dir> <sid>
-  local gdir="$1" sid="$2" gbr_prefix br_glob
+  local gdir="$1" sid="$2" gbr_prefix br_glob fbase
   gbr_prefix="fleet${sid:+/s$sid}"; br_glob="refs/heads/$gbr_prefix"
+  fbase="$SESSIONS_DIR/$(basename "$REPO")"   # expected session-dir prefix for THIS repo, under SESSIONS_DIR
 
-  # Hard path assertions BEFORE anything destructive: the target must be a "<repo>-fleet[-<sid>]" dir beside the repo,
-  # never $HOME, /, or the parent repo itself. (Mirrors cmd_clean's GUARD 2; defense-in-depth for the rm -rf below.)
+  # Hard path assertions BEFORE anything destructive: the target must be the "<repo>-fleet[-<sid>]" dir for THIS repo
+  # under SESSIONS_DIR — never $HOME, /, the repo, or the sessions root itself. (Defense-in-depth for the rm -rf below.)
   case "$gdir" in
-    ""|"$HOME"|"$HOME"/|/|"$REPO") printf 'SKIP %s (not a session worktree dir)\n' "$gdir"; return 1 ;;
-    "$REPO"-fleet|"$REPO"-fleet-*) : ;;   # must be a fleet dir for THIS repo, beside it
-    *) printf 'SKIP %s (does not look like a "<repo>-fleet[-<sid>]" dir for %s)\n' "$gdir" "$REPO"; return 1 ;;
+    ""|"$HOME"|"$HOME"/|/|"$REPO"|"$SESSIONS_DIR"|"$SESSIONS_DIR"/) printf 'SKIP %s (not a session worktree dir)\n' "$gdir"; return 1 ;;
+    "$fbase"-fleet|"$fbase"-fleet-*) : ;;   # must be the fleet dir for THIS repo under SESSIONS_DIR
+    *) printf 'SKIP %s (does not look like a session dir for %s)\n' "$gdir" "$REPO"; return 1 ;;
   esac
   [ -d "$gdir" ] || { printf 'SKIP %s (no such directory)\n' "$gdir"; return 1; }
 
@@ -949,15 +953,15 @@ gc_auto_current() {
 # and call gc_one_session on each (which removes only those passing G0-G4). Shared by --gc and the auto hook.
 # Returns 0 if at least one candidate folder was found, 1 if none existed.
 gc_sweep_repo() {
-  local parent base gdir sid found=0
-  parent="$(dirname "$REPO")"; base="$(basename "$REPO")"
+  local base gdir sid found=0
+  base="$(basename "$REPO")"
   shopt -s nullglob
-  for gdir in "$parent/$base"-fleet "$parent/$base"-fleet-*; do
+  for gdir in "$SESSIONS_DIR/$base"-fleet "$SESSIONS_DIR/$base"-fleet-*; do
     [ -d "$gdir" ] || continue
     found=1
     # derive sid: "<base>-fleet-<sid>" -> <sid>; "<base>-fleet" -> "" (unnamespaced)
     case "$gdir" in
-      "$parent/$base"-fleet-*) sid="${gdir##*-fleet-}" ;;
+      "$SESSIONS_DIR/$base"-fleet-*) sid="${gdir##*-fleet-}" ;;
       *) sid="" ;;
     esac
     gc_one_session "$gdir" "$sid" || true
@@ -980,27 +984,25 @@ cmd_gc() {
 # folder runs in a SUBSHELL with REPO overridden so $REPO/set_default_branch resolve per-folder and never leak.
 # Root override: arg $1 or CLAUDE_FLEET_GC_ROOT. Honors CLAUDE_FLEET_GC_EXCLUDE (colon-separated dirs to skip).
 cmd_gc_all() { # [root]
-  local root="${1:-${CLAUDE_FLEET_GC_ROOT:-$(dirname "$REPO")}}"
-  [ -d "$root" ] || die "gc-all: root dir not found: $root"
+  local root="${1:-${CLAUDE_FLEET_GC_ROOT:-$SESSIONS_DIR}}"
+  [ -d "$root" ] || { echo "claude-fleet --gc-all: no sessions dir ($root)."; return 0; }
   local gdir repo sid found=0
   shopt -s nullglob
   for gdir in "$root"/*-fleet "$root"/*-fleet-*; do
     [ -d "$gdir" ] || continue
     found=1
-    # derive parent repo + sid from the folder name: "<repo>-fleet-<sid>" -> repo,sid ; "<repo>-fleet" -> repo,"" .
+    # derive sid from the folder name: "<base>-fleet-<sid>" -> <sid> ; "<base>-fleet" -> "" .
     # Real fleet sids are NUMERIC (the app's nextSid). Requiring that rejects non-fleet dirs that merely contain
-    # "-fleet-" in their name — e.g. the "claude-fleet-app" repo itself — without relying on the git-repo check below.
+    # "-fleet-" in their name without relying on the git-repo check below.
     case "$gdir" in
-      *-fleet-*)
-        repo="${gdir%-fleet-*}"; sid="${gdir##*-fleet-}"
-        case "$sid" in ''|*[!0-9]*) continue ;; esac
-        ;;
-      *-fleet)   repo="${gdir%-fleet}";   sid="" ;;
+      *-fleet-*) sid="${gdir##*-fleet-}"; case "$sid" in ''|*[!0-9]*) continue ;; esac ;;
+      *-fleet)   sid="" ;;
       *) continue ;;
     esac
-    # parent repo must exist + be a git repo, else we cannot verify merge state safely — SKIP (never rm a folder we
-    # can't vet against its main). Mirrors gc_one_session's G2.
-    if [ ! -d "$repo/.git" ]; then printf 'SKIP %s (parent repo %s is not a git repo)\n' "$gdir" "$repo"; continue; fi
+    # The repo is NOT beside the session dir anymore — read it from the session's .status/repo marker (written at
+    # init). Without a valid marker we cannot verify merge state safely, so SKIP (never rm a folder we can't vet).
+    repo=""; [ -f "$gdir/.status/repo" ] && repo="$(head -n1 "$gdir/.status/repo" 2>/dev/null || true)"
+    if [ -z "$repo" ] || [ ! -d "$repo/.git" ]; then printf 'SKIP %s (no/invalid repo marker)\n' "$gdir"; continue; fi
     # gc_one_session returns 1 on any guard SKIP (non-fatal); guard with || true so set -e doesn't abort the sweep.
     ( REPO="$repo"; gc_one_session "$gdir" "$sid" ) || true
   done
@@ -1071,7 +1073,7 @@ cmd_new_project() { # <name> <goalfile>
 # own CLAUDE.md. Same todo / parallelize / handoff / spawn mechanics; framed by feature/module, not product/page.
 # Write the (full) autonomous grid-worker operating manual ONCE to the session's .status dir.
 ensure_grid_protocol() {
-  mkdir -p "$STATUS"
+  mkdir -p "$STATUS"; printf '%s\n' "$REPO" > "$STATUS/repo"
   cat > "$STATUS/grid-protocol.md" <<EOF
 # Autonomous grid-worker operating manual (claude-fleet)
 
