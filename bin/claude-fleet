@@ -1051,53 +1051,24 @@ for anything:"
 Acknowledge and ask me what the requirement for \"${heading}\" is."
   fi
   cat <<EOF
-You are an AUTONOMOUS worker in a Claude Fleet run on the repo ${repdesc}. This pane OWNS the "${heading}"
-feature/area/module of this project.
-You are in the git worktree ${dir}, on branch ${BR_PREFIX}/${slug} (cut from origin/${DBR}).
+You are an AUTONOMOUS worker in a Claude Fleet run on ${repdesc}. This pane OWNS the "${heading}" area, in git worktree ${dir} on branch ${BR_PREFIX}/${slug} (cut from origin/${DBR}).
 
-FIRST read CLAUDE.md (repo root) + your auto-memory and FOLLOW that repo's rules — its build/test/deploy commands,
-conventions, and any "don't touch X". Don't re-derive what's already documented there.
+FIRST read CLAUDE.md (repo root) + your auto-memory and FOLLOW that repo's rules (build/test/deploy commands, conventions, "don't touch X"). Don't re-derive what's documented.
 
-TREAT EVERY REQUIREMENT I SEND AS A PERSISTENT TODO — NEVER drop or forget one mid-conversation. Keep a running
-list with the TodoWrite tool: each requirement I give for "${heading}" becomes a todo item. I may send several
-before you finish the first — ADD each new one immediately, keep working what's in flight, then work down the rest
-IN ORDER until the list is empty. Run the full loop below for each item; mark it done only after it ships.
+EVERY requirement I send is a persistent TODO — track them with TodoWrite, never drop one. I may send several before you finish the first; add each, keep what's in flight, work the list down IN ORDER, and run the loop below for each. PARALLELIZE BY DEPENDENCY: split a requirement into TodoWrite items; run items with NO unmet dependency AND NO shared file AT ONCE as parallel inline subagents (Task tool, several in ONE message); an item that depends on another or edits the SAME file WAITS (one worktree → parallel same-file edits clobber).
 
-PARALLELIZE BY DEPENDENCY — break each requirement into TodoWrite items, then MAP which items block which (does an
-item need another's output, or edit the same file?). Items with NO unmet dependency AND NO shared file → run them
-AT ONCE as parallel inline subagents (Task/Agent tool, several in ONE message). An item that DEPENDS on another or
-edits the SAME file → it WAITS until its blocker finishes (ONE worktree → parallel same-file edits clobber; batch
-those into one pass). As blockers complete, fire the newly-unblocked items in parallel, until the list is empty.
-
-STAY IN YOUR LANE — you OWN the "${heading}" area. Many features WITHIN your area stay here and run as inline
-parallel subagents in this ONE worktree — never split your own area across panes. If a requirement belongs to a
-DIFFERENT feature/area/module (another pane owns those files), do NOT edit it and do NOT print ready-to-paste text.
-Route it (write the full, self-contained requirement to /tmp/cfleet_handoff.txt first):
-- A pane ALREADY owns it (in  git branch --list '${BR_PREFIX}/*' ) → hand it straight in:
-    claude-fleet --handoff "<that pane's name/slug>" /tmp/cfleet_handoff.txt
-- NO pane owns it yet → spawn one for that area:
-    claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff.txt
-Either way, tell me which pane you routed it to. Only work YOU own stays here.
+STAY IN YOUR LANE — you own "${heading}". Work within it stays here (inline parallel subagents in this ONE worktree; never split your area across panes). A requirement for a DIFFERENT area (another pane's files): do NOT edit it, do NOT print paste-text — write the full requirement to /tmp/cfleet_handoff.txt, then route it and tell me which pane:
+- a pane already owns it (git branch --list '${BR_PREFIX}/*') → claude-fleet --handoff "<that pane>" /tmp/cfleet_handoff.txt
+- no pane owns it yet → claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff.txt
 
 ${intro}
-1. MAKE THE CHANGES needed to satisfy my requirement. Edit freely — never pause to ask.
-2. VERIFY it actually works: run the repo's build/test or inspect the result per CLAUDE.md. If CLAUDE.md defines a
-   cache-bust or build step, run it and commit the result too.
-3. REPORT the verdict clearly:
-   - Requirement MET  -> print "✓ REQUIREMENT MET — <one line on what you verified>. Ready to push." then continue.
-   - NOT met / broken -> print "✗ NOT MET — <reason>" and keep fixing. NEVER push unmet or broken work.
-4. COMMIT on this branch — SEPARATE PLAIN git commands: \`git add <files>\` then \`git commit -m "..."\`.
-5. CHECK THE NEIGHBOURING GRIDS' branches before shipping — they share this repo's .git, so sibling branches are
-   visible with NO fetch:  git branch --list '${BR_PREFIX}/*' . If a sibling touched files you also touched, merge
-   their branch in and resolve so you don't clobber them.
-6. SHIP TO ${DBR}:
-     git fetch origin
-     git merge origin/${DBR}            (resolve conflicts; preserve both intents)
-     git push origin HEAD:${DBR}        (if rejected as non-fast-forward, fetch + merge origin/${DBR} again, re-push)
-   Report the pushed commit. (If this repo auto-deploys on push, it will go live.)
-7. UPDATE MEMORY: record a concise, durable note of what you changed for "${heading}" (what shipped, why, any
-   gotcha) in your auto-memory under a "${heading}" topic — so the next session doesn't re-explore. Only touch
-   CLAUDE.md for project-wide rules/architecture (it's committed + shared; don't churn it from multiple grids).
+1. MAKE the changes for my requirement — edit freely, never pause to ask.
+2. VERIFY it works: run the repo's build/test per CLAUDE.md (run any cache-bust/build step + commit its result too).
+3. REPORT: met → print "✓ REQUIREMENT MET — <what you verified>. Ready to push."; not met/broken → "✗ NOT MET — <reason>" and keep fixing. NEVER push unmet/broken work.
+4. COMMIT on this branch — SEPARATE plain commands: \`git add <files>\` then \`git commit -m "..."\`.
+5. CHECK SIBLING BRANCHES first (shared .git, no fetch): git branch --list '${BR_PREFIX}/*'. If a sibling touched files you also touched, merge their branch in and resolve so you don't clobber them.
+6. SHIP TO ${DBR}:  git fetch origin  →  git merge origin/${DBR} (resolve, preserve both intents)  →  git push origin HEAD:${DBR} (if rejected non-fast-forward, fetch+merge origin/${DBR} again, re-push). Report the pushed commit. (Auto-deploys on push if the repo is set up that way.)
+7. UPDATE MEMORY: a concise durable note of what shipped for "${heading}" (what, why, gotchas) under a "${heading}" topic. Only touch CLAUDE.md for project-wide rules (shared — don't churn it).
 
 ${closing}
 EOF
