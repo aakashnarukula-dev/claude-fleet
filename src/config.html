@@ -88,11 +88,11 @@
     background:var(--card-2); color:var(--fg); font-size:13px; font-weight:600; transition:.14s; }
   .counts button:hover { border-color:var(--line-2); }
   .counts button.on { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
-  .heads { display:flex; flex-direction:column; gap:7px; }
-  .hrow { display:flex; align-items:center; gap:10px; }
-  .tag { width:52px; font-size:11px; color:var(--faint); flex:none; text-align:right; }
-  .heads input { -webkit-app-region:no-drag; -webkit-user-select:text; flex:1; padding:8px 12px; border-radius:8px; border:1px solid var(--line);
-    background:var(--card-2); color:var(--fg); font-size:13px; outline:none; transition:.14s; }
+  .heads { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
+  .hrow { display:flex; flex-direction:column; gap:3px; min-width:0; }
+  .tag { font-size:10px; color:var(--faint); text-transform:uppercase; letter-spacing:.05em; }
+  .heads input { -webkit-app-region:no-drag; -webkit-user-select:text; width:100%; box-sizing:border-box; padding:8px 10px; border-radius:8px; border:1px solid var(--line);
+    background:var(--card-2); color:var(--fg); font-size:12.5px; outline:none; transition:.14s; }
   .heads input:focus { border-color:var(--accent); }
 
   /* CTA */
