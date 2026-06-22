@@ -228,17 +228,6 @@ function ghTokenFor(account) {
   });
 }
 function ghEnv(token) { return token ? Object.assign(cmdEnv(), { GH_TOKEN: token }) : cmdEnv(); }
-// the OAuth scopes on a token (from the X-OAuth-Scopes response header) — used to tell whether an account can see
-// private repos (needs the `repo` scope). Empty string if it can't be determined.
-function ghScopes(token) {
-  return new Promise((resolve) => {
-    execFile('gh', ['api', '-i', 'user'], { env: ghEnv(token), timeout: 15000 }, (err, out) => {
-      if (err) return resolve('');
-      const m = String(out).match(/^x-oauth-scopes:\s*(.*)$/im);
-      resolve(m ? m[1].trim() : '');
-    });
-  });
-}
 // clone <owner>/<repo> to ~/Developer/<repo> if it isn't there yet, then fetch to refresh. Uses the selected account's
 // token (if any) so private repos on a non-active account clone correctly. Prefers gh (handles auth), falls back to git.
 async function ensureRepoClone(nameWithOwner, defaultBranch, account) {
@@ -613,7 +602,10 @@ ipcMain.handle('gh-accounts', () => new Promise((resolve) => {
 // process to drive/kill — so a Cancel can never corrupt gh's config, and the code always comes straight from the API
 // response). We reuse the GitHub CLI's public device-flow client id (the same one `gh auth login` uses). The token is
 // handed to gh ONLY at the very end via `gh auth login --with-token` (an atomic write we never interrupt).
-const GH_CLIENT_ID = 'Iv1.b507a08c87ecfe98';   // GitHub CLI's public OAuth client id (device flow)
+// GitHub CLI's public OAUTH-App client id (NOT the `Iv1.*` GitHub-App id — that issues scopeless `ghu_`
+// tokens that can't reliably see private repos). This OAuth app issues classic `gho_` tokens, so the `repo`
+// scope below actually grants full private+public repo access. This is the id `gh auth login --web` uses.
+const GH_CLIENT_ID = '178c6fc778ccc68e1d6a';
 function ghApiPost(reqPath, params) {
   return new Promise((resolve, reject) => {
     const body = new URLSearchParams(params).toString();
@@ -630,6 +622,13 @@ function storeGhToken(token) {   // hand the token to gh (atomic write; never ki
     try { p.stdin.write(token + '\n'); p.stdin.end(); } catch (_) {}
   });
 }
+// the GitHub login (.login) a token belongs to — used so a fresh connect can auto-select the account it just added.
+// GH_TOKEN env pins the lookup to THIS token (ignores the active account), so the answer is always the new account.
+function ghLoginForToken(token) {
+  return new Promise((resolve) => {
+    execFile('gh', ['api', 'user', '--jq', '.login'], { env: ghEnv(token), timeout: 15000 }, (err, out) => resolve(err ? '' : String(out).trim() || ''));
+  });
+}
 let ghPollAbort = null;
 ipcMain.handle('gh-connect', async () => {
   try {
@@ -643,7 +642,7 @@ ipcMain.handle('gh-connect', async () => {
       await new Promise((r) => setTimeout(r, interval));
       if (aborted) break;
       const tok = await ghApiPost('/login/oauth/access_token', { client_id: GH_CLIENT_ID, device_code: dev.device_code, grant_type: 'urn:ietf:params:oauth:grant-type:device_code' });
-      if (tok && tok.access_token) { ghPollAbort = null; const ok = await storeGhToken(tok.access_token); return ok ? { ok: true } : { ok: false, error: 'authorized, but saving the token to gh failed' }; }
+      if (tok && tok.access_token) { ghPollAbort = null; const ok = await storeGhToken(tok.access_token); if (!ok) return { ok: false, error: 'authorized, but saving the token to gh failed' }; const user = await ghLoginForToken(tok.access_token); return { ok: true, user }; }
       if (tok && tok.error === 'slow_down') { interval += 5000; continue; }
       if (tok && tok.error && tok.error !== 'authorization_pending') { ghPollAbort = null; return { ok: false, error: tok.error_description || tok.error }; }
     }
@@ -670,9 +669,10 @@ ipcMain.handle('clipboard-write', (_e, t) => { try { clipboard.writeText(String(
 // without changing the user's globally-active gh account.
 ipcMain.handle('list-account-repos', async (_e, account) => {
   const token = await ghTokenFor(account);
-  const scopesP = ghScopes(token);   // fetched in parallel with the repo list
-  const result = await new Promise((resolve) => {
-    execFile('gh', ['repo', 'list', String(account), '--limit', '100', '--json', 'nameWithOwner,name,defaultBranchRef,visibility,pushedAt'],
+  return new Promise((resolve) => {
+    // no --visibility filter → gh returns BOTH public and private repos (private needs the token's `repo` scope,
+    // which the device-flow connect always requests). Sorted newest-pushed first.
+    execFile('gh', ['repo', 'list', String(account), '--limit', '200', '--json', 'nameWithOwner,name,defaultBranchRef,visibility,pushedAt'],
       { env: ghEnv(token), timeout: 25000, maxBuffer: 8 * 1024 * 1024 }, (err, out, errOut) => {
         if (err) return resolve({ error: (errOut && errOut.trim()) || err.message });
         try {
@@ -684,8 +684,6 @@ ipcMain.handle('list-account-repos', async (_e, account) => {
         } catch (_) { resolve({ error: 'could not parse gh output' }); }
       });
   });
-  if (result.error) return result;
-  return { repos: result.repos, scopes: await scopesP };
 });
 
 // Grid mode: add one more named worker to a running session (no restart). Engine creates a fresh
@@ -1070,6 +1068,10 @@ function spawnPane(sid, idx, cols, rows) {
   const allowList = s.bypass ? ALLOW.concat(['Bash(git push:*)', 'Bash(rm:*)'])
     : (s.autonomous ? ALLOW.concat(dispatchPush) : null);
   const allowArgs = allowList ? ' --allowedTools ' + allowList.map((a) => shQuote(a)).join(' ') : '';
+  // Start every pane in ⏵⏵ accept-edits mode (auto-apply file edits, no per-edit prompt) when
+  // autonomous — pairs with the allowlist (which auto-approves the listed Bash verbs). Non-allowlisted
+  // verbs (curl/sudo/…) still ask. Only set when autonomous so a non-autonomous run still prompts.
+  const permArgs = allowList ? ' --permission-mode acceptEdits' : '';
   // restored panes resume their prior conversation in this worktree (Claude's built-in --continue); fresh panes get the prompt
   const cmd = p.resume ? 'claude --continue' : 'claude ' + shQuote(p.prompt);
   // Workers rarely need external MCP servers (playwright/canva/…); connecting them slows every
@@ -1078,7 +1080,7 @@ function spawnPane(sid, idx, cols, rows) {
   const mcpArgs = (p.role === 'orchestrator') ? '' : ' --strict-mcp-config';
   let term;
   try {
-    term = pty.spawn(shell, ['-l', '-c', `exec ${cmd}${mcpArgs}${allowArgs}`], {
+    term = pty.spawn(shell, ['-l', '-c', `exec ${cmd}${mcpArgs}${allowArgs}${permArgs}`], {
       name: 'xterm-256color', cols: cols || 80, rows: rows || 24, cwd: p.dir, env,
     });
   } catch (e) {   // bad cwd / spawn failure -> surface it instead of leaving the pane stuck on "Starting Claude…"
