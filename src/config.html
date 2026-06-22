@@ -39,8 +39,9 @@
     background:var(--card-2); color:var(--fg); font-size:12px; font-weight:600; transition:.14s; }
   .pickbtn:hover { border-color:var(--line-2); }
   .pickbtn.on { border-color:var(--accent); color:#fff; background:var(--accent-soft); }
-  .projpath { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; font-size:12px; color:var(--faint); }
-  .projpath.set { color:var(--fg); }
+  .projpath { flex:1; min-width:0; display:flex; align-items:center; }
+  .projhint { font-size:12px; color:var(--faint); }
+  .folder-chip { display:inline-flex; align-items:center; gap:6px; padding-right:5px; max-width:220px; }
 
   /* repo bar: Connect GitHub button + account chips, OR, folder pickers */
   .repobar { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
@@ -223,17 +224,38 @@
   function fit() { requestAnimationFrame(() => window.fleet.resizeWindow(document.querySelector('.wrap').getBoundingClientRect().bottom + 8)); }
   function refreshGo() { goEl.disabled = !(repo || repoNWO || newProject); }
 
+  // Render the current selection as a CHIP — the folder's name (or "New project"), with an ×
+  // to clear it — instead of a long path string. Falls back to a faint hint when nothing's set.
+  function setProjLabel() {
+    projPath.innerHTML = '';
+    if (newProject) {
+      projPath.appendChild(folderChip('New project', null));
+    } else if (repo) {
+      projPath.appendChild(folderChip(repo.replace(/\/+$/, '').split('/').pop() || repo, repo));
+    } else {
+      const s = document.createElement('span'); s.className = 'projhint'; s.textContent = 'No folder selected';
+      projPath.appendChild(s);
+    }
+  }
+  function folderChip(name, full) {
+    const c = document.createElement('div'); c.className = 'chip folder-chip on';
+    if (full) c.title = full;
+    const nm = document.createElement('span'); nm.textContent = name;
+    const x = document.createElement('button'); x.className = 'acctx'; x.textContent = '×'; x.title = 'Clear selection';
+    x.onclick = () => { repo = ''; newProject = false; newProjBtn.classList.remove('on'); setProjLabel(); refreshGo(); };
+    c.appendChild(nm); c.appendChild(x);
+    return c;
+  }
+
   // --- new project (no folder): boot the orchestrator in a scratch repo; Claude names + sets up the project ---
   function setNewProject(on) {
     newProject = !!on;
     newProjBtn.classList.toggle('on', newProject);
     if (newProject) {                              // mutually exclusive with a folder OR a GitHub repo
       repo = ''; clearGithub();
-      projPath.textContent = 'New project — Claude will create the folder'; projPath.classList.add('set');
       useOrchEl.checked = true; syncOrch();        // new project always uses the orchestrator
-    } else if (!repo && !repoNWO) {
-      projPath.textContent = 'No folder selected'; projPath.classList.remove('set');
     }
+    setProjLabel();
     refreshGo(); renderRecent();
   }
 
@@ -241,8 +263,8 @@
   function setRepo(p) {
     repo = p || '';
     if (repo) newProject = false;                  // picking a folder clears new-project (and vice-versa)
-    projPath.textContent = repo || 'No folder selected'; projPath.classList.toggle('set', !!repo);
     if (repo) { clearGithub(); newProjBtn.classList.remove('on'); }   // a local folder and a GitHub repo are mutually exclusive
+    setProjLabel();
     refreshGo(); renderRecent();
   }
   function recents() { try { return JSON.parse(localStorage.getItem('cfleet.recent') || '[]'); } catch (_) { return []; } }
@@ -329,7 +351,7 @@
   }
   function setAccount(id) {
     account = id; repo = ''; newProject = false; newProjBtn.classList.remove('on');   // choosing GitHub clears the local folder + new-project
-    projPath.textContent = 'No folder selected'; projPath.classList.remove('set');
+    setProjLabel();
     [...acctsEl.children].forEach((c) => c.classList.toggle('on', c.dataset.id === id));
     renderRecent(); document.getElementById('repoPickRow').style.display = ''; loadRepos(id);
   }
@@ -402,7 +424,7 @@
     else { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; syncOrch(); }
   };
 
-  renderRecent(); syncOrch(); fit();
+  renderRecent(); setProjLabel(); syncOrch(); fit();
   // on startup, if a GitHub account is connected and nothing else is chosen yet, auto-select it so its repos
   // (public + private) load immediately — no hidden "click the chip" step. Prefers the gh-active account.
   loadAccounts().then(() => {
