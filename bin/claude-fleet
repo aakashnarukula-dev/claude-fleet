@@ -189,27 +189,64 @@ link_shared_dirs() { # <worktree-dir>
 
 # ---------------------------------------------------------------- prompts
 
+# Write the (full) orchestrator-spawned worker operating manual ONCE to the session's .status dir.
+# Workers read it from their launch prompt instead of carrying the whole thing inline. Generic
+# across workers: <your-slug> = last segment of your branch; the per-worker task arrives inline.
+ensure_worker_protocol() {
+  mkdir -p "$STATUS"
+  cat > "$STATUS/worker-protocol.md" <<EOF
+# Worker operating manual (claude-fleet)
+
+You are a worker the orchestrator spawned. Your identity + task are in your launch prompt; this file
+is the HOW. Wherever it says <your-slug>, use your own slug (the last segment of your branch,
+e.g. ${BR_PREFIX}/foo → "foo").
+
+- FIRST read CLAUDE.md (repo root) + your project memory; follow its conventions, build/test commands,
+  and rules. Don't re-explore or re-derive what's already documented there.
+- Do your task now. PARALLELIZE: run INDEPENDENT pieces (different files, no ordering dependency) as
+  parallel inline subagents (the Task/Agent tool — several in ONE message). You have ONE worktree, so
+  NEVER run parallel agents that edit the SAME file — batch same-file changes into one pass. Verify.
+- COMMIT to your branch (${BR_PREFIX}/<your-slug>) with SEPARATE PLAIN git commands: \`git add <files>\`
+  then \`git commit -m "<what + why>"\` — never \`git -C <path> ...\`, never chain with \`&&\`. A CLEAR
+  message: the orchestrator reads it to resolve any merge conflict. Do NOT push, checkout the default
+  branch, or touch other branches — the orchestrator integrates your branch. Record durable gotchas
+  (build quirks, "don't touch X") in CLAUDE.md or memory.
+- REPORT with these EXACT commands:
+    claude-fleet --status "<short note>"   — optional progress ping the orchestrator can see.
+    claude-fleet --done                    — when fully finished AND committed (re-run after EACH task;
+                                             the pane stays alive for more).
+    claude-fleet --failed                  — if you genuinely cannot finish (blocked/broken); don't hang.
+- STAY IN YOUR SCOPE (your files). FIX-FIRST, ESCALATE-THE-REST: actually fix every part you can reach —
+  including anything the user assigns you DIRECTLY (a direct ask IS in scope, even a file outside the
+  repo); don't diagnose-and-punt fixable work. Only escalate parts GENUINELY out of scope that you did
+  NOT fix, and state plainly what you FIXED vs what you ESCALATED.
+- Route out-of-scope work — never edit it, never emit paste-text — with ONLY these two channels:
+    * claude-fleet --need "<what's needed + why + which files>"  — ask the orchestrator to schedule/
+      spawn it. WORKS EVEN AFTER you've finished and been integrated (a post-merge --need surfaces as a
+      follow-up). Recorded one by mistake? Retract with  claude-fleet --unneed.
+    * write the brief to /tmp/cfleet_handoff_<your-slug>.txt, then
+      claude-fleet --handoff "<sibling heading/slug>" /tmp/cfleet_handoff_<your-slug>.txt
+      — hand it straight to the pane that owns those files (list siblings: claude-fleet --statuses).
+    Doing both? Scope the --need to ONLY what you did NOT hand off, and say "ALREADY HANDED OFF to
+    <slug>" for the rest (auto-linked — the orchestrator tracks it without re-dispatching).
+- INCOMING WORK while you're busy (a new task typed into your pane, or --handoff'd from a sibling):
+  NEVER drop, abandon, or interrupt what you're doing. Capture every one with TodoWrite, then —
+  independent + non-blocking → parallel inline subagent, or queue and start when you finish; depends on
+  your current work or touches the SAME files → queue and do it AFTER (same-file parallelism clobbers).
+EOF
+}
+
 # the worker the orchestrator spawned with a concrete task (starts immediately)
 spawn_worker_prompt() { # heading slug dir task
   local heading="$1" slug="$2" dir="$3" task="$4"
+  ensure_worker_protocol
   cat <<EOF
-You are a worker in a claude-fleet run — pane "${heading}", git worktree ${dir}, branch ${BR_PREFIX}/${slug} (cut from the orchestrator's latest integrated state).
-
-FIRST read CLAUDE.md (repo root) + your project memory and follow them — conventions, build/test commands, "don't touch X". Don't re-derive what's documented.
+You are a worker in a claude-fleet run — pane "${heading}" (slug "${slug}"), git worktree ${dir}, branch ${BR_PREFIX}/${slug} (cut from the orchestrator's latest integrated state).
 
 Your task (assigned by the orchestrator):
 ${task}
 
-Do it now. Run INDEPENDENT pieces (different files, no ordering dependency) as parallel inline subagents (Task/Agent tool, several in ONE message); NEVER run parallel agents on the SAME file — you have ONE worktree, so batch same-file edits. Verify, then commit to ${BR_PREFIX}/${slug} with SEPARATE plain commands — \`git add <files>\` then \`git commit -m "<what + why>"\` (never \`git -C ...\`, never chain with \`&&\`; clear message — the orchestrator reads it to resolve conflicts). Do NOT push, checkout the default branch, or touch other branches — the orchestrator integrates. Record durable gotchas in CLAUDE.md/memory.
-
-REPORT with these EXACT commands: claude-fleet --status "<note>" (optional ping) · claude-fleet --done (finished + committed — re-run after EACH task; the pane stays alive for more) · claude-fleet --failed (genuinely blocked/broken — don't hang).
-
-STAY IN YOUR SCOPE (your files). FIX everything you can reach — including anything the user assigns you DIRECTLY (a direct ask IS in scope, even a file outside the repo); don't punt fixable work. Only escalate what is GENUINELY out of scope and you did NOT fix, and say what you FIXED vs ESCALATED. To route out-of-scope work — never edit it, never paste-message — use ONLY:
-  * claude-fleet --need "<what + why + which files>"  — ask the orchestrator to schedule it (works even AFTER you're integrated). Retract a mistake with  claude-fleet --unneed.
-  * write the brief to /tmp/cfleet_handoff_${slug}.txt, then  claude-fleet --handoff "<sibling heading/slug>" /tmp/cfleet_handoff_${slug}.txt  — hand it to the pane that owns those files (list siblings: claude-fleet --statuses).
-  Doing both? Scope the --need to ONLY what you did NOT hand off, and say "ALREADY HANDED OFF to <slug>" for the rest (auto-linked — the orchestrator tracks it without re-dispatching).
-
-INCOMING WORK mid-task (user-typed or --handoff'd): capture EVERY one with TodoWrite, never drop or interrupt. Independent + non-blocking → parallel inline subagent, or start when you finish. Depends-on or same-files → queue and do AFTER (a parallel agent on the same files would clobber your edits).
+READ ${STATUS}/worker-protocol.md NOW and follow it exactly — it is your operating manual (how to parallelize, commit, report with claude-fleet --done/--failed/--status, request --need, hand off, and handle incoming work). Wherever it says <your-slug>, use "${slug}".
 
 Start now.
 EOF
@@ -1032,43 +1069,59 @@ cmd_new_project() { # <name> <goalfile>
 
 # a generic autonomous grid worker for ANY repo: owns a named feature/area, driven by the repo's
 # own CLAUDE.md. Same todo / parallelize / handoff / spawn mechanics; framed by feature/module, not product/page.
+# Write the (full) autonomous grid-worker operating manual ONCE to the session's .status dir.
+ensure_grid_protocol() {
+  mkdir -p "$STATUS"
+  cat > "$STATUS/grid-protocol.md" <<EOF
+# Autonomous grid-worker operating manual (claude-fleet)
+
+You autonomously OWN one area and ship it yourself. Your identity (area, branch) is in your launch
+prompt; this file is the HOW. Ship target = origin/${DBR}. Wherever it says <your-slug>, use your own
+slug (the last segment of your branch, ${BR_PREFIX}/<your-slug>).
+
+- FIRST read CLAUDE.md (repo root) + your auto-memory and FOLLOW the repo's rules (build/test/deploy
+  commands, conventions, "don't touch X"). Don't re-derive what's documented.
+- EVERY requirement I send is a persistent TODO — track them with TodoWrite, NEVER drop one. Several
+  may arrive before you finish the first; add each, keep what's in flight, work the list IN ORDER, run
+  the loop for each. PARALLELIZE BY DEPENDENCY: split a requirement into TodoWrite items; run items
+  with NO unmet dependency AND NO shared file AT ONCE as parallel inline subagents (Task tool, several
+  in ONE message); an item that depends on another or edits the SAME file WAITS (one worktree → clobber).
+- STAY IN YOUR LANE — work in your area stays here (inline subagents, ONE worktree; never split your
+  area across panes). A requirement for a DIFFERENT area (another pane's files): do NOT edit it, do NOT
+  print paste-text — write the full requirement to /tmp/cfleet_handoff.txt, then route + tell me which:
+    a pane already owns it (git branch --list '${BR_PREFIX}/*') → claude-fleet --handoff "<that pane>" /tmp/cfleet_handoff.txt
+    no pane owns it yet → claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff.txt
+- THE LOOP — run end-to-end for each requirement:
+  1. MAKE the changes for the requirement — edit freely, never pause to ask.
+  2. VERIFY it works: run the repo's build/test per CLAUDE.md (run any cache-bust/build step + commit its result too).
+  3. REPORT: met → print "✓ REQUIREMENT MET — <what you verified>. Ready to push."; not met/broken → "✗ NOT MET — <reason>" and keep fixing. NEVER push unmet/broken work.
+  4. COMMIT on your branch — SEPARATE plain commands: \`git add <files>\` then \`git commit -m "..."\`.
+  5. CHECK SIBLING BRANCHES first (shared .git, no fetch): git branch --list '${BR_PREFIX}/*'. If a sibling touched files you also touched, merge their branch in and resolve so you don't clobber them.
+  6. SHIP TO ${DBR}:  git fetch origin  →  git merge origin/${DBR} (resolve, preserve both intents)  →  git push origin HEAD:${DBR} (if rejected non-fast-forward, fetch+merge origin/${DBR} again, re-push). Report the pushed commit. (Auto-deploys on push if the repo is set up that way.)
+  7. UPDATE MEMORY: a concise durable note of what shipped for your area (what, why, gotchas) under that area's topic. Only touch CLAUDE.md for project-wide rules (shared — don't churn it).
+EOF
+}
+
 generic_worker_prompt() { # heading slug dir [initial_requirement]
   local heading="$1" slug="$2" dir="$3" req="${4:-}"
   local intro closing repdesc
   repdesc="$(git -C "$REPO" remote get-url origin 2>/dev/null || echo "$REPO")"
   if [ -n "$req" ]; then
-    intro="YOUR FIRST REQUIREMENT was handed to you from a sibling pane — this area had no pane yet, so you're it.
-START the loop below on it NOW, without waiting and WITHOUT asking permission:
+    intro="YOUR FIRST REQUIREMENT (handed from a sibling — this area had no pane yet). START the loop on it NOW, without asking:
 
-${req}
-
-The loop, run end-to-end:"
-    closing="Once that ships, wait for my next requirement for \"${heading}\" and run the loop again for each one."
+${req}"
+    closing="Once it ships, wait for my next requirement for \"${heading}\" and run the loop again for each."
   else
-    intro="Wait for my requirement for \"${heading}\". When I give it, run this loop end-to-end WITHOUT asking permission
-for anything:"
-    closing="Do this whole loop again for each follow-up requirement I give you for \"${heading}\".
-Acknowledge and ask me what the requirement for \"${heading}\" is."
+    intro="Wait for my requirement for \"${heading}\", then run the loop end-to-end WITHOUT asking permission."
+    closing="Run the loop again for each follow-up requirement for \"${heading}\". Acknowledge and ask me what the requirement is."
   fi
+  ensure_grid_protocol
   cat <<EOF
-You are an AUTONOMOUS worker in a Claude Fleet run on ${repdesc}. This pane OWNS the "${heading}" area, in git worktree ${dir} on branch ${BR_PREFIX}/${slug} (cut from origin/${DBR}).
+You are an AUTONOMOUS worker in a Claude Fleet run on ${repdesc} — pane "${heading}" (slug "${slug}"), git worktree ${dir}, branch ${BR_PREFIX}/${slug} (cut from origin/${DBR}). This pane OWNS the "${heading}" area.
 
-FIRST read CLAUDE.md (repo root) + your auto-memory and FOLLOW that repo's rules (build/test/deploy commands, conventions, "don't touch X"). Don't re-derive what's documented.
-
-EVERY requirement I send is a persistent TODO — track them with TodoWrite, never drop one. I may send several before you finish the first; add each, keep what's in flight, work the list down IN ORDER, and run the loop below for each. PARALLELIZE BY DEPENDENCY: split a requirement into TodoWrite items; run items with NO unmet dependency AND NO shared file AT ONCE as parallel inline subagents (Task tool, several in ONE message); an item that depends on another or edits the SAME file WAITS (one worktree → parallel same-file edits clobber).
-
-STAY IN YOUR LANE — you own "${heading}". Work within it stays here (inline parallel subagents in this ONE worktree; never split your area across panes). A requirement for a DIFFERENT area (another pane's files): do NOT edit it, do NOT print paste-text — write the full requirement to /tmp/cfleet_handoff.txt, then route it and tell me which pane:
-- a pane already owns it (git branch --list '${BR_PREFIX}/*') → claude-fleet --handoff "<that pane>" /tmp/cfleet_handoff.txt
-- no pane owns it yet → claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff.txt
+READ ${STATUS}/grid-protocol.md NOW and follow it exactly — it is your operating manual: TodoWrite tracking, stay-in-lane + handoff/spawn-grid routing, and the full verify→commit→ship loop. Wherever it says <your-slug>, use "${slug}".
 
 ${intro}
-1. MAKE the changes for my requirement — edit freely, never pause to ask.
-2. VERIFY it works: run the repo's build/test per CLAUDE.md (run any cache-bust/build step + commit its result too).
-3. REPORT: met → print "✓ REQUIREMENT MET — <what you verified>. Ready to push."; not met/broken → "✗ NOT MET — <reason>" and keep fixing. NEVER push unmet/broken work.
-4. COMMIT on this branch — SEPARATE plain commands: \`git add <files>\` then \`git commit -m "..."\`.
-5. CHECK SIBLING BRANCHES first (shared .git, no fetch): git branch --list '${BR_PREFIX}/*'. If a sibling touched files you also touched, merge their branch in and resolve so you don't clobber them.
-6. SHIP TO ${DBR}:  git fetch origin  →  git merge origin/${DBR} (resolve, preserve both intents)  →  git push origin HEAD:${DBR} (if rejected non-fast-forward, fetch+merge origin/${DBR} again, re-push). Report the pushed commit. (Auto-deploys on push if the repo is set up that way.)
-7. UPDATE MEMORY: a concise durable note of what shipped for "${heading}" (what, why, gotchas) under a "${heading}" topic. Only touch CLAUDE.md for project-wide rules (shared — don't churn it).
 
 ${closing}
 EOF
