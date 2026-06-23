@@ -105,18 +105,7 @@
   #edsave { background:var(--accent); color:#1a0f0a; border-color:var(--accent); }
   #edsave:disabled { opacity:.45; }
   #monaco { flex:1; min-height:0; }
-  /* in-app permission QUEUE — concurrent prompts stack as a dismissible LIST (no longer hide each other) */
-  #permqueue { position:fixed; right:14px; bottom:14px; z-index:70; width:312px; max-height:70vh; overflow-y:auto; display:none; flex-direction:column; gap:8px; -webkit-app-region:no-drag; }
-  #permqueue.show { display:flex; }
-  #permhdr { font-size:11px; font-weight:700; color:var(--muted, #8a8f98); text-transform:uppercase; letter-spacing:.04em; padding:0 2px; }
-  #permlist { display:flex; flex-direction:column; gap:8px; }
-  .permcard { background:#16181c; border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:10px; padding:11px 12px; box-shadow:0 12px 34px rgba(0,0,0,.45); }
-  .permcard .pc-name { font-size:12px; font-weight:700; color:#fff; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .permcard .pc-sub { font-size:11px; color:var(--muted, #8a8f98); margin-top:2px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .permcard .pc-btns { display:flex; gap:6px; margin-top:10px; flex-wrap:wrap; }
-  .permcard .pc-btns button { -webkit-app-region:no-drag; padding:5px 11px; border-radius:7px; border:1px solid var(--line); background:transparent; color:var(--fg); font-size:11px; font-weight:600; cursor:pointer; }
-  .permcard .pc-btns button:hover { border-color:#3a3e48; }
-  .permcard .pc-btns button.pc-yes { background:var(--accent); color:#1a0f0a; border-color:var(--accent); }
+  /* in-app permission queue removed — permission prompts now surface only through the system-wide overlay window. */
 </style>
 </head>
 <body>
@@ -126,7 +115,6 @@
 <div id="filepanel"><select id="rootsel"></select><input id="filesearch" type="text" placeholder="Search text in files…" autocomplete="off" spellcheck="false" /><div id="filetree"></div><div id="fileresults"></div></div>
 <div id="editor"><div id="edbar"><span id="edpath"></span><button id="edsave" disabled>Save ⌘S</button><button id="edclose">✕</button></div><div id="monaco"></div></div>
 <div id="edsplit"></div>
-<div id="permqueue"><div id="permhdr"></div><div id="permlist"></div></div>
 <script src="vendor/xterm.js"></script>
 <script src="vendor/addon-fit.js"></script>
 <script>
@@ -523,47 +511,8 @@
     const t = s.terms[id]; if (t) requestAnimationFrame(() => { try { t.term.focus(); } catch (_) {} });
   }
   window.fleet.onFocusPane(({ sid, id }) => jumpToPane(sid, id));
-
-  // in-app permission QUEUE: pending prompts from main stack as a dismissible LIST (concurrent prompts no longer
-  // hide each other). Each card routes its answer back to ITS OWN sid:id, so answers never cross-wire between panes.
-  const permQueue = new Map();   // "sid:id" -> { sid, id, name, title, options:{yes,always,no} }
-  const permqEl = document.getElementById('permqueue');
-  const permlistEl = document.getElementById('permlist');
-  const permhdrEl = document.getElementById('permhdr');
-  function renderPermQueue() {
-    const items = Array.from(permQueue.values());
-    permqEl.classList.toggle('show', items.length > 0);
-    if (!items.length) { permlistEl.innerHTML = ''; return; }
-    permhdrEl.textContent = items.length === 1 ? 'Permission needed' : items.length + ' permissions pending';
-    permlistEl.innerHTML = '';
-    items.forEach((p) => {
-      const card = document.createElement('div'); card.className = 'permcard';
-      const name = document.createElement('div'); name.className = 'pc-name'; name.textContent = p.name || 'A pane';
-      const sub = document.createElement('div'); sub.className = 'pc-sub'; sub.textContent = (p.title || '') + ' · asking to proceed — click to open';
-      name.onclick = sub.onclick = () => jumpToPane(p.sid, p.id);
-      const btns = document.createElement('div'); btns.className = 'pc-btns';
-      const o = p.options || {};
-      const mk = (label, digit, cls) => { const b = document.createElement('button'); b.textContent = label; if (cls) b.className = cls; b.onclick = () => answerPerm(p.sid, p.id, digit); btns.appendChild(b); };
-      if (o.yes != null) mk('Yes', o.yes, 'pc-yes');
-      if (o.always != null) mk('Always', o.always);
-      if (o.no != null) mk('No', o.no);
-      if (o.yes == null && o.always == null && o.no == null) { const b = document.createElement('button'); b.textContent = 'Open pane'; b.onclick = () => jumpToPane(p.sid, p.id); btns.appendChild(b); }
-      card.appendChild(name); card.appendChild(sub); card.appendChild(btns);
-      permlistEl.appendChild(card);
-    });
-  }
-  function answerPerm(sid, id, digit) {
-    window.fleet.answerPane(sid, id, digit);   // main writes the digit + Enter to that pane's pty
-    permQueue.delete(sid + ':' + id);          // dismiss now (snappy); main also pushes a remove on state change
-    renderPermQueue();
-  }
-  window.fleet.onPermPrompt((d) => {
-    if (!d) return;
-    const key = d.sid + ':' + d.id;
-    if (d.remove) permQueue.delete(key);
-    else permQueue.set(key, { sid: d.sid, id: d.id, name: d.name, title: d.title, options: d.options || {} });
-    renderPermQueue();
-  });
+  // (in-app permission queue removed — prompts surface only through the system-wide overlay; the overlay answers
+  //  directly via window.fleet.answerPane, and clicking an overlay card jumps here through the focus-pane channel.)
 
   // this session was MOVED to another window: dispose THIS window's view objects (xterm) and drop the tab — but do
   // NOT kill the PTYs (main keeps them running and re-routes their output to the destination window). The destination
@@ -574,7 +523,6 @@
     if (s.tabEl) s.tabEl.remove();
     if (s.sessEl) s.sessEl.remove();
     delete sessions[sid];
-    Array.from(permQueue.keys()).forEach((k) => { if (k.indexOf(sid + ':') === 0) permQueue.delete(k); }); renderPermQueue();
     if (activeSid === sid) { const ids = Object.keys(sessions); activeSid = ids.length ? +ids[ids.length - 1] : null; if (activeSid != null) activate(activeSid); else window.fleet.setActiveSession(null); }
   });
   // another window's tab bar lights up while a tab is dragged over it (re-dock target feedback)

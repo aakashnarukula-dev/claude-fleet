@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, clipboard, Menu, dialog, Notification, powerSaveBlocker, Tray, nativeImage, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, clipboard, Menu, dialog, powerSaveBlocker, Tray, nativeImage, shell } = require('electron');
 const path = require('path');
 const os = require('os');
 const fsmod = require('fs');
@@ -138,23 +138,40 @@ function focusSidPane(sid, id) {
 }
 
 // ── system-wide permission OVERLAY ───────────────────────────────────────────────────────────────────────────
-// An always-on-top, all-Spaces panel that mirrors EVERY pending permission prompt across ALL sessions/windows, so
-// the user can SEE and ANSWER prompts while another macOS app is frontmost — the in-app grid queue is per-window and
-// trapped inside the app. `permQueueAll` is the SINGLE source of truth for the global pending list; it's fed from the
-// same perm-prompt stream as the in-app queue (see setPaneState/clearPaneState) and clicking a button answers via the
-// existing answerPane() path. The overlay is a SECOND consumer — it never replaces the in-app queue.
+// An always-on-top, all-Spaces panel that mirrors EVERY pending permission prompt across ALL sessions/windows, so the
+// user can SEE and ANSWER prompts while another macOS app is frontmost. This is now the ONLY permission surface — the
+// in-app per-window card stack and the macOS/AppleScript notifications were removed. `permQueueAll` is the SINGLE
+// source of truth for the global pending list (fed by setPaneState/clearPaneState); clicking a button answers via the
+// existing answerPane() path, and clicking a card body jumps to the pane via focusSidPane().
 const permQueueAll = new Map();   // "sid:id" -> { sid, id, name, title, options:{yes,always,no} }
 let overlayWin = null;
+let overlayDisplayId = null;      // id of the monitor the overlay is currently pinned to (drives cursor-follow)
+let overlayFollowTimer = null;    // while visible, polls the cursor's monitor and relocates the panel when it changes
 
 function positionOverlay(win) {
   try {
     const { screen } = require('electron');
-    const pt = screen.getCursorScreenPoint();
-    const wa = screen.getDisplayNearestPoint(pt).workArea;   // monitor the cursor is on
-    const b = win.getBounds();
+    const disp = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());   // monitor the cursor is on
+    overlayDisplayId = disp.id;
+    const wa = disp.workArea, b = win.getBounds();
     win.setBounds({ x: wa.x + wa.width - b.width - 16, y: wa.y + 16, width: b.width, height: b.height });
   } catch (_) {}
 }
+
+// while the overlay is up, follow the cursor across monitors: if the pointer moves to a DIFFERENT display, re-pin the
+// panel to that monitor's top-right. Only fires on a display change (not every poll), so it never jitters in place.
+function startOverlayFollow() {
+  if (overlayFollowTimer) return;
+  overlayFollowTimer = setInterval(() => {
+    try {
+      if (!overlayWin || overlayWin.isDestroyed() || !overlayWin.isVisible()) return;
+      const { screen } = require('electron');
+      const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+      if (d.id !== overlayDisplayId) positionOverlay(overlayWin);
+    } catch (_) {}
+  }, 300);
+}
+function stopOverlayFollow() { if (overlayFollowTimer) { clearInterval(overlayFollowTimer); overlayFollowTimer = null; } }
 
 function ensureOverlay() {
   if (overlayWin && !overlayWin.isDestroyed()) return overlayWin;
@@ -169,7 +186,7 @@ function ensureOverlay() {
   overlayWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   try { overlayWin.setWindowButtonVisibility(false); } catch (_) {}
   overlayWin.loadFile(path.join(__dirname, 'overlay.html'));
-  overlayWin.on('closed', () => { overlayWin = null; });
+  overlayWin.on('closed', () => { stopOverlayFollow(); overlayWin = null; });
   overlayWin.webContents.on('did-finish-load', () => pushOverlay());   // first paint -> push whatever's pending
   positionOverlay(overlayWin);
   return overlayWin;
@@ -184,13 +201,15 @@ function pushOverlay() {
     try { w.webContents.send('perm-queue', list); } catch (_) {}
     positionOverlay(w);
     if (!w.isVisible()) w.showInactive();     // reveal WITHOUT focusing — user keeps their current app frontmost
+    startOverlayFollow();                     // track the cursor across monitors while prompts are pending
   } else if (overlayWin && !overlayWin.isDestroyed()) {
     try { overlayWin.webContents.send('perm-queue', list); } catch (_) {}
     if (overlayWin.isVisible()) overlayWin.hide();
+    stopOverlayFollow();
   }
 }
 
-// upsert/remove a prompt in the global queue (mirrors the in-app perm-prompt payload shape) and refresh the overlay
+// upsert/remove a prompt in the global queue and refresh the overlay
 function permUpsert(d) {
   if (!d) return;
   const key = d.sid + ':' + d.id;
@@ -874,11 +893,6 @@ const DONE_RE = /Marked\s+".*?"\s+done\b/i;       // a worker ran `claude-fleet 
 const FAILED_RE = /Marked\s+".*?"\s+FAILED\b/i;   // a worker ran `claude-fleet --failed`
 const PERM_LOG = path.join(os.tmpdir(), 'cfleet-perm.log');
 function permLog(msg) { try { fsmod.appendFileSync(PERM_LOG, '[' + new Date().toISOString() + '] ' + msg + '\n'); } catch (_) {} }
-// AppleScript fallback — shows a banner even if Electron's signed-notification path is unavailable (no buttons though)
-function osNotify(title, body) {
-  const q = (x) => '"' + String(x).replace(/["\\]/g, '').replace(/\s+/g, ' ').trim() + '"';
-  try { execFile('osascript', ['-e', `display notification ${q(body)} with title ${q(title)} sound name "Submarine"`], { env: cmdEnv() }, () => {}); } catch (_) {}
-}
 const IDLE_DOT_MS = 6000;       // quiet this long → flip working→idle (drives dot/tray)
 const IDLE_NOTIFY_MS = 25000;   // only notify "idle · ready" after a LONGER quiet (avoids between-phase noise)
 const STATE_LABEL = { permission: 'needs permission', failed: 'failed', idle: 'idle · ready', working: 'working' };
@@ -896,16 +910,12 @@ function setPaneState(sid, idx, state) {
   permLog('state ' + sid + ':' + idx + ' -> ' + state + ' focused=' + !!(w && w.isFocused()));
   sendToSid(sid, 'pane-state', { sid, id: idx, state });   // drives the in-app dot, in the window hosting this sid
   updateBadgeAndTray();
-  // in-app permission QUEUE: add a card when a pane needs permission, remove it once it's no longer waiting.
-  // Multiple concurrent prompts stack as a dismissible list in the renderer (each routes back to ITS sid:idx).
+  // permission prompts surface ONLY through the system-wide OVERLAY now. The in-app per-window card stack AND the
+  // macOS/AppleScript notifications were removed — the floating overlay is the single, always-visible permission surface.
   const permMsg = (state === 'permission')
     ? { sid, id: idx, name: nameOf(s, idx), title: s.title, options: (s.permOpts && s.permOpts[idx]) || {} }
     : { sid, id: idx, remove: true };
-  sendToSid(sid, 'perm-prompt', permMsg);   // in-app per-window queue
   permUpsert(permMsg);                       // system-wide overlay (global across ALL sessions/windows)
-  // notify ALWAYS — even when you're looking at THIS session's tab (user wants in-tab pings too)
-  if (state === 'permission') notifyPermission(sid, idx);
-  else if (state === 'failed') simpleNotify(sid, idx, nameOf(s, idx) + ' failed', s.title + ' · "' + nameOf(s, idx) + '" couldn’t finish.');
   markPaneWorking(s, idx, state === 'working');   // bridge a re-activated (already-integrated) worker to the engine
 }
 // A worker pane that's already been --merged/--done but picks up a NEW in-pane task goes back to running with NO engine
@@ -922,7 +932,7 @@ function markPaneWorking(s, idx, on) {
     else { if (fsmod.existsSync(f)) fsmod.unlinkSync(f); }
   } catch (_) { /* status dir gone (session torn down) — nothing live to bridge */ }
 }
-function clearPaneState(sid, idx) { const s = sessions[sid]; if (!s) return; if (s.pstate) delete s.pstate[idx]; if (s.permOpts) delete s.permOpts[idx]; sendToSid(sid, 'perm-prompt', { sid, id: idx, remove: true }); permUpsert({ sid, id: idx, remove: true }); updateBadgeAndTray(); }
+function clearPaneState(sid, idx) { const s = sessions[sid]; if (!s) return; if (s.pstate) delete s.pstate[idx]; if (s.permOpts) delete s.permOpts[idx]; permUpsert({ sid, id: idx, remove: true }); updateBadgeAndTray(); }
 // When a worker pane's pty dies (user closed the pane/window, or claude exited) the git worktree stays on disk, so
 // the engine's `[ -d "$FLEET/<slug>" ]` liveness guard still thinks the pane is ALIVE — a --handoff to it would write
 // a .task no live claude ever reads (the "black hole"). Drop a durable `$STATUS/<slug>.closed` marker the engine can
@@ -935,16 +945,7 @@ function markPaneClosed(statusDir, slug) {
 }
 function noteEvent(sid, idx, kind) {   // transient events parsed from engine output
   if (kind === 'failed') { setPaneState(sid, idx, 'failed'); return; }
-  if (kind === 'done') { const s = sessions[sid]; if (!s) return; simpleNotify(sid, idx, nameOf(s, idx) + ' finished', s.title + ' · "' + nameOf(s, idx) + '" completed a task.'); }
-}
-// plain (no-button) notification used for done / failed / idle; falls back to AppleScript if the signed path fails
-function simpleNotify(sid, idx, title, body) {
-  const focus = () => focusSidPane(sid, idx);
-  if (!Notification.isSupported()) { osNotify(title, body); return; }
-  const n = new Notification({ title, body, silent: false });
-  n.on('click', focus); n.on('failed', () => osNotify(title, body));
-  n.show();
-  try { if (app.dock) app.dock.bounce('informational'); } catch (_) {}
+  // 'done' previously fired a macOS notification; the tray badge + in-app dots now carry that state, so it's a no-op.
 }
 function fleetCounts() {
   const c = { permission: 0, failed: 0, working: 0, idle: 0 };
@@ -1014,27 +1015,6 @@ function answerPane(sid, idx, digit) {
   setTimeout(() => { try { t.write('\r'); } catch (_) {} }, 60);   // commit the selection
   setPaneState(sid, idx, 'working');   // answered → back to working
 }
-function notifyPermission(sid, idx) {
-  const s = sessions[sid]; if (!s) return;
-  const pane = s.panes[idx]; const name = (pane && pane.heading) || 'A pane';
-  const title = `${name} needs permission`, body = `${s.title} · "${name}" is asking to proceed.`;
-  permLog('notify ' + sid + ':' + idx + ' supported=' + Notification.isSupported());
-  if (!Notification.isSupported()) { osNotify(title, body); return; }
-  const opt = (s.permOpts && s.permOpts[idx]) || {};
-  const actions = [], map = [];   // action index -> option digit
-  if (opt.yes != null) { actions.push({ type: 'button', text: 'Yes' }); map.push(opt.yes); }
-  if (opt.always != null) { actions.push({ type: 'button', text: 'Always Yes' }); map.push(opt.always); }
-  if (opt.no != null) { actions.push({ type: 'button', text: 'No' }); map.push(opt.no); }
-  const focus = () => focusSidPane(sid, idx);
-  const n = new Notification({ title, body, actions, silent: false });
-  n.on('action', (_e, ai) => answerPane(sid, idx, map[ai]));   // tapped a notification button → answer directly
-  n.on('click', focus);                                        // tapped the body → jump to the pane
-  n.on('show', () => permLog('shown ' + sid + ':' + idx));
-  n.on('failed', (_e, err) => { permLog('FAILED ' + err); osNotify(title, body); });   // signed-notif unavailable → AppleScript banner
-  n.show();
-  try { if (app.dock) app.dock.bounce('informational'); } catch (_) {}
-}
-
 function spawnPane(sid, idx, cols, rows) {
   const s = sessions[sid];
   if (!pty || !s || ptys[`${sid}:${idx}`] || !s.panes[idx]) return;
@@ -1303,6 +1283,7 @@ function killAll() {
   saveState();   // window close / quit preserves sessions + worktrees so they can be restored next launch
   Object.values(ptys).forEach((t) => { try { t.kill(); } catch (_) {} });
   Object.values(sessions).forEach((s) => { if (s.watcher) { try { s.watcher.close(); } catch (_) {} } });
+  stopOverlayFollow();
   if (overlayWin && !overlayWin.isDestroyed()) { try { overlayWin.destroy(); } catch (_) {} overlayWin = null; }
   if (tray) { try { tray.destroy(); } catch (_) {} tray = null; }
 }

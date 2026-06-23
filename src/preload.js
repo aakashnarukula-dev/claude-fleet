@@ -33,9 +33,8 @@ contextBridge.exposeInMainWorld('fleet', {
   onPtyData: (cb) => ipcRenderer.on('pty-data', (_e, d) => cb(d)),   // {sid,id,data}
   onPtyExit: (cb) => ipcRenderer.on('pty-exit', (_e, d) => cb(d)),   // {sid,id}
   onFleetError: (cb) => ipcRenderer.on('fleet-error', (_e, d) => cb(d)), // {sid,msg}
-  onFocusPane: (cb) => ipcRenderer.on('focus-pane', (_e, d) => cb(d)),   // {sid,id} — from a permission notification
+  onFocusPane: (cb) => ipcRenderer.on('focus-pane', (_e, d) => cb(d)),   // {sid,id} — overlay card click jumps to the pane
   onPaneState: (cb) => ipcRenderer.on('pane-state', (_e, d) => cb(d)),   // {sid,id,state} — drives the per-pane status dot
-  onPermPrompt: (cb) => ipcRenderer.on('perm-prompt', (_e, d) => cb(d)),   // {sid,id,name,title,options} | {sid,id,remove:true} — in-app permission queue
   answerPane: (sid, id, digit) => ipcRenderer.send('answer-pane', { sid, id, digit }),   // answer a queued permission prompt by option digit
   onCmdW: (cb) => ipcRenderer.on('cmd-w', () => cb()),   // ⌘W routed from the menu (pane/project-aware close)
 
