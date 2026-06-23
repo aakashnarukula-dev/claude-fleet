@@ -37,6 +37,8 @@
 #   --statuses             show the live progress board (slug: status) across the fleet
 #   --rebuild              (orchestrator) rebuild + reinstall the project's app from the integrated state, ONCE
 #                          per batch — runs .claude-fleet/rebuild or $CLAUDE_FLEET_REBUILD_CMD; no-op if neither
+#   --gh-align             switch the gh CLI's active account to the OWNER of origin (so osxkeychain can read/push
+#                          this repo). Runs automatically at startup; this flag is the manual trigger.
 #   --clean                remove this session's worktrees + branches
 #   --gc                   garbage-collect FULLY-INTEGRATED <repo>-fleet[-*] session folders (folder-only). Removes a
 #                          session's worktree dir ONLY when guarded: not the live session, parent repo present, every
@@ -65,6 +67,43 @@ json_str() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"; }
 
 has_origin() { git -C "$REPO" remote get-url origin >/dev/null 2>&1; }
 fetch_origin() { has_origin && git -C "$REPO" fetch --prune origin >&2 2>/dev/null || true; }   # start from latest
+
+# Align the gh CLI's active account to the OWNER of origin, so the osxkeychain github.com entry
+# (which tracks gh's active account) can read/push this repo. Non-fatal, stderr-only, returns 0 always.
+gh_align() (
+  set +euo pipefail
+  {
+    command -v gh >/dev/null 2>&1 || exit 0
+    url=""; owner=""; host=""; rest=""; active=""; hosts=""
+    url="$(git -C "$REPO" remote get-url origin 2>/dev/null || true)"
+    [ -n "$url" ] || exit 0
+    case "$url" in
+      git@github.com:*)            host="github.com"; rest="${url#git@github.com:}" ;;
+      https://github.com/*)        host="github.com"; rest="${url#https://github.com/}" ;;
+      ssh://git@github.com/*)      host="github.com"; rest="${url#ssh://git@github.com/}" ;;
+      *) exit 0 ;;
+    esac
+    [ "$host" = "github.com" ] || exit 0
+    owner="${rest%%/*}"; owner="${owner%.git}"
+    [ -n "$owner" ] || exit 0
+    hosts="$HOME/.config/gh/hosts.yml"
+    if [ -f "$hosts" ]; then
+      active="$(awk '/^github\.com:/{f=1;next} f && /^[^[:space:]]/{f=0} f && /^[[:space:]]+user:/{print $2;exit}' "$hosts" 2>/dev/null || true)"
+    fi
+    [ -n "$active" ] || active="$(gh auth status --active 2>/dev/null | sed -nE 's/.*Logged in to github\.com account ([^ ]+).*/\1/p' | head -1)"
+    [ "$owner" = "$active" ] && exit 0
+    authed=""
+    if [ -f "$hosts" ]; then
+      authed="$(awk '/^github\.com:/{f=1;next} f && /^[^[:space:]]/{f=0} f && /^[[:space:]]+[A-Za-z0-9_-]+:[[:space:]]*$/{gsub(/[[:space:]:]/,"");print}' "$hosts" 2>/dev/null || true)"
+    fi
+    if ! printf '%s\n' "$authed" | grep -qx "$owner"; then
+      gh auth status 2>/dev/null | grep -q "account $owner " || exit 0
+    fi
+    gh auth switch --user "$owner" >/dev/null 2>&1 || true
+    printf '[claude-fleet] gh active account -> %s (to match origin)\n' "$owner" >&2
+  }
+  exit 0
+)
 
 set_default_branch() {
   # `|| true` is REQUIRED: under set -euo pipefail a repo with no origin/HEAD would otherwise abort silently.
@@ -1219,6 +1258,8 @@ cmd_grid_spawn() { # <name> <task-file>
 }
 
 # ---------------------------------------------------------------- dispatch
+gh_align   # align gh active account to origin owner before any git/gh work (self-guarded, non-fatal)
+
 case "${1:-}" in
   --orchestrator) cmd_orchestrator ;;
   --grid-plan)    shift; cmd_grid_plan "$@" ;;
@@ -1245,6 +1286,7 @@ case "${1:-}" in
   --clean)        cmd_clean ;;
   --gc)           cmd_gc ;;
   --gc-all)       shift; cmd_gc_all "${1:-}" ;;
+  --gh-align)     gh_align; echo "gh active account: $(gh auth status --active 2>/dev/null | sed -nE 's/.*Logged in to github\.com account ([^ ]+).*/\1/p' | head -1)" ;;
   -h|--help)      awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0" ;;
   *)              die "unknown arg: ${1:-} (try --help)" ;;
 esac
