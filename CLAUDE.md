@@ -52,11 +52,20 @@ Electron, no bundler — plain HTML + vendored libs, loaded directly.
   at runtime; don't import xterm via require in renderer.
 - `build/icon.icns` — app icon.
 
-### Two modes (`config.html`, gated by the "Use orchestrator" checkbox)
+### Three modes (`config.html`)
+A "Mode" segmented control picks **Single project** vs **Gyftalala — multi-repo**. Under Single
+project the "Use orchestrator" checkbox still toggles Dispatch vs Grid.
 - **Dispatch** (`mode:'dispatch'`, default, agentic): starts SOLO with one orchestrator
   pane; the orchestrator spawns its own workers on the fly (`--orchestrator`).
 - **Grid** (`mode:'grid'`, "Use orchestrator" unchecked): a fixed set of N named worker
   panes you task directly; each owns its area and pushes itself (`--grid-plan`, `--grid-add`).
+- **Gyftalala** (`mode:'gyftalala'`, multi-repo, always orchestrated/autonomous): one
+  super-orchestrator coordinates ONE task across SEVERAL interconnected repos. The config
+  shows a multi-select repo checklist (the 4 Gyftalala repos — `gyftalala/gyftalala`,
+  `-server`, `-admin`, `splashbook-editor` — pre-checked, editable). It reuses the single-repo
+  engine once per repo, with ONE shared coordination `.status` (the watcher surface) + per-repo
+  fleet dirs, repo-tagged workers, and an atomic push across the whole set. See the Gyftalala
+  multi-repo section below.
 
 ## The `claude-fleet` CLI (`bin/claude-fleet`)
 
@@ -73,8 +82,9 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
 - Orchestrator subcommands: `--orchestrator`, `--spawn-file H FILE`, `--spawn H TASK`,
   `--handoff T FILE`, `--next` (exit 3 = ALL DONE, 5 = TIMEOUT), `--ready`,
   `--watch`, `--merged S`, `--conflicts`, `--needs` / `--need-clear S`, `--rebuild`,
-  `--clean`, `--gc`. Worker-side (run inside a worktree): `--done`, `--failed`, `--need`,
-  `--unneed`, `--status`, `--statuses`.
+  `--clean`, `--gc`. `--spawn[-file]`/`--handoff` take an optional `--repo <name>` (multi-repo,
+  see below); `--ship-all` is the multi-repo atomic push gate. Worker-side (run inside a
+  worktree): `--done`, `--failed`, `--need`, `--unneed`, `--status`, `--statuses`.
 - **Auto-clean / `--gc` (added 2026-06-18):** finished session FOLDERS used to pile up
   forever (`--clean` was manual). `--gc` sweeps `<repo>-fleet*` for the configured repo and
   removes only sessions passing ALL guards: **G0** liveness (`lsof` — skip if any process
@@ -92,6 +102,22 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   `.playwright-mcp/` artifacts (`real_porcelain`), so junk can't block integration. Real
   tracked edits still trip the clobber guard. REFUSED messages now print the offending paths
   + the exact reconcile command.
+- **Gyftalala multi-repo mode (added 2026-06-24):** one super-orchestrator coordinates ONE task
+  across SEVERAL repos. The engine is REUSED verbatim once per repo, namespaced by session id.
+  Env: `CLAUDE_FLEET_MULTI=1`, `CLAUDE_FLEET_REPOS` (colon-sep repo paths), `CLAUDE_FLEET_STATUS_DIR`
+  (the ONE shared coordination `.status`, independent of any repo's `FLEET`). Layout: a coordination
+  dir `<...>/Fleet-Sessions/gyftalala-multi-fleet-<sid>/` (only `.status` — the watcher surface) +
+  per-repo fleet dirs `<repo>-fleet-<sid>/` (each with its own `_main` + workers on `fleet/s<sid>/<slug>`).
+  Workers are repo-tagged: `--spawn[-file] H TASK --repo <name>` cuts the worktree from that repo's
+  `_main` and writes a `"repo"` field into the `.spawn` marker (+ a `<slug>.repo` sidecar); the watcher
+  spawns the pane with `CLAUDE_FLEET_REPO`=that repo. All panes share `CLAUDE_FLEET_STATUS_DIR`
+  (coordination), so worker self-signals (`--done`/`--need`) land on the one board while git ops target
+  their own repo. The orchestrator integrates each repo's workers into that repo's `_main`, then
+  **`--ship-all`** = the HOLD-ALL atomic gate: dry-run every repo's merge to origin/main (ff-only,
+  per-repo `gh_align`), push ALL or NONE. **GC:** the multi `cmd_orchestrator` writes each member
+  fleet's `.status/repo` marker (reaped by the normal G0–G4 `gc_one_session`) + a coord `.status/members`
+  marker; `gc_one_coord` reaps the coord only when non-live + not-self + ALL members gone (fail-safe-holds
+  on an empty/partial marker). `--gc-all` routes `members`-flagged dirs to it. See [[gyftalala-multi-repo-mode]].
 
 ## Conventions / gotchas
 
