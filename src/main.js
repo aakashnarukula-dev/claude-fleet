@@ -230,6 +230,9 @@ function repoFor(repo) { return repo ? String(repo).replace(/\/+$/, '') : DEFAUL
 // FLEET=$SESSIONS_DIR/$(basename REPO)-fleet-$SESSION — the watcher reads that dir's .status.
 const SESSIONS_DIR = process.env.CLAUDE_FLEET_SESSIONS_DIR || path.join(os.homedir(), 'Developer', 'Fleet-Sessions');
 function fleetDir(repo, sid) { return path.join(SESSIONS_DIR, `${path.basename(String(repo).replace(/\/+$/, ''))}-fleet-${sid}`); }
+// Gyftalala (multi-repo) session: ONE coordination dir holds the shared .status the watcher observes; each repo
+// keeps its own <basename>-fleet-<sid> dir (created by the engine). Name is stable + sid-scoped.
+function coordDir(sid) { return path.join(SESSIONS_DIR, `gyftalala-multi-fleet-${sid}`); }
 function sessionEnv(sid, repo) { return Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: repo }); }
 
 // Per-account chip color, derived deterministically from the account name — no hardcoded account list.
@@ -271,6 +274,16 @@ async function ensureRepoClone(nameWithOwner, defaultBranch, account) {
       });
     });
   });
+}
+// Clone/fetch every selected repo to ~/Developer/<name>; returns absolute paths (in selection order) or an error.
+async function cloneRepos(repos, account) {
+  const paths = [];
+  for (const r of repos) {
+    const ens = await ensureRepoClone(r.nameWithOwner, r.defaultBranch || 'main', account);
+    if (!ens.ok) return { ok: false, error: `clone failed for ${r.nameWithOwner}: ${ens.error}` };
+    paths.push(ens.path);
+  }
+  return { ok: true, paths };
 }
 // per-project tab color from a small palette (hashed by name) so different projects look distinct
 const TAB_PALETTE = ['#2f6df0', '#1faa52', '#ef6c33', '#a855f7', '#0ea5e9', '#e0457b', '#b8542b', '#0d9488'];
@@ -484,8 +497,38 @@ function sendAddSession(sid, title, color, meta, mode, win, migrated) {
   sendToWin(target, 'add-session', payload);
 }
 
-async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, account, orchestrator, count, names, newProject }) {
+async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, account, orchestrator, count, names, newProject, mode, repos }) {
   if (!pty) { if (configWin) configWin.webContents.send('launch-error', 'node-pty failed to load — run `npm run rebuild`.'); return { ok: false, error: 'node-pty not loaded' }; }
+  if (mode === 'gyftalala') {
+    if (!Array.isArray(repos) || !repos.length) return { ok: false, error: 'Gyftalala mode needs at least one repo.' };
+    const cl = await cloneRepos(repos, account);
+    if (!cl.ok) return { ok: false, error: cl.error };
+    const sid = nextSid++;
+    const coord = coordDir(sid);
+    try { fsmod.mkdirSync(path.join(coord, '.status'), { recursive: true }); } catch (e) { nextSid--; return { ok: false, error: 'coord init failed: ' + ((e && e.message) || e) }; }
+    const title = 'Gyftalala', color = account ? accountColor(account) : tabColor(title);
+    sessions[sid] = {
+      repo: coord, repos: cl.paths, coordDir: coord, title, color,
+      mode: 'gyftalala', bypass: false, autonomous: true, newProject: false,
+      panes: [], planReady: false, pending: {}, slugIdx: {},
+      statusDir: path.join(coord, '.status'), watcher: null,
+    };
+    const win = targetGridWin();
+    sidWin.set(sid, win.id);
+    updatePowerBlocker();
+    if (configWin) configWin.hide();
+    const onReady = (panes) => {
+      const s = sessions[sid]; if (!s) return;
+      s.panes = panes; s.planReady = true;
+      panes.forEach((p, i) => { if (p.slug) s.slugIdx[p.slug] = i; });
+      Object.keys(s.pending).forEach((idx) => spawnPane(sid, +idx, s.pending[idx].cols, s.pending[idx].rows));
+      startWatcher(sid); saveState(); updateBadgeAndTray();
+    };
+    const onErr = (err) => sendToSid(sid, 'fleet-error', { sid, msg: String(err.message || err) });
+    sendAddSession(sid, title, color, [{ id: 0, role: 'orchestrator', heading: 'Orchestrator' }], 'gyftalala', win);
+    runMultiOrchestrator(sid, coord, cl.paths).then(onReady).catch(onErr);
+    return { ok: true };
+  }
   const useOrch = orchestrator !== false;   // default ON (orchestrator); OFF = named worker panes you task directly
   // resolve the project: a NEW-PROJECT scratch repo (no folder picked yet), a GitHub repo (clone to ~/Developer/<repo>
   // if missing, then fetch), or a local folder.
@@ -585,6 +628,24 @@ function restoreSessions(saved) {
 function runOrchestrator(sid, repo) {
   return new Promise((resolve, reject) => {
     execFile(FLEET_CLI, ['--orchestrator'], { maxBuffer: 16 * 1024 * 1024, env: sessionEnv(sid, repo) }, (err, out, errOut) => {
+      if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
+      try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty'); resolve(p); } catch (e) { reject(e); }
+    });
+  });
+}
+
+// Like runOrchestrator but multi-repo: the engine reads CLAUDE_FLEET_MULTI + CLAUDE_FLEET_REPOS + the shared
+// coordination CLAUDE_FLEET_STATUS_DIR, creates each repo's _main, and emits the orchestrator pane JSON.
+function runMultiOrchestrator(sid, coord, repoPaths) {
+  return new Promise((resolve, reject) => {
+    const env = Object.assign({}, process.env, {
+      CLAUDE_FLEET_SESSION: String(sid),
+      CLAUDE_FLEET_REPO: coord,                 // basename → coordination fleet name; not a git repo (multi path skips that check)
+      CLAUDE_FLEET_MULTI: '1',
+      CLAUDE_FLEET_REPOS: repoPaths.join(':'),
+      CLAUDE_FLEET_STATUS_DIR: path.join(coord, '.status'),
+    });
+    execFile(FLEET_CLI, ['--orchestrator'], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
       if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
       try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty'); resolve(p); } catch (e) { reject(e); }
     });
