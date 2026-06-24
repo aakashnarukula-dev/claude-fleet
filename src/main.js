@@ -33,7 +33,8 @@ function saveState() {
       .filter(([, s]) => !s.newProject)   // don't persist throwaway scratch sessions — their dir is disposable/torn down
       .map(([sid, s]) => ({
         sid: +sid, autonomous: !!s.autonomous, repo: s.repo, title: s.title, color: s.color, mode: s.mode, bypass: !!s.bypass,
-        panes: (s.panes || []).map((p, i) => (p ? { id: i, role: p.role, heading: p.heading, slug: p.slug, dir: p.dir } : null)).filter(Boolean),
+        repos: s.repos || null, coordDir: s.coordDir || null,
+        panes: (s.panes || []).map((p, i) => (p ? { id: i, role: p.role, heading: p.heading, slug: p.slug, dir: p.dir, repo: p.repo } : null)).filter(Boolean),
       })).filter((x) => x.panes.length);
     fsmod.writeFileSync(stateFile(), JSON.stringify(data));
   } catch (_) {}
@@ -611,10 +612,11 @@ function restoreSessions(saved) {
     const sid = ss.sid; maxSid = Math.max(maxSid, sid);
     const title = ss.title || projTitle(ss.repo), color = ss.color || tabColor(title);
     const s = {
-      repo: ss.repo, title, color, mode: ss.mode || 'dispatch', bypass: !!ss.bypass, autonomous: !!ss.autonomous, panes: [], planReady: true,
+      repo: ss.repo, title, color, mode: ss.mode || 'dispatch', bypass: !!ss.bypass, autonomous: !!ss.autonomous, planReady: true,
+      repos: ss.repos || null, coordDir: ss.coordDir || null, panes: [],
       pending: {}, slugIdx: {}, statusDir: path.join(fleetDir(ss.repo, sid), '.status'), watcher: null,
     };
-    panes.forEach((p) => { s.panes[p.id] = { role: p.role, slug: p.slug, heading: p.heading, dir: p.dir, prompt: '', resume: true }; if (p.slug) s.slugIdx[p.slug] = p.id; });
+    panes.forEach((p) => { s.panes[p.id] = { role: p.role, slug: p.slug, heading: p.heading, dir: p.dir, repo: p.repo, prompt: '', resume: true }; if (p.slug) s.slugIdx[p.slug] = p.id; });
     sessions[sid] = s;
     sendAddSession(sid, title, color, panes.map((p) => ({ id: p.id, role: p.role, heading: p.heading })), s.mode, win);
     startWatcher(sid);
@@ -1095,15 +1097,24 @@ function spawnPane(sid, idx, cols, rows) {
   // Orchestrator defaults to 'high' (not xhigh) for a faster first dispatch — it can still raise a
   // specific worker to xhigh per-task via `claude-fleet --spawn[-file] … --effort xhigh`.
   const effort = (p.role === 'orchestrator') ? 'high' : (p.effort || 'high');
+  const multi = s.mode === 'gyftalala';
+  const paneRepo = p.repo || s.repo;                 // worker: its tagged repo; orchestrator/single: the session repo
   const env = Object.assign({}, process.env, {
     TERM: 'xterm-256color', COLORTERM: 'truecolor',
-    CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: s.repo,   // so the orchestrator's `claude-fleet` calls target THIS project, not the default
+    CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: paneRepo,
     CLAUDE_CODE_EFFORT_LEVEL: effort,
     // share ONE Rust build cache across this session's worktrees (Tauri/cargo) instead of a multi-GB target/ per
     // pane. Lives inside the fleet dir, so it's reclaimed when the session closes. cargo locks it for concurrency.
-    CARGO_TARGET_DIR: path.join(fleetDir(s.repo, sid), '.cargo-target'),
+    CARGO_TARGET_DIR: path.join(fleetDir(paneRepo, sid), '.cargo-target'),
     PATH: extraPath + (process.env.PATH ? ':' + process.env.PATH : ''),
   });
+  if (multi) {
+    env.CLAUDE_FLEET_STATUS_DIR = s.statusDir;        // all panes share the coordination .status
+    if (p.role === 'orchestrator') {
+      env.CLAUDE_FLEET_MULTI = '1';
+      env.CLAUDE_FLEET_REPOS = (s.repos || []).join(':');
+    }
+  }
   // new-project scratch session: the CLI emits the new-project brief (name → retarget) when this is set.
   if (s.newProject && p.role === 'orchestrator') env.CLAUDE_FLEET_NEW_PROJECT = '1';
   // Grid workers (no-orchestrator mode) get a BROAD allowlist (incl. push + rm) — each pushes its own area, so it
@@ -1218,7 +1229,7 @@ function handleSpawn(sid, filename) {
     let info; try { info = JSON.parse(data); } catch (_) { return; }
     if (info.slug == null || s.slugIdx[info.slug] != null) return;
     const idx = s.panes.length;
-    s.panes.push({ role: 'worker', slug: info.slug, heading: info.heading, dir: info.dir, prompt: info.prompt, effort: info.effort });
+    s.panes.push({ role: 'worker', slug: info.slug, heading: info.heading, dir: info.dir, prompt: info.prompt, effort: info.effort, repo: info.repo });
     s.slugIdx[info.slug] = idx;
     sendToSid(sid, 'add-pane', { sid, pane: { id: idx, role: 'worker', heading: info.heading } });
     saveState();
