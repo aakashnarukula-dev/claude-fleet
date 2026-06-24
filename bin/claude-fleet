@@ -57,7 +57,8 @@ SESSION="${CLAUDE_FLEET_SESSION:-}"                                        # per
 SESSIONS_DIR="${CLAUDE_FLEET_SESSIONS_DIR:-$HOME/Developer/Fleet-Sessions}"
 mkdir -p "$SESSIONS_DIR" 2>/dev/null || true
 FLEET="$SESSIONS_DIR/$(basename "$REPO")-fleet${SESSION:+-$SESSION}"        # e.g. ~/Developer/Fleet-Sessions/gyftalala-fleet-1
-STATUS="$FLEET/.status"; MANIFEST="$STATUS/manifest"
+STATUS="${CLAUDE_FLEET_STATUS_DIR:-$FLEET/.status}"                         # multi-repo: ONE shared coordination dir; single-repo: per-fleet (unchanged)
+MANIFEST="$STATUS/manifest"
 BR_PREFIX="fleet${SESSION:+/s$SESSION}"                                    # worker branch prefix
 DBR="main"                                                                 # default branch, set by set_default_branch
 
@@ -110,6 +111,31 @@ set_default_branch() {
   DBR="$(git -C "$REPO" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
   [ -n "$DBR" ] || DBR="$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"   # no origin -> current branch
   [ -n "$DBR" ] || DBR="main"
+}
+
+# Multi-repo: the set of cloned repo paths the super-orchestrator coordinates (colon-separated). Empty = single-repo.
+REPOS_LIST="${CLAUDE_FLEET_REPOS:-}"
+
+# Resolve a repo reference (absolute path, or a basename present in REPOS_LIST) to an absolute repo path.
+# Echoes the path on success; returns non-zero (silent) if it can't be resolved.
+resolve_repo() { # <name-or-path>
+  local ref="$1" p IFS=:
+  [ -n "$ref" ] || return 1
+  if [ -d "$ref/.git" ]; then printf '%s\n' "${ref%/}"; return 0; fi
+  for p in $REPOS_LIST; do
+    [ -n "$p" ] || continue
+    if [ "$(basename "$p")" = "$ref" ] || [ "${p%/}" = "${ref%/}" ]; then printf '%s\n' "${p%/}"; return 0; fi
+  done
+  return 1
+}
+
+# Re-point REPO/FLEET/DBR at a given repo for the duration of one operation (spawn into repo X, ship repo X).
+# STATUS is intentionally LEFT ALONE — in multi-repo it stays the shared coordination dir (CLAUDE_FLEET_STATUS_DIR).
+select_repo() { # <name-or-path>
+  local p; p="$(resolve_repo "$1")" || die "unknown repo '$1' (not in CLAUDE_FLEET_REPOS and not a git dir)"
+  REPO="$p"
+  FLEET="$SESSIONS_DIR/$(basename "$REPO")-fleet${SESSION:+-$SESSION}"
+  set_default_branch
 }
 
 # DATA-LOSS FIX (2026-06-18): when there is NO 'origin' remote, the documented `git push origin HEAD:$DBR` step is
@@ -1270,6 +1296,7 @@ cmd_grid_spawn() { # <name> <task-file>
 }
 
 # ---------------------------------------------------------------- dispatch
+if [ "${CFLEET_NO_MAIN:-}" != 1 ]; then
 gh_align   # align gh active account to origin owner before any git/gh work (self-guarded, non-fatal)
 
 case "${1:-}" in
@@ -1302,3 +1329,4 @@ case "${1:-}" in
   -h|--help)      awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0" ;;
   *)              die "unknown arg: ${1:-} (try --help)" ;;
 esac
+fi
