@@ -1213,10 +1213,16 @@ gc_one_coord() { # <coord-dir> <sid>
 
   # MEMBERS-GONE — do not reap the coord while ANY member fleet folder still exists (it may hold unmerged work that
   # gc_one_session's G3 is keeping). Reaped only once every listed member is off disk.
-  while IFS= read -r m; do
+  # Fail-safe: `|| [ -n "$m" ]` processes a final line lacking a trailing newline; empty/unparseable marker → HOLD.
+  local seen=0
+  while IFS= read -r m || [ -n "$m" ]; do
     [ -n "$m" ] || continue
+    seen=1
     [ -d "$m" ] && { left=1; break; }
   done < "$gdir/.status/members"
+  if [ "$seen" = 0 ]; then
+    printf 'SKIP %s (members marker empty/unreadable — cannot verify; refusing to reap)\n' "$gdir"; return 1
+  fi
   [ "$left" = 0 ] || { printf 'SKIP %s (member fleet(s) still present — reaping coord only after members)\n' "$gdir"; return 1; }
 
   rm -rf "$gdir"
