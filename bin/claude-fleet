@@ -37,6 +37,8 @@
 #   --statuses             show the live progress board (slug: status) across the fleet
 #   --rebuild              (orchestrator) rebuild + reinstall the project's app from the integrated state, ONCE
 #                          per batch — runs .claude-fleet/rebuild or $CLAUDE_FLEET_REBUILD_CMD; no-op if neither
+#   --ship-all             (multi-repo) ATOMIC ship: dry-run every CLAUDE_FLEET_REPOS repo's merge to origin/<DBR>,
+#                          then push ALL repos or NONE. Holds everything back if any repo can't merge cleanly.
 #   --gh-align             switch the gh CLI's active account to the OWNER of origin (so osxkeychain can read/push
 #                          this repo). Runs automatically at startup; this flag is the manual trigger.
 #   --clean                remove this session's worktrees + branches
@@ -572,6 +574,63 @@ cmd_orchestrator() {
   [ -f "$odir/CLAUDE.md" ] || [ -f "$odir/.claude/CLAUDE.md" ] || seed=1
   printf '[{"role":"orchestrator","slug":"orchestrator","heading":"Orchestrator","dir":%s,"prompt":%s}]\n' \
     "$(json_str "$odir")" "$(json_str "$(spawn_orchestrator_prompt "$odir" "$DBR" "$seed")")"
+}
+
+# Atomic multi-repo ship: dry-run EVERY repo, then push ALL or NONE. The "hold-all" gate for Gyftalala mode.
+# Phase 1 dry-runs every CLAUDE_FLEET_REPOS repo's integrated _main HEAD against origin/<DBR>; if ANY repo can't
+# land cleanly (no integration checkout, empty HEAD, or a non-fast-forward against its remote tip) we push NOTHING
+# and exit non-zero with every blocker listed. Phase 2 only runs when all repos are feasible: it pushes each repo
+# in REPOS_LIST order (re-fetching + re-confirming ff right before each push); a mid-sequence push failure reports
+# which repos already landed and exits non-zero.
+# FEASIBILITY: a repo is shippable iff its remote default branch is ABSENT (first push) OR its remote tip is an
+# ANCESTOR of the integrated _main HEAD (a clean fast-forward: `git merge-base --is-ancestor <tip> <head>`). Any
+# divergence (the remote moved out from under us, e.g. an external push) is a non-ff → NOT feasible → held. This
+# exit-code check is robust and needs no `merge-tree --write-tree` (and thus no git >=2.38).
+cmd_ship_all() {
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--ship-all is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--ship-all needs CLAUDE_FLEET_REPOS"
+  local r odir head target tip blockers="" IFS=:
+  # Phase 1 — DRY RUN every repo. Block if a repo has no _main, an empty HEAD, or its HEAD can't fast-forward origin/DBR.
+  for r in $REPOS_LIST; do
+    select_repo "$r"; odir="$FLEET/_main"
+    if [ ! -d "$odir" ]; then blockers="$blockers\n  - $(basename "$r"): no integration checkout ($odir) — nothing integrated"; continue; fi
+    fetch_origin
+    head="$(git -C "$odir" rev-parse --verify --quiet HEAD || true)"
+    [ -n "$head" ] || { blockers="$blockers\n  - $(basename "$r"): empty _main HEAD"; continue; }
+    if has_origin; then target="origin/$DBR"; else target="$DBR"; fi
+    tip="$(git -C "$odir" rev-parse --verify --quiet "$target" || true)"
+    if [ -z "$tip" ]; then
+      :                                                              # remote/default branch absent → first push, fine
+    elif git -C "$odir" merge-base --is-ancestor "$tip" "$head" 2>/dev/null; then
+      :                                                              # fast-forward: integrated HEAD already contains the target tip
+    else
+      blockers="$blockers\n  - $(basename "$r"): integrated HEAD ${head:0:8} does NOT fast-forward $target ${tip:0:8} (remote moved; reconcile in $odir: git merge $target)"
+    fi
+  done
+  if [ -n "$blockers" ]; then
+    printf 'claude-fleet: --ship-all HELD ALL repos — nothing pushed. Blocked:%b\n' "$blockers" >&2
+    exit 1
+  fi
+  # Phase 2 — push every repo. Re-confirm fast-forward right before each push; report partial landings on failure.
+  local landed=""
+  for r in $REPOS_LIST; do
+    select_repo "$r"; odir="$FLEET/_main"
+    gh_align   # align gh's active account to THIS repo's origin owner (e.g. gyftalala) so osxkeychain can push it
+    has_origin || { printf 'claude-fleet: %s has no origin — skipped push (integrated locally on _main).\n' "$(basename "$r")" >&2; continue; }
+    git -C "$odir" fetch --prune origin >&2 2>/dev/null || true
+    head="$(git -C "$odir" rev-parse --verify --quiet HEAD || true)"
+    tip="$(git -C "$odir" rev-parse --verify --quiet "origin/$DBR" || true)"
+    if [ -n "$tip" ] && ! git -C "$odir" merge-base --is-ancestor "$tip" "$head" 2>/dev/null; then
+      printf 'claude-fleet: --ship-all aborted before pushing %s — origin/%s moved since the dry run (non-ff). Already pushed: %s. Re-run --ship-all.\n' "$(basename "$r")" "$DBR" "${landed:-none}" >&2
+      exit 1
+    fi
+    if ! git -C "$odir" push origin "HEAD:$DBR" >&2; then
+      printf 'claude-fleet: --ship-all push FAILED on %s after pushing: %s. State is PARTIAL — re-run --ship-all to finish the rest.\n' "$(basename "$r")" "${landed:-none}" >&2
+      exit 1
+    fi
+    landed="$landed $(basename "$r")"
+  done
+  printf 'claude-fleet: --ship-all pushed all repos to their default branch:%s\n' "${landed}"
 }
 
 # spawn a worker for a subtask; writes a .spawn marker the app turns into a pane.
@@ -1404,6 +1463,7 @@ case "${1:-}" in
   --status)       shift; cmd_status "${1:-}" ;;
   --statuses)     cmd_statuses ;;
   --rebuild)      cmd_rebuild ;;
+  --ship-all)     cmd_ship_all ;;
   --new-project)  shift; cmd_new_project "${1:-}" "${2:-}" ;;
   --clean)        cmd_clean ;;
   --gc)           cmd_gc ;;
