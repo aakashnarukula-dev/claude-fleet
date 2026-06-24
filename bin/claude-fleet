@@ -543,6 +543,7 @@ cmd_orchestrator() {
     [ -n "$REPOS_LIST" ] || die "multi-repo orchestrator needs CLAUDE_FLEET_REPOS"
     reset_state                                   # coordination STATUS (CLAUDE_FLEET_STATUS_DIR); manifest seeded
     local r odir IFS=:
+    local -a member_fleets=()                      # collected member fleet paths for the coord's gc `members` marker
     for r in $REPOS_LIST; do                      # create each repo's own _main integration checkout
       [ -d "$r/.git" ] || die "not a git repository: $r"
       select_repo "$r"; fetch_origin
@@ -552,9 +553,19 @@ cmd_orchestrator() {
           || git -C "$REPO" worktree add --detach "$odir" "$DBR" >&2
       fi
       link_shared_dirs "$odir"
+      # Give each member fleet the SAME .status/repo marker a single-repo session has, so cmd_gc_all can vet it
+      # via gc_one_session's G0-G4 (instead of skipping it as "no repo marker"). Points at the REAL member repo.
+      mkdir -p "$FLEET/.status"
+      printf '%s\n' "$REPO" > "$FLEET/.status/repo"
+      member_fleets+=("$FLEET")
     done
     local coord; coord="$(dirname "$STATUS")"     # the coordination dir (parent of .status)
     mkdir -p "$coord"
+    # Flag the coord as a coordination dir for gc: one absolute member-fleet path per line. gc_one_coord reaps the
+    # coord only once EVERY listed member is gone (so an unmerged member kept by G3 also keeps the coord). This marker
+    # is what cmd_gc_all routes on (BEFORE the .status/repo check), so the coord's own repo-marker (= coord, non-git)
+    # is harmless. `member_fleets` is guaranteed non-empty here (REPOS_LIST was validated above).
+    printf '%s\n' "${member_fleets[@]}" > "$coord/.status/members"
     printf '[{"role":"orchestrator","slug":"orchestrator","heading":"Orchestrator","dir":%s,"prompt":%s}]\n' \
       "$(json_str "$coord")" "$(json_str "$(spawn_multi_orchestrator_prompt "$coord")")"
     return 0
@@ -1056,6 +1067,21 @@ cmd_clean() {
 
 # ---------------------------------------------------------------- gc (guarded auto-clean of finished sessions)
 #
+# G0 LIVENESS probe (read-only). Returns 0 (LIVE) if ANY running process has a cwd at/under $1. Used by both
+# gc_one_session (member/single-repo sessions) and gc_one_coord (coordination dirs) so the probe lives in ONE place.
+# FAIL-SAFE: returns LIVE (0) when lsof is missing so a bare `if gc_is_live` treats the unverifiable case as live →
+# the caller SKIPs. (A caller that wants a DISTINCT "lsof unavailable" message tests `command -v lsof` separately,
+# as gc_one_session/gc_one_coord do, before calling this.)
+gc_is_live() { # <dir>
+  local dir="$1" _cwd
+  command -v lsof >/dev/null 2>&1 || return 0
+  while IFS= read -r _cwd; do
+    case "$_cwd" in n*) _cwd="${_cwd#n}" ;; *) continue ;; esac
+    case "$_cwd" in "$dir"|"$dir"/*) return 0 ;; esac
+  done < <(lsof -nP -d cwd -F n 2>/dev/null)
+  return 1
+}
+
 # --gc garbage-collects FULLY-INTEGRATED fleet session FOLDERS for the configured CLAUDE_FLEET_REPO. A session's
 # worktree folder is removed ONLY IF all four guards pass; any failing guard => SKIP with a reason, NEVER forced.
 #   G1. Not the session you are currently inside (cwd not under the candidate fleet dir; sid != $CLAUDE_FLEET_SESSION).
@@ -1096,13 +1122,8 @@ gc_one_session() { # <fleet-dir> <sid>
   if ! command -v lsof >/dev/null 2>&1; then
     printf 'SKIP %s (cannot verify liveness — lsof unavailable; remove manually if the session is closed)\n' "$gdir"; return 1
   fi
-  # `lsof -nP -d cwd -F n` prints one `n<path>` line per process cwd; strip the leading `n` and test each against $gdir.
-  local _cwd _live=0
-  while IFS= read -r _cwd; do
-    case "$_cwd" in n*) _cwd="${_cwd#n}" ;; *) continue ;; esac
-    case "$_cwd" in "$gdir"|"$gdir"/*) _live=1; break ;; esac
-  done < <(lsof -nP -d cwd -F n 2>/dev/null)
-  if [ "$_live" = 1 ]; then
+  # Liveness probe is shared via gc_is_live (read-only); same `lsof -nP -d cwd` semantics, message unchanged.
+  if gc_is_live "$gdir"; then
     printf 'SKIP %s (session appears LIVE — a process has its cwd inside it; refusing to delete a running session)\n' "$gdir"; return 1
   fi
 
@@ -1151,6 +1172,54 @@ gc_one_session() { # <fleet-dir> <sid>
   done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
   rm -rf "$gdir"
   git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+  printf 'REMOVED %s\n' "$gdir"
+  return 0
+}
+
+# gc_one_coord reaps a Gyftalala COORDINATION dir (flagged by .status/members). Unlike a member fleet it has NO git,
+# branches, or worktrees — it holds only .status — so G2/G3/G4 do not apply; the only deletion is `rm -rf $gdir`.
+# Guards: hard path-assert (under $SESSIONS_DIR + the *-multi-fleet[-<sid>] shape, never root/$HOME/sessions-root),
+# EXCLUDE list, G0 liveness (lsof; SKIP if unverifiable), G1 self (cwd inside / CLAUDE_FLEET_SESSION == sid), and
+# MEMBERS-GONE: every member fleet listed in .status/members must already be removed. Because the coord is reaped
+# only AFTER its members, a member with unmerged work (kept by gc_one_session's G3) keeps the coord too.
+# Prints exactly one "REMOVED <dir>" / "SKIP <dir> (<reason>)" line. Returns 0 on remove, 1 on skip (non-fatal).
+gc_one_coord() { # <coord-dir> <sid>
+  local gdir="$1" sid="$2" m left=0
+  # Hard path assertions BEFORE the rm -rf (defense-in-depth): under SESSIONS_DIR, matching the coord naming, never
+  # $HOME, /, or the sessions root itself.
+  case "$gdir" in
+    ""|"$HOME"|"$HOME"/|/|"$SESSIONS_DIR"|"$SESSIONS_DIR"/) printf 'SKIP %s (not a coord dir)\n' "$gdir"; return 1 ;;
+  esac
+  case "$gdir" in
+    "$SESSIONS_DIR"/*-multi-fleet|"$SESSIONS_DIR"/*-multi-fleet-*) : ;;
+    *) printf 'SKIP %s (does not look like a coordination dir)\n' "$gdir"; return 1 ;;
+  esac
+  [ -f "$gdir/.status/members" ] || { printf 'SKIP %s (no members marker)\n' "$gdir"; return 1; }
+
+  # EXCLUDE — caller-supplied skip list (the app passes the dirs it is about to RESTORE).
+  case ":${CLAUDE_FLEET_GC_EXCLUDE:-}:" in *":$gdir:"*) printf 'SKIP %s (excluded by caller)\n' "$gdir"; return 1 ;; esac
+
+  # G0 — liveness. FAIL-SAFE: lsof unavailable → cannot confirm dead → SKIP.
+  if ! command -v lsof >/dev/null 2>&1; then
+    printf 'SKIP %s (cannot verify liveness — lsof unavailable)\n' "$gdir"; return 1
+  fi
+  if gc_is_live "$gdir"; then printf 'SKIP %s (coordination dir appears LIVE)\n' "$gdir"; return 1; fi
+
+  # G1 — never gc the session you are currently INSIDE (cwd under it, or CLAUDE_FLEET_SESSION matches this sid).
+  case "$PWD/" in "$gdir"/*) printf 'SKIP %s (cwd is INSIDE this session — refusing self-wipe)\n' "$gdir"; return 1 ;; esac
+  if [ -n "${CLAUDE_FLEET_SESSION:-}" ] && [ "${CLAUDE_FLEET_SESSION}" = "$sid" ]; then
+    printf 'SKIP %s (this is the live session you are running — refusing self-wipe)\n' "$gdir"; return 1
+  fi
+
+  # MEMBERS-GONE — do not reap the coord while ANY member fleet folder still exists (it may hold unmerged work that
+  # gc_one_session's G3 is keeping). Reaped only once every listed member is off disk.
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    [ -d "$m" ] && { left=1; break; }
+  done < "$gdir/.status/members"
+  [ "$left" = 0 ] || { printf 'SKIP %s (member fleet(s) still present — reaping coord only after members)\n' "$gdir"; return 1; }
+
+  rm -rf "$gdir"
   printf 'REMOVED %s\n' "$gdir"
   return 0
 }
@@ -1218,6 +1287,11 @@ cmd_gc_all() { # [root]
       *-fleet)   sid="" ;;
       *) continue ;;
     esac
+    # Gyftalala COORDINATION dirs are flagged by .status/members (no git/branches/worktrees). Route them to the
+    # coord-specific reaper BEFORE the repo-marker check below — the coord ALSO has a .status/repo (= the coord path,
+    # non-git) that would otherwise SKIP as an invalid marker. Member fleets have .status/repo (not members) and keep
+    # flowing to gc_one_session. Run in a subshell + || true so a SKIP never aborts the set -e sweep.
+    if [ -f "$gdir/.status/members" ]; then ( gc_one_coord "$gdir" "$sid" ) || true; continue; fi
     # The repo is NOT beside the session dir anymore — read it from the session's .status/repo marker (written at
     # init). Without a valid marker we cannot verify merge state safely, so SKIP (never rm a folder we can't vet).
     repo=""; [ -f "$gdir/.status/repo" ] && repo="$(head -n1 "$gdir/.status/repo" 2>/dev/null || true)"
