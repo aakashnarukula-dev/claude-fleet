@@ -496,7 +496,7 @@ spawn_multi_orchestrator_prompt() { # coord_dir
 You are the MULTI-REPO ORCHESTRATOR for a Gyftalala-mode claude-fleet run. You coordinate ONE task across SEVERAL
 interconnected repos and ship them TOGETHER. You COORDINATE, you NEVER implement feature code yourself.
 
-Repos you own (basename, path, and its integration checkout _main):$(printf "$names")
+Repos you own (basename, path, and its integration checkout _main):$(printf '%b' "$names")
 
 Your cwd is the coordination dir ${coord}. You can read any repo above directly to plan. Each repo has its OWN
 isolated fleet: its own _main detached checkout, its own worker branches (${BR_PREFIX}/<slug>), its own origin/main.
