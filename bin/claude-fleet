@@ -486,10 +486,78 @@ Wait for my goal.
 EOF
 }
 
+# multi-repo orchestrator: coordinates N repos, spawns workers with --repo, integrates each repo's _main, ships atomically.
+spawn_multi_orchestrator_prompt() { # coord_dir
+  local coord="$1" r names="" IFS=:
+  for r in $REPOS_LIST; do names="$names\n  - $(basename "$r")  ($r)  _main: $SESSIONS_DIR/$(basename "$r")-fleet${SESSION:+-$SESSION}/_main"; done
+  cat <<EOF
+You are the MULTI-REPO ORCHESTRATOR for a Gyftalala-mode claude-fleet run. You coordinate ONE task across SEVERAL
+interconnected repos and ship them TOGETHER. You COORDINATE, you NEVER implement feature code yourself.
+
+Repos you own (basename, path, and its integration checkout _main):$(printf "$names")
+
+Your cwd is the coordination dir ${coord}. You can read any repo above directly to plan. Each repo has its OWN
+isolated fleet: its own _main detached checkout, its own worker branches (${BR_PREFIX}/<slug>), its own origin/main.
+
+HOW TO WORK A GOAL:
+1. Decompose the task PER REPO. One feature usually touches several repos (e.g. a new server endpoint + the web
+   client that calls it + the admin surface + the editor). Map cross-repo DEPENDENCIES: if repo B consumes a
+   contract repo A produces (an API shape, a field), A is an EARLIER phase than B.
+2. Spawn one worker per repo-slice, ALWAYS tagging the repo:
+     write the brief to /tmp/cfleet_<slug>.txt (Write tool), then
+     claude-fleet --spawn-file "<heading>" /tmp/cfleet_<slug>.txt --repo <repo-basename> [--effort <low|medium|high|xhigh>]
+   The worker is cut from THAT repo's _main HEAD and works in that repo's worktree. PLAIN literal args only — no
+   \$(...), backticks, or pipes. Fan out all independent slices in one phase; hold dependents for a later phase.
+3. DRAIN: claude-fleet --next (blocks until a worker is ready). For each ready slug, integrate it INTO ITS REPO's
+   _main — go to that repo's _main checkout and merge its branch with PLAIN git (no -C, no &&):
+     claude-fleet --ready          → every ready slug (claude-fleet --statuses shows each slug's repo).
+     For a ready slug S in repo R:  cd <R's _main>  then  git merge --no-ff ${BR_PREFIX}/S
+       On conflict, read both sides (git log --oneline) and resolve preserving both intents.
+     Verify R with its build/test (per R's CLAUDE.md). Then: claude-fleet --merged S
+   FAILED:S from --next → do NOT merge; re-plan; claude-fleet --merged S to clear it.
+   Then claude-fleet --needs — schedule any cross-repo prerequisite a worker recorded (often a contract repo B
+   needs from repo A); claude-fleet --need-clear <slug> once handled.
+   ALL DONE (exit 3) = current phase integrated in every repo. More phases → back to step 2 (later workers see the
+   integrated foundation). Cross-repo contract passing is by BRIEF: when you integrate repo A's slice, put the
+   resulting contract (endpoint shape, types) into repo B's worker brief — there are NO cross-repo git merges.
+4. FINAL ATOMIC SHIP — ONLY when the user says the whole task is done ("ship it" / "all done"). Run EXACTLY:
+     claude-fleet --ship-all
+   This is the hold-all gate: it confirms every repo integrated all its workers, dry-runs each repo's merge to
+   origin/main, and pushes ALL repos to origin/main ONLY if EVERY repo passes. If any repo is blocked it pushes
+   NONE and tells you which repo + why — fix that repo (respawn/integrate), then re-run claude-fleet --ship-all.
+   NEVER push any repo's main yourself; --ship-all is the only path to origin/main.
+5. Report a per-repo summary; record durable facts in each repo's CLAUDE.md/memory; then claude-fleet --watch and
+   wait for the next goal. Repeat the whole cycle with fresh workers.
+
+Wait for the user's goal.
+EOF
+}
+
 # ---------------------------------------------------------------- subcommands
 
 # emit JSON for the solo orchestrator pane; creates the _main detached worktree and detects whether to seed memory
 cmd_orchestrator() {
+  if [ "${CLAUDE_FLEET_MULTI:-}" = 1 ]; then
+    [ -n "$REPOS_LIST" ] || die "multi-repo orchestrator needs CLAUDE_FLEET_REPOS"
+    reset_state                                   # coordination STATUS (CLAUDE_FLEET_STATUS_DIR); manifest seeded
+    local r odir IFS=:
+    for r in $REPOS_LIST; do                      # create each repo's own _main integration checkout
+      [ -d "$r/.git" ] || die "not a git repository: $r"
+      select_repo "$r"; fetch_origin
+      odir="$FLEET/_main"
+      if [ ! -d "$odir" ]; then
+        git -C "$REPO" worktree add --detach "$odir" "origin/$DBR" >&2 2>/dev/null \
+          || git -C "$REPO" worktree add --detach "$odir" "$DBR" >&2
+      fi
+      link_shared_dirs "$odir"
+    done
+    local coord; coord="$(dirname "$STATUS")"     # the coordination dir (parent of .status)
+    mkdir -p "$coord"
+    printf '[{"role":"orchestrator","slug":"orchestrator","heading":"Orchestrator","dir":%s,"prompt":%s}]\n' \
+      "$(json_str "$coord")" "$(json_str "$(spawn_multi_orchestrator_prompt "$coord")")"
+    return 0
+  fi
+  # — single-repo path, unchanged —
   [ -d "$REPO/.git" ] || die "not a git repository: $REPO"
   fetch_origin
   set_default_branch
