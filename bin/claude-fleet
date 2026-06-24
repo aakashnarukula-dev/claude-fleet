@@ -517,6 +517,11 @@ _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
   local slug base k=2 branch dir
   slug="$(slugify "$heading")"; [ -n "$slug" ] || slug="worker"; base="$slug"
   while [ -d "$FLEET/$slug" ] || grep -qx "$slug" "$MANIFEST" 2>/dev/null; do slug="$base-$k"; k=$((k + 1)); done
+  # Multi-repo: cut this worker's worktree from the requested repo's fleet (FLEET re-points to <repo>-fleet-<sid>).
+  # STATUS stays the shared coordination dir, so the manifest/markers remain on the one board. Single-repo path
+  # (no --repo) leaves FLEET/REPO exactly as-is → original behavior.
+  local target_repo=""
+  if [ -n "${SPAWN_REPO:-}" ]; then select_repo "$SPAWN_REPO"; target_repo="$REPO"; fi
   branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
   # cut from the orchestrator's LATEST INTEGRATED STATE (_main HEAD) so dependency-phased workers build on the
   # finished foundation from earlier phases — works with or without a remote. Fall back to origin/DBR then DBR.
@@ -527,13 +532,16 @@ _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
   link_shared_dirs "$dir"
   printf '%s\n' "$slug" >> "$MANIFEST"
   rm -f "$STATUS/$slug.done" "$STATUS/$slug.merged" "$STATUS/$slug.closed" "$STATUS/$slug.working"   # fresh worker: clear any stale closed/done/merged/working state if the slug is reused
-  # Optional "effort" field: only emitted when a (validated) effort was passed, so a spawn WITHOUT --effort
-  # produces the original marker shape byte-for-byte. json_str keeps it valid regardless of the value.
   local effort_field=""
   [ -n "$effort" ] && effort_field=",\"effort\":$(json_str "$effort")"
-  printf '{"slug":%s,"heading":%s,"dir":%s,"prompt":%s%s}' \
+  local repo_field=""
+  if [ -n "$target_repo" ]; then
+    repo_field=",\"repo\":$(json_str "$target_repo")"
+    printf '%s\n' "$target_repo" > "$STATUS/$slug.repo"   # sidecar: lets --ready/--ship-all/--handoff find this slug's repo
+  fi
+  printf '{"slug":%s,"heading":%s,"dir":%s,"prompt":%s%s%s}' \
     "$(json_str "$slug")" "$(json_str "$heading")" "$(json_str "$dir")" \
-    "$(json_str "$(spawn_worker_prompt "$heading" "$slug" "$dir" "$task")")" "$effort_field" > "$STATUS/$slug.spawn"
+    "$(json_str "$(spawn_worker_prompt "$heading" "$slug" "$dir" "$task")")" "$effort_field" "$repo_field" > "$STATUS/$slug.spawn"
   printf 'Spawned worker "%s" (%s).\n' "$heading" "$slug"
 }
 
@@ -541,8 +549,9 @@ _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
 # (it may trail the positional args, e.g. --spawn "H" "task" --effort high). Echoes the remaining (non-effort)
 # args one per line so the caller can re-read them; sets EFFORT for _do_spawn to pick up.
 EFFORT=""
-parse_effort_args() { # <args...>  -> sets EFFORT, prints remaining args (NUL-safe enough for our literal use)
-  EFFORT=""
+SPAWN_REPO=""
+parse_effort_args() { # <args...> -> sets EFFORT + SPAWN_REPO, fills ARGS_REST with the rest
+  EFFORT=""; SPAWN_REPO=""
   local -a rest=()
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -550,10 +559,13 @@ parse_effort_args() { # <args...>  -> sets EFFORT, prints remaining args (NUL-sa
         [ -n "${2:-}" ] || die "--effort needs a level (low|medium|high|xhigh)"
         case "$2" in low|medium|high|xhigh) EFFORT="$2" ;; *) die "invalid --effort '$2' (use low|medium|high|xhigh)" ;; esac
         shift 2 ;;
+      --repo)
+        [ -n "${2:-}" ] || die "--repo needs a repo name or path"
+        SPAWN_REPO="$2"; shift 2 ;;
       *) rest+=("$1"); shift ;;
     esac
   done
-  ARGS_REST=("${rest[@]+"${rest[@]}"}")   # remaining positional args, effort stripped out
+  ARGS_REST=("${rest[@]+"${rest[@]}"}")
 }
 cmd_spawn() {                                                              # inline task (short) [+ optional --effort]
   parse_effort_args "$@"; set -- ${ARGS_REST[@]+"${ARGS_REST[@]}"}
@@ -589,6 +601,9 @@ cmd_handoff() { # <target-pane> <task-file>
   local slug; slug="$(slugify "$target")"
   grep -qx "$slug" "$MANIFEST" 2>/dev/null \
     || die "no sibling pane '$target' (slug '$slug') in this fleet — handoff CANNOT deliver; spawn a FRESH worker for this brief instead. (panes: claude-fleet --statuses)"
+  # If the slug was spawned into a specific repo, point FLEET at that repo's fleet so the worktree-liveness check
+  # (and any path references) resolve correctly in multi-repo runs. Single-repo: no .repo sidecar → unchanged.
+  if [ -f "$STATUS/$slug.repo" ]; then select_repo "$(cat "$STATUS/$slug.repo")"; fi
   # Liveness guard: the pane's worktree must still exist. If it was removed (e.g. --clean'd), the pane is dead and
   # a handoff would vanish — fail loudly so the orchestrator spawns fresh rather than trusting a lost handoff.
   [ -d "$FLEET/$slug" ] || die "pane '$target' (slug '$slug') has no worktree at $FLEET/$slug — it is DEAD; handoff CANNOT deliver, spawn a FRESH worker for this brief instead."
