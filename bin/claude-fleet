@@ -402,17 +402,14 @@ For EACH goal I give you (now and every time after — repeat this whole cycle):
        On conflict, read BOTH sides first — git log --oneline ${dbr}..${BR_PREFIX}/S — then resolve preserving
        both intents. If one merge is too tangled, skip it, integrate the rest, handle the straggler on its own.
      Verify ONCE with the project's build/test (per CLAUDE.md); run the cache-bust step if CLAUDE.md defines one.
-     git push origin HEAD:${dbr}  ONCE     (auto-deploy is expected; skip only if there is no 'origin' remote — when
-                                           there's no origin, claude-fleet --merged below advances the canonical
-                                           ${dbr} ref to your integrated state automatically, so the commits are
-                                           never stranded on your detached HEAD; if it prints REFUSED, STOP and
-                                           resolve before --clean or the work will be lost)
-     claude-fleet --rebuild  ONCE          if this batch changed the app's OWN code (e.g. frontend src/ or native
-                                           src-tauri/), rebuild + reinstall the running app from the integrated
-                                           state so the live app isn't stale — DON'T punt this to the user. It is
-                                           a no-op when the project configures no rebuild (.claude-fleet/rebuild
-                                           or \$CLAUDE_FLEET_REBUILD_CMD), and you skip it when the batch touched
-                                           no app code (docs/config/test-only).
+     ⚠️ DO NOT push to ${dbr} per batch. The user may run PARALLEL fleet/Claude sessions on this repo, so ${dbr}
+     must move ONLY on a final reviewed merge (step 4). Instead push your integrated state to THIS session's own
+     integration branch — backup + diff-able, and it does NOT deploy:
+       git push -f origin HEAD:${BR_PREFIX}/_integrated   ONCE   (force-update your own session integration branch)
+     ${dbr} stays untouched this batch → nothing deploys yet.
+     (ESCAPE HATCH — solo runs only: if CLAUDE_FLEET_AUTOSHIP=1 is exported, you MAY instead
+      git push origin HEAD:${dbr} per batch like the old auto-ship behavior, and run claude-fleet --rebuild if this
+      batch changed the app's OWN code. With AUTOSHIP unset (the default), do NEITHER per batch.)
      claude-fleet --merged S               for EACH integrated slug.
    If --next prints  FAILED:S  → that worker gave up: do NOT merge it. Re-plan (respawn with a fresh brief, or
    drop it), then  claude-fleet --merged S  to clear it. (Optional: export CLAUDE_FLEET_NEXT_TIMEOUT=1800 so
@@ -435,10 +432,25 @@ For EACH goal I give you (now and every time after — repeat this whole cycle):
    failed handoff was delivered.
    "ALL DONE" (exit code 3) = the CURRENT phase is fully integrated. If more phases remain, go back to step 2 for
    the next phase — its workers will now see the finished foundation. Otherwise continue.
-4. Report a summary, write anything durable into CLAUDE.md/memory, then WAIT for my next goal. When it comes, do
+4. FINAL SHIP TO ${dbr} — do this ONLY when I explicitly say the work is done ("all work is done" / "ship it" /
+   "merge to ${dbr}"). NEVER auto-ship; ${dbr} moves only here. Steps:
+     git fetch origin
+     - List every integration/worker branch to fold in — THIS session AND any PARALLEL fleet/Claude sessions on
+       this repo:  git branch -r | grep -E 'fleet|_integrated'  (include other sessions' ${BR_PREFIX%/*}/* and
+       */_integrated branches, not just your own).
+     - From a clean checkout of origin/${dbr}, merge those branches in one at a time. On a same-file conflict
+       BETWEEN the two sessions, read BOTH sides (git log --oneline origin/${dbr}..<branch>) and resolve preserving
+       both intents — this cross-session reconcile is the whole point of holding ${dbr} back.
+     - Verify ONCE with the project's build/test (per CLAUDE.md); run the cache-bust step if CLAUDE.md defines one.
+     git push origin HEAD:${dbr}  ONCE     ← the ONLY push to ${dbr} (auto-deploys). If REFUSED/non-fast-forward,
+                                           fetch + re-merge origin/${dbr} and retry; never force-push ${dbr}.
+     claude-fleet --rebuild  ONCE          if the merged work changed the app's OWN code (no-op otherwise).
+     claude-fleet --merged S               for any slugs not already cleared.
+5. Report a summary, write anything durable into CLAUDE.md/memory, then WAIT for my next goal. When it comes, do
    this whole cycle AGAIN with fresh workers — never do the work here yourself.
-5. Between goals run  claude-fleet --watch  — FIRST  export CLAUDE_FLEET_WATCH_NEEDS=1  so it ALSO wakes on a
-   worker's request, not just on re-signalled work. When it prints slug S, re-integrate + ship it (step 3). When it
+6. Between goals run  claude-fleet --watch  — FIRST  export CLAUDE_FLEET_WATCH_NEEDS=1  so it ALSO wakes on a
+   worker's request, not just on re-signalled work. When it prints slug S, re-integrate it onto your session
+   integration branch (step 3) — do NOT push ${dbr}; ${dbr} moves only at the FINAL SHIP (step 4). When it
    prints  NEED:S , a worker (often an already-integrated one) is asking for follow-up work: run  claude-fleet
    --needs , act on S's request (SPAWN a worker for it, or --handoff to the sibling that owns those files), then
    claude-fleet --need-clear S  so it stops re-firing. Either way, run  claude-fleet --watch  again afterward. If I
