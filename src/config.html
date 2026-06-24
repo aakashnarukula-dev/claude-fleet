@@ -95,6 +95,31 @@
     background:var(--card-2); color:var(--fg); font-size:12.5px; outline:none; transition:.14s; }
   .heads input:focus { border-color:var(--accent); }
 
+  /* gyftalala multi-repo picker — bounded, searchable, scrollable (never overflows the window) */
+  .repopick { margin-top:11px; border:1px solid var(--line); border-radius:11px; background:var(--card-2); overflow:hidden; }
+  .repopick-bar { display:flex; align-items:center; gap:7px; padding:9px 10px; border-bottom:1px solid var(--line); }
+  .repo-search { flex:1; min-width:0; display:flex; align-items:center; gap:7px; padding:7px 10px; border-radius:8px; background:var(--bg); border:1px solid var(--line); transition:.14s; }
+  .repo-search:focus-within { border-color:var(--accent); }
+  .repo-search svg { width:13px; height:13px; color:var(--faint); flex:none; }
+  .repo-search input { flex:1; min-width:0; border:none; background:transparent; color:var(--fg); font-size:12.5px; outline:none; -webkit-user-select:text; -webkit-app-region:no-drag; }
+  .repo-search input::placeholder { color:var(--faint); }
+  .mini { -webkit-app-region:no-drag; cursor:pointer; flex:none; padding:7px 11px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--muted); font-size:11.5px; font-weight:600; transition:.14s; }
+  .mini:hover { color:var(--fg); border-color:var(--line-2); }
+  .repolist { max-height:210px; overflow-y:auto; overflow-x:hidden; }
+  .repolist::-webkit-scrollbar { width:10px; }
+  .repolist::-webkit-scrollbar-thumb { background:var(--line-2); border-radius:6px; border:3px solid var(--card-2); }
+  .repolist::-webkit-scrollbar-track { background:transparent; }
+  .repo-row { -webkit-app-region:no-drag; cursor:pointer; display:flex; align-items:center; gap:11px; padding:9px 12px; border-bottom:1px solid rgba(255,255,255,.035); transition:background .12s; }
+  .repo-row:last-child { border-bottom:none; }
+  .repo-row:hover { background:rgba(255,255,255,.03); }
+  .repo-row.on { background:var(--accent-soft); box-shadow:inset 2px 0 0 var(--accent); }
+  .repo-row input { -webkit-app-region:no-drag; accent-color:var(--accent); width:15px; height:15px; flex:none; margin:0; cursor:pointer; }
+  .repo-row .rn { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px; font-weight:550; color:var(--fg); }
+  .repo-row .rv { flex:none; font-size:9.5px; text-transform:uppercase; letter-spacing:.07em; font-weight:700; color:var(--faint); padding:2px 6px; border:1px solid var(--line); border-radius:5px; }
+  .repo-empty { padding:18px 12px; text-align:center; color:var(--faint); font-size:12px; }
+  .repopick-foot { display:flex; align-items:center; justify-content:space-between; padding:8px 12px; border-top:1px solid var(--line); font-size:11.5px; color:var(--muted); }
+  .repopick-foot b { color:var(--accent); font-weight:650; }
+
   /* CTA */
   .go { -webkit-app-region:no-drag; margin-top:16px; width:100%; padding:13px; border:none; border-radius:12px; cursor:pointer;
     background:linear-gradient(180deg, #e08763, var(--accent)); color:var(--accent-ink); font-size:14px; font-weight:700; letter-spacing:.01em;
@@ -160,8 +185,19 @@
       <button id="modeGyf">Gyftalala — multi-repo</button>
     </div>
     <div id="gyfCfg" style="display:none">
-      <div class="label">Repos <span class="hintnote">— one task across all checked repos; ships them together</span></div>
-      <div class="heads" id="gyfRepos" style="grid-template-columns:1fr;"></div>
+      <div class="label">Repos <span class="hintnote">— one task across every checked repo; branched, integrated &amp; pushed together</span></div>
+      <div class="repopick">
+        <div class="repopick-bar">
+          <div class="repo-search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+            <input id="repoSearch" type="text" placeholder="Filter repos…" spellcheck="false" autocomplete="off" />
+          </div>
+          <button class="mini" id="repoAll">All</button>
+          <button class="mini" id="repoNone">None</button>
+        </div>
+        <div class="repolist" id="gyfRepos"></div>
+        <div class="repopick-foot"><span id="repoCount">0 selected</span><span id="repoTotal"></span></div>
+      </div>
     </div>
     <label class="opt"><input type="checkbox" id="useOrch" checked />
       <span class="otxt"><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly.</span></label>
@@ -223,13 +259,13 @@
   const countsEl = document.getElementById('counts');
   const headsEl = document.getElementById('heads');
   let repo = '', repoNWO = '', repoBranch = 'main', account = '', count = 3, newProject = false;
-  let mode = 'single'; let gyfRepos = [];
+  let mode = 'single', gyfAll = [], gyfChecked = new Set(), gyfLoadedAccount = null;
   const repoCache = {};
   let accounts = [];
 
   function fit() { requestAnimationFrame(() => window.fleet.resizeWindow(document.querySelector('.wrap').getBoundingClientRect().bottom + 8)); }
   function refreshGo() {
-    if (mode === 'gyftalala') { goEl.disabled = !(account && gyfReposEl.querySelector('input:checked')); return; }
+    if (mode === 'gyftalala') { goEl.disabled = !(account && gyfChecked.size); return; }
     goEl.disabled = !(repo || repoNWO || newProject);
   }
 
@@ -413,9 +449,11 @@
   useOrchEl.onchange = syncOrch;
 
   const GYF_DEFAULT = ['gyftalala/gyftalala', 'gyftalala/gyftalala-server', 'gyftalala/gyftalala-admin', 'gyftalala/splashbook-editor'];
-  const modeSelEl = document.getElementById('modeSel');
   const gyfCfg = document.getElementById('gyfCfg');
   const gyfReposEl = document.getElementById('gyfRepos');
+  const repoSearchEl = document.getElementById('repoSearch');
+  const repoCountEl = document.getElementById('repoCount');
+  const repoTotalEl = document.getElementById('repoTotal');
   function setMode(m) {
     mode = m;
     document.getElementById('modeSingle').classList.toggle('on', m === 'single');
@@ -427,28 +465,50 @@
     else syncOrch();
     refreshGo(); fit();
   }
+  function emptyRepoMsg(text) { gyfReposEl.innerHTML = ''; const d = document.createElement('div'); d.className = 'repo-empty'; d.textContent = text; gyfReposEl.appendChild(d); }
   function loadGyfRepos() {
-    if (!account) { gyfReposEl.innerHTML = '<div class="projhint">Connect the gyftalala GitHub account above first.</div>'; fit(); return; }
+    if (!account) { gyfAll = []; emptyRepoMsg('Connect a GitHub account above, then choose its repos.'); updateRepoCount(); fit(); return; }
     const repos = repoCache[account];
-    if (!repos) { loadRepos(account).then(() => loadGyfRepos()); return; }   // populate cache, then render
-    renderGyfRepos(repos);
+    if (!repos) { emptyRepoMsg('Loading repos…'); loadRepos(account).then(() => { if (mode === 'gyftalala') loadGyfRepos(); }); return; }
+    gyfAll = repos;
+    if (gyfLoadedAccount !== account) {                 // new account → reset selection, pre-check the Gyftalala defaults present here
+      gyfChecked = new Set(GYF_DEFAULT.filter((d) => repos.some((r) => r.nameWithOwner === d)));
+      gyfLoadedAccount = account;
+      if (repoSearchEl) repoSearchEl.value = '';
+    }
+    renderGyfRepos();
   }
-  function renderGyfRepos(repos) {
+  function visibleRepos() {
+    const q = (repoSearchEl.value || '').trim().toLowerCase();
+    return gyfAll.filter((r) => !q || r.name.toLowerCase().includes(q) || r.nameWithOwner.toLowerCase().includes(q));
+  }
+  function renderGyfRepos() {
+    const shown = visibleRepos();
     gyfReposEl.innerHTML = '';
-    repos.forEach((r) => {
-      const row = document.createElement('label'); row.className = 'opt'; row.style.padding = '4px 0';
-      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = r.nameWithOwner;
-      cb.dataset.branch = r.defaultBranch || 'main';
-      cb.checked = GYF_DEFAULT.includes(r.nameWithOwner);
-      cb.onchange = refreshGo;
-      const tx = document.createElement('span'); tx.className = 'otxt'; tx.innerHTML = '<b>' + r.name + '</b>';
-      row.appendChild(cb); row.appendChild(tx); gyfReposEl.appendChild(row);
+    if (!shown.length) { emptyRepoMsg(gyfAll.length ? 'No repos match your filter.' : 'No repos found for this account.'); updateRepoCount(); fit(); return; }
+    shown.forEach((r) => {
+      const on = gyfChecked.has(r.nameWithOwner);
+      const row = document.createElement('label'); row.className = 'repo-row' + (on ? ' on' : '');
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = r.nameWithOwner; cb.dataset.branch = r.defaultBranch || 'main'; cb.checked = on;
+      cb.onchange = () => { if (cb.checked) gyfChecked.add(r.nameWithOwner); else gyfChecked.delete(r.nameWithOwner); row.classList.toggle('on', cb.checked); updateRepoCount(); refreshGo(); };
+      const nm = document.createElement('span'); nm.className = 'rn'; nm.textContent = r.name;
+      row.appendChild(cb); row.appendChild(nm);
+      if (String(r.visibility || '').toLowerCase() === 'private') { const v = document.createElement('span'); v.className = 'rv'; v.textContent = 'private'; row.appendChild(v); }
+      gyfReposEl.appendChild(row);
     });
-    refreshGo(); fit();
+    updateRepoCount(); refreshGo(); fit();
+  }
+  function updateRepoCount() {
+    if (repoCountEl) repoCountEl.innerHTML = '<b>' + gyfChecked.size + '</b> selected';
+    if (repoTotalEl) repoTotalEl.textContent = gyfAll.length ? gyfAll.length + ' repos' : '';
   }
   function checkedGyfRepos() {
-    return [...gyfReposEl.querySelectorAll('input:checked')].map((cb) => ({ nameWithOwner: cb.value, defaultBranch: cb.dataset.branch }));
+    const by = {}; gyfAll.forEach((r) => { by[r.nameWithOwner] = r; });
+    return [...gyfChecked].filter((n) => by[n]).map((n) => ({ nameWithOwner: n, defaultBranch: by[n].defaultBranch || 'main' }));
   }
+  repoSearchEl.oninput = () => renderGyfRepos();
+  document.getElementById('repoAll').onclick = () => { visibleRepos().forEach((r) => gyfChecked.add(r.nameWithOwner)); renderGyfRepos(); };
+  document.getElementById('repoNone').onclick = () => { visibleRepos().forEach((r) => gyfChecked.delete(r.nameWithOwner)); renderGyfRepos(); };
   document.getElementById('modeSingle').onclick = () => setMode('single');
   document.getElementById('modeGyf').onclick = () => setMode('gyftalala');
 
