@@ -353,7 +353,14 @@ app.whenReady().then(() => {
       });
       // fleet dirs of the saved sessions — protected from the sweep on Restore (they're being reopened) and skipped on
       // Start fresh (they're explicitly --clean'd below). Engine derives the same path as ${repo}-fleet-${sid}.
-      const savedDirs = saved.map((ss) => fleetDir(ss.repo || DEFAULT_REPO, ss.sid));
+      // For a gyftalala session ss.repo is the COORD dir, so fleetDir(ss.repo, sid) would double to
+      // <coord>-fleet-<sid> (wrong) and protect neither the real coord NOR the member fleets. Expand to the REAL
+      // dirs (coord + each member fleet) so the startup sweep can't reap a session mid-restore. (ss.coordDir/ss.repos
+      // are persisted by saveState.) Single-repo sessions keep the unchanged single-dir mapping.
+      const savedDirs = saved.flatMap((ss) =>
+        ss.coordDir
+          ? [ss.coordDir, ...(ss.repos || []).map((r) => fleetDir(r, ss.sid))]
+          : [fleetDir(ss.repo || DEFAULT_REPO, ss.sid)]);
       if (choice === 0) { restoreSessions(saved); gcAll(savedDirs); return; }
       // Start fresh: discard the previous sessions' worktrees so <repo>-fleet-N folders don't pile up
       saved.forEach((ss) => execFile(FLEET_CLI, ['--clean'], { env: Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(ss.sid), CLAUDE_FLEET_REPO: ss.repo || DEFAULT_REPO, CLAUDE_FLEET_FORCE: '1' }) }, () => {}));
