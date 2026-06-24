@@ -614,7 +614,9 @@ function restoreSessions(saved) {
     const s = {
       repo: ss.repo, title, color, mode: ss.mode || 'dispatch', bypass: !!ss.bypass, autonomous: !!ss.autonomous, planReady: true,
       repos: ss.repos || null, coordDir: ss.coordDir || null, panes: [],
-      pending: {}, slugIdx: {}, statusDir: path.join(fleetDir(ss.repo, sid), '.status'), watcher: null,
+      pending: {}, slugIdx: {}, statusDir: ss.coordDir
+        ? path.join(ss.coordDir, '.status')
+        : path.join(fleetDir(ss.repo, sid), '.status'), watcher: null,
     };
     panes.forEach((p) => { s.panes[p.id] = { role: p.role, slug: p.slug, heading: p.heading, dir: p.dir, repo: p.repo, prompt: '', resume: true }; if (p.slug) s.slugIdx[p.slug] = p.id; });
     sessions[sid] = s;
