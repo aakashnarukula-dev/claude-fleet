@@ -154,6 +154,15 @@
   </section>
 
   <section class="card">
+    <div class="label">Mode</div>
+    <div class="counts" id="modeSel" style="grid-template-columns:repeat(2,1fr); margin-bottom:13px;">
+      <button id="modeSingle" class="on">Single project</button>
+      <button id="modeGyf">Gyftalala — multi-repo</button>
+    </div>
+    <div id="gyfCfg" style="display:none">
+      <div class="label">Repos <span class="hintnote">— one task across all checked repos; ships them together</span></div>
+      <div class="heads" id="gyfRepos" style="grid-template-columns:1fr;"></div>
+    </div>
     <label class="opt"><input type="checkbox" id="useOrch" checked />
       <span class="otxt"><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly.</span></label>
 
@@ -214,11 +223,15 @@
   const countsEl = document.getElementById('counts');
   const headsEl = document.getElementById('heads');
   let repo = '', repoNWO = '', repoBranch = 'main', account = '', count = 3, newProject = false;
+  let mode = 'single'; let gyfRepos = [];
   const repoCache = {};
   let accounts = [];
 
   function fit() { requestAnimationFrame(() => window.fleet.resizeWindow(document.querySelector('.wrap').getBoundingClientRect().bottom + 8)); }
-  function refreshGo() { goEl.disabled = !(repo || repoNWO || newProject); }
+  function refreshGo() {
+    if (mode === 'gyftalala') { goEl.disabled = !(account && gyfReposEl.querySelector('input:checked')); return; }
+    goEl.disabled = !(repo || repoNWO || newProject);
+  }
 
   // Render the current selection as a CHIP — the folder's name (or "New project"), with an ×
   // to clear it — instead of a long path string. Falls back to a faint hint when nothing's set.
@@ -352,6 +365,7 @@
     setProjLabel();
     [...acctsEl.children].forEach((c) => c.classList.toggle('on', c.dataset.id === id));
     renderRecent(); document.getElementById('repoPickRow').style.display = ''; loadRepos(id);
+    if (mode === 'gyftalala') loadGyfRepos();
   }
   async function loadRepos(acct) {
     repoNWO = ''; refreshGo();
@@ -398,8 +412,56 @@
   }
   useOrchEl.onchange = syncOrch;
 
+  const GYF_DEFAULT = ['gyftalala/gyftalala', 'gyftalala/gyftalala-server', 'gyftalala/gyftalala-admin', 'gyftalala/splashbook-editor'];
+  const modeSelEl = document.getElementById('modeSel');
+  const gyfCfg = document.getElementById('gyfCfg');
+  const gyfReposEl = document.getElementById('gyfRepos');
+  function setMode(m) {
+    mode = m;
+    document.getElementById('modeSingle').classList.toggle('on', m === 'single');
+    document.getElementById('modeGyf').classList.toggle('on', m === 'gyftalala');
+    gyfCfg.style.display = m === 'gyftalala' ? '' : 'none';
+    document.querySelector('.opt').style.display = m === 'gyftalala' ? 'none' : '';   // hide orchestrator toggle in multi-repo
+    gridCfg.style.display = (m === 'single' && !useOrchEl.checked) ? '' : 'none';
+    if (m === 'gyftalala') { goEl.textContent = 'Launch Gyftalala fleet'; loadGyfRepos(); }
+    else syncOrch();
+    refreshGo(); fit();
+  }
+  function loadGyfRepos() {
+    if (!account) { gyfReposEl.innerHTML = '<div class="projhint">Connect the gyftalala GitHub account above first.</div>'; fit(); return; }
+    const repos = repoCache[account];
+    if (!repos) { loadRepos(account).then(() => loadGyfRepos()); return; }   // populate cache, then render
+    renderGyfRepos(repos);
+  }
+  function renderGyfRepos(repos) {
+    gyfReposEl.innerHTML = '';
+    repos.forEach((r) => {
+      const row = document.createElement('label'); row.className = 'opt'; row.style.padding = '4px 0';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = r.nameWithOwner;
+      cb.dataset.branch = r.defaultBranch || 'main';
+      cb.checked = GYF_DEFAULT.includes(r.nameWithOwner);
+      cb.onchange = refreshGo;
+      const tx = document.createElement('span'); tx.className = 'otxt'; tx.innerHTML = '<b>' + r.name + '</b>';
+      row.appendChild(cb); row.appendChild(tx); gyfReposEl.appendChild(row);
+    });
+    refreshGo(); fit();
+  }
+  function checkedGyfRepos() {
+    return [...gyfReposEl.querySelectorAll('input:checked')].map((cb) => ({ nameWithOwner: cb.value, defaultBranch: cb.dataset.branch }));
+  }
+  document.getElementById('modeSingle').onclick = () => setMode('single');
+  document.getElementById('modeGyf').onclick = () => setMode('gyftalala');
+
   goEl.onclick = async () => {
     errEl.textContent = '';
+    if (mode === 'gyftalala') {
+      const sel = checkedGyfRepos();
+      if (!sel.length) { errEl.textContent = 'Check at least one repo.'; return; }
+      goEl.disabled = true; goEl.textContent = 'Setting up…';
+      const res = await window.fleet.launch({ mode: 'gyftalala', account, repos: sel, autonomous: true, orchestrator: true });
+      if (!(res && res.ok)) { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; setMode('gyftalala'); }
+      return;
+    }
     if (!(repo || repoNWO || newProject)) return;
     let payload;
     if (newProject) {   // no folder/repo — orchestrator boots in a scratch repo, retargets once Claude names the project
