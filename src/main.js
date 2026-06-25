@@ -1097,7 +1097,13 @@ function spawnPane(sid, idx, cols, rows) {
   if (p.slug) { try { fsmod.unlinkSync(path.join(s.statusDir, `${p.slug}.closed`)); } catch (_) {} try { fsmod.unlinkSync(path.join(s.statusDir, `${p.slug}.working`)); } catch (_) {} }
   const shell = process.env.SHELL || '/bin/zsh';
   const home = os.homedir();
-  const extraPath = [path.join(home, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':');
+  // Pane shells call `claude-fleet` from PATH. The app process uses the BUNDLED CLI (FLEET_CLI); if a pane resolved a
+  // separately-installed copy (e.g. a stale ~/.local/bin/claude-fleet) the two could drift in version — exactly the bug
+  // where the bundled CLI understood multi-repo CLAUDE_FLEET_STATUS_DIR coordination but the on-PATH copy didn't, so a
+  // `--spawn-file --repo` wrote its .spawn marker into the wrong .status dir (or died "no active session") and no pane
+  // ever launched. Prepend the bundled CLI's OWN dir so panes always run the exact binary the app ships — no skew.
+  const cliDir = path.isAbsolute(FLEET_CLI) ? [path.dirname(FLEET_CLI)] : [];
+  const extraPath = [...cliDir, path.join(home, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':');
   // Task-aware reasoning effort, per pane (all panes stay Opus). The orchestrator runs xhigh
   // (max reasoning) for heavy coordination/decomposition; workers default to 'high' (faster
   // first output than xhigh) but honor an explicit per-worker effort from the spawn marker
@@ -1133,10 +1139,12 @@ function spawnPane(sid, idx, cols, rows) {
   const allowList = s.bypass ? ALLOW.concat(['Bash(git push:*)', 'Bash(rm:*)'])
     : (s.autonomous ? ALLOW.concat(dispatchPush) : null);
   const allowArgs = allowList ? ' --allowedTools ' + allowList.map((a) => shQuote(a)).join(' ') : '';
-  // Start every pane in ⏵⏵ accept-edits mode (auto-apply file edits, no per-edit prompt) when
-  // autonomous — pairs with the allowlist (which auto-approves the listed Bash verbs). Non-allowlisted
-  // verbs (curl/sudo/…) still ask. Only set when autonomous so a non-autonomous run still prompts.
-  const permArgs = allowList ? ' --permission-mode acceptEdits' : '';
+  // Start every pane in ⏵⏵ auto mode (the `auto` permission-mode: auto-apply edits AND auto-run safe commands, no
+  // per-step prompt) when autonomous — pairs with the allowlist (which auto-approves the listed Bash verbs).
+  // Non-allowlisted/unsafe verbs (curl/sudo/…) still ask. Only set when autonomous so a non-autonomous run still
+  // prompts. (`auto` needs Claude Code v2.1.83+; falls back gracefully if unsupported. Was `acceptEdits`, which only
+  // auto-applied edits and left the pane in "accept edits on" instead of the intended "auto mode on".)
+  const permArgs = allowList ? ' --permission-mode auto' : '';
   // restored panes resume their prior conversation in this worktree (Claude's built-in --continue); fresh panes get the prompt
   const cmd = p.resume ? 'claude --continue' : 'claude ' + shQuote(p.prompt);
   // Workers rarely need external MCP servers (playwright/canva/…); connecting them slows every
@@ -1210,20 +1218,30 @@ function routeTextToPane(sid, idx, data) {
 
 function startWatcher(sid) {
   const s = sessions[sid]; if (!s) return;
+  const onMarker = (filename) => {
+    if (!filename) return;
+    if (filename.endsWith('.spawn')) { handleSpawn(sid, filename); return; }   // orchestrator created a new worker
+    if (filename.endsWith('.retarget')) { handleRetarget(sid, filename); return; }   // new-project named → retarget to ~/Developer/<name>
+    if (!filename.endsWith('.task')) return;
+    const slug = filename.slice(0, -5);
+    const full = path.join(s.statusDir, filename);
+    fsmod.readFile(full, 'utf8', (err, data) => {
+      if (err) return;
+      fsmod.unlink(full, () => {});
+      const idx = s.slugIdx[slug];
+      if (idx != null) routeTextToPane(sid, idx, data);
+    });
+  };
   try {
-    s.watcher = fsmod.watch(s.statusDir, (_evt, filename) => {
-      if (!filename) return;
-      if (filename.endsWith('.spawn')) { handleSpawn(sid, filename); return; }   // orchestrator created a new worker
-      if (filename.endsWith('.retarget')) { handleRetarget(sid, filename); return; }   // new-project named → retarget to ~/Developer/<name>
-      if (!filename.endsWith('.task')) return;
-      const slug = filename.slice(0, -5);
-      const full = path.join(s.statusDir, filename);
-      fsmod.readFile(full, 'utf8', (err, data) => {
-        if (err) return;
-        fsmod.unlink(full, () => {});
-        const idx = s.slugIdx[slug];
-        if (idx != null) routeTextToPane(sid, idx, data);
-      });
+    s.watcher = fsmod.watch(s.statusDir, (_evt, filename) => onMarker(filename));
+  } catch (_) { /* status dir not ready */ }
+  // SELF-HEAL: fs.watch only delivers events that fire AFTER the watch attaches, and on macOS it can miss/coalesce
+  // events entirely. A .spawn marker written before this watcher attached (session restore, or a spawn that raced
+  // the watch) would otherwise sit unconsumed forever → the worker pane never launches. Sweep the dir once now to
+  // pick up any already-present markers; handleSpawn is idempotent (it no-ops on an already-tracked slug).
+  try {
+    fsmod.readdirSync(s.statusDir).forEach((f) => {
+      if (f.endsWith('.spawn') || f.endsWith('.retarget')) onMarker(f);   // creation markers only; .task routes to a live pane via events
     });
   } catch (_) { /* status dir not ready */ }
 }
@@ -1234,8 +1252,11 @@ function handleSpawn(sid, filename) {
   const full = path.join(s.statusDir, filename);
   fsmod.readFile(full, 'utf8', (err, data) => {
     if (err) return;
-    fsmod.unlink(full, () => {});
+    // Parse BEFORE unlinking: the CLI writes this marker non-atomically (printf > file), so the watch event can fire
+    // on a partial read → JSON.parse throws. If we unlinked first, that transient would destroy the marker and the
+    // worker pane would be lost forever. Leave it on parse failure so the startWatcher rescan retries it later.
     let info; try { info = JSON.parse(data); } catch (_) { return; }
+    fsmod.unlink(full, () => {});
     if (info.slug == null || s.slugIdx[info.slug] != null) return;
     const idx = s.panes.length;
     s.panes.push({ role: 'worker', slug: info.slug, heading: info.heading, dir: info.dir, prompt: info.prompt, effort: info.effort, repo: info.repo });
