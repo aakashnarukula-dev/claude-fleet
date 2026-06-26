@@ -362,10 +362,15 @@ app.whenReady().then(() => {
           ? [ss.coordDir, ...(ss.repos || []).map((r) => fleetDir(r, ss.sid))]
           : [fleetDir(ss.repo || DEFAULT_REPO, ss.sid)]);
       if (choice === 0) { restoreSessions(saved); gcAll(savedDirs); return; }
-      // Start fresh: discard the previous sessions' worktrees so <repo>-fleet-N folders don't pile up
-      saved.forEach((ss) => execFile(FLEET_CLI, ['--clean'], { env: Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(ss.sid), CLAUDE_FLEET_REPO: ss.repo || DEFAULT_REPO, CLAUDE_FLEET_FORCE: '1' }) }, () => {}));
+      // Start fresh: discard the previous sessions' worktrees so <repo>-fleet-N folders don't pile up. A multi-repo
+      // (gyftalala) session must be --clean'd PER MEMBER REPO — CLAUDE_FLEET_REPO=coordDir cleans nothing (the coord
+      // holds only .status), so the member fleets would otherwise leak. Each --clean keeps its own data-loss guard.
+      saved.forEach((ss) => {
+        const cleanRepos = ss.coordDir ? (ss.repos || []) : [ss.repo || DEFAULT_REPO];
+        cleanRepos.forEach((r) => execFile(FLEET_CLI, ['--clean'], { env: Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(ss.sid), CLAUDE_FLEET_REPO: r, CLAUDE_FLEET_FORCE: '1' }) }, () => {}));
+      });
       clearState();
-      gcAll(savedDirs);   // reap any OTHER orphaned finished folders (the saved ones are --clean'd above)
+      gcAll();   // NO exclude on Start-fresh: let the guarded sweep reap the just-cleaned member + coord dirs (savedDirs was protecting them → leak)
     } else {
       gcAll();            // no prior sessions — sweep any finished folders orphaned by a crash/quit
     }
@@ -422,7 +427,10 @@ function onGridClosed(win) {
   activeSidByWin.delete(win.id);   // drop the visible-tab record for the gone window
   if (lastFocusedGridId === win.id) lastFocusedGridId = (gridWindows()[0] || {}).id || null;
   updateBadgeAndTray();
-  if (!gridWindows().length && !configWin) { killAll(); app.quit(); }   // no windows left -> quit (state already saved)
+  // No grid windows left -> quit (state already saved). A HIDDEN config window (we hide, never close, it on launch)
+  // must NOT keep the app alive as an invisible background process holding live PTYs + the power blocker — only a
+  // VISIBLE config window counts as remaining UI.
+  if (!gridWindows().length && !(configWin && configWin.isVisible())) { killAll(); app.quit(); }
 }
 function closeEmptyWindow(win) { if (win && !win.isDestroyed()) { win._allowClose = true; win.close(); } }
 
@@ -726,6 +734,9 @@ function ghLoginForToken(token) {
 }
 let ghPollAbort = null;
 ipcMain.handle('gh-connect', async () => {
+  // Single-flight: ghPollAbort is one global. A second concurrent device flow would orphan the first poll loop
+  // (it'd keep hitting GitHub until expiry, and cancel would only stop the latest). Reject overlap instead.
+  if (ghPollAbort) return { ok: false, error: 'a GitHub sign-in is already in progress' };
   try {
     const dev = await ghApiPost('/login/device/code', { client_id: GH_CLIENT_ID, scope: 'repo read:org gist workflow' });
     if (!dev || !dev.device_code) return { ok: false, error: (dev && (dev.error_description || dev.error)) || 'could not start device flow' };
@@ -819,8 +830,10 @@ ipcMain.on('resize-window', (_e, arg) => {
   let h = typeof arg === 'number' ? arg : (arg && arg.h);
   let w = (arg && typeof arg === 'object' && arg.w) ? arg.w : b.width;
   if (!(h > 0)) return;
-  const wa = activeDisplay().workArea;
-  h = Math.min(Math.ceil(h), wa.height - 16);
+  // Clamp/recenter against the config window's OWN display (not the focused/cursor display) so a mode-switch
+  // recenter can't yank it to another monitor. Enforce a sane min height so a bad renderer value can't shrink it.
+  const wa = require('electron').screen.getDisplayMatching(b).workArea;
+  h = Math.max(240, Math.min(Math.ceil(h), wa.height - 16));
   w = Math.min(w, wa.width - 16);
   const widthChanged = w !== b.width;
   let x = b.x, y = b.y;
@@ -989,7 +1002,8 @@ function isPermPrompt(buf) { return PERM_YES.test(buf) && PERM_MARK.test(buf); }
 const DONE_RE = /Marked\s+".*?"\s+done\b/i;       // a worker ran `claude-fleet --done`
 const FAILED_RE = /Marked\s+".*?"\s+FAILED\b/i;   // a worker ran `claude-fleet --failed`
 const PERM_LOG = path.join(os.tmpdir(), 'cfleet-perm.log');
-function permLog(msg) { try { fsmod.appendFileSync(PERM_LOG, '[' + new Date().toISOString() + '] ' + msg + '\n'); } catch (_) {} }
+// Debug-only: an unbounded append log. OFF unless CFLEET_DEBUG_PERM is set, so it can't grow forever in normal use.
+function permLog(msg) { if (!process.env.CFLEET_DEBUG_PERM) return; try { fsmod.appendFileSync(PERM_LOG, '[' + new Date().toISOString() + '] ' + msg + '\n'); } catch (_) {} }
 const IDLE_DOT_MS = 6000;       // quiet this long → flip working→idle (drives dot/tray)
 const IDLE_NOTIFY_MS = 25000;   // only notify "idle · ready" after a LONGER quiet (avoids between-phase noise)
 const STATE_LABEL = { permission: 'needs permission', failed: 'failed', idle: 'idle · ready', working: 'working' };
@@ -1077,15 +1091,8 @@ function updateTray(c) {
   items.push({ type: 'separator' }, { label: 'Open Claude Fleet', click: () => { const w = winById(lastFocusedGridId) || anyGridWin(); if (w) { w.show(); w.focus(); } } });
   try { tray.setContextMenu(Menu.buildFromTemplate(items)); } catch (_) {}
 }
-// live state is reported by the renderer (it reads the real screen). Here we only NOTIFY when a pane has been
-// idle/waiting for a while (so a brief between-phase pause doesn't ping you).
-setInterval(() => {
-  const now = Date.now();
-  Object.keys(sessions).forEach((sid) => { const s = sessions[sid]; if (!s || !s.pstate) return;
-    Object.keys(s.pstate).forEach((idx) => { const r = s.pstate[idx];
-    });
-  });
-}, 3000);
+// (removed: a dead 3s setInterval whose body was emptied when the idle-notify logic was dropped — it only burned
+//  a wakeup every 3s forever, defeating the backgroundThrottling:false intent. Pane state is reported by the renderer.)
 // parse the numbered options from the live prompt so notification buttons map to the RIGHT key (layouts vary:
 // "1.Yes 2.No"  vs  "1.Yes 2.Yes,don't-ask 3.No"). Returns the digit to press for yes / always / no.
 function parsePermOptions(buf) {
@@ -1250,11 +1257,18 @@ function startWatcher(sid) {
     if (!filename.endsWith('.task')) return;
     const slug = filename.slice(0, -5);
     const full = path.join(s.statusDir, filename);
-    fsmod.readFile(full, 'utf8', (err, data) => {
-      if (err) return;
-      fsmod.unlink(full, () => {});
-      const idx = s.slugIdx[slug];
-      if (idx != null) routeTextToPane(sid, idx, data);
+    // Atomically CLAIM the marker via rename before reading: macOS fs.watch routinely fires multiple events per write,
+    // and without this two events both read the same .task and paste the brief into the pane TWICE. Only the first
+    // rename succeeds; the loser gets ENOENT and bails.
+    const claim = full + '.consuming';
+    fsmod.rename(full, claim, (rerr) => {
+      if (rerr) return;
+      fsmod.readFile(claim, 'utf8', (err, data) => {
+        fsmod.unlink(claim, () => {});
+        if (err) return;
+        const idx = s.slugIdx[slug];
+        if (idx != null) routeTextToPane(sid, idx, data);
+      });
     });
   };
   try {
@@ -1322,6 +1336,7 @@ function teardownScratch(sid) {
   // remove the scratch worktree dir AND the scratch repo itself — both guarded by the startsWith assertion above
   try { if (scratchFleetDir.startsWith(fleetGuard)) fsmod.rmSync(scratchFleetDir, { recursive: true, force: true }); } catch (_) {}
   try { if (scratchRepo.startsWith(guard)) fsmod.rmSync(scratchRepo, { recursive: true, force: true }); } catch (_) {}
+  sendToSid(sid, 'remove-session', { sid });   // drop the ghost "New project" tab BEFORE we delete the routing entry (else sendToSid no-ops)
   delete sessions[sid];
   sidWin.delete(Number(sid));
   updatePowerBlocker();

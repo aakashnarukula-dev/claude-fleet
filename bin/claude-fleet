@@ -37,8 +37,10 @@
 #   --statuses             show the live progress board (slug: status) across the fleet
 #   --rebuild              (orchestrator) rebuild + reinstall the project's app from the integrated state, ONCE
 #                          per batch — runs .claude-fleet/rebuild or $CLAUDE_FLEET_REBUILD_CMD; no-op if neither
-#   --ship-all             (multi-repo) ATOMIC ship: dry-run every CLAUDE_FLEET_REPOS repo's merge to origin/<DBR>,
-#                          then push ALL repos or NONE. Holds everything back if any repo can't merge cleanly.
+#   --ship-all             (multi-repo) hold-all ship: dry-run every CLAUDE_FLEET_REPOS repo's merge to origin/<DBR>;
+#                          if ANY can't ff cleanly, push NOTHING. Otherwise push each in order — best-effort, not a
+#                          true cross-repo transaction: a mid-sequence failure leaves earlier repos pushed but is
+#                          RESUMABLE (re-run finishes the rest).
 #   --gh-align             switch the gh CLI's active account to the OWNER of origin (so osxkeychain can read/push
 #                          this repo). Runs automatically at startup; this flag is the manual trigger.
 #   --clean                remove this session's worktrees + branches
@@ -241,7 +243,19 @@ advance_canonical_branch() {
   return 1
 }
 
-reset_state() { rm -rf "$STATUS"; mkdir -p "$STATUS"; : > "$MANIFEST"; printf '%s\n' "$REPO" > "$STATUS/repo"; }
+reset_state() {
+  # STATUS is app-controlled (CLAUDE_FLEET_STATUS_DIR or $FLEET/.status). Assert it is a real per-session status dir
+  # before the rm -rf — every other destructive path in this file path-asserts; this one must too (a misconfigured
+  # STATUS=$HOME would otherwise be wiped). Must be non-empty, not / or $HOME, and end in /.status or live under a fleet dir.
+  case "$STATUS" in
+    ""|"/"|"$HOME"|"$HOME"/) die "refusing to reset_state: STATUS='$STATUS' is not a session status dir" ;;
+  esac
+  case "$STATUS" in
+    */.status|"$SESSIONS_DIR"/*) : ;;
+    *) die "refusing to reset_state: STATUS='$STATUS' must end in /.status or live under $SESSIONS_DIR" ;;
+  esac
+  rm -rf "$STATUS"; mkdir -p "$STATUS"; : > "$MANIFEST"; printf '%s\n' "$REPO" > "$STATUS/repo"
+}
 
 # symlink heavy gitignored DEPENDENCY dirs from the main checkout into a new worktree so they're SHARED, not
 # copied (a worktree already shares .git; this shares node_modules/etc too) — keeps each worktree small.
@@ -522,11 +536,12 @@ HOW TO WORK A GOAL:
    ALL DONE (exit 3) = current phase integrated in every repo. More phases → back to step 2 (later workers see the
    integrated foundation). Cross-repo contract passing is by BRIEF: when you integrate repo A's slice, put the
    resulting contract (endpoint shape, types) into repo B's worker brief — there are NO cross-repo git merges.
-4. FINAL ATOMIC SHIP — ONLY when the user says the whole task is done ("ship it" / "all done"). Run EXACTLY:
+4. FINAL SHIP — ONLY when the user says the whole task is done ("ship it" / "all done"). Run EXACTLY:
      claude-fleet --ship-all
    This is the hold-all gate: it confirms every repo integrated all its workers, dry-runs each repo's merge to
-   origin/main, and pushes ALL repos to origin/main ONLY if EVERY repo passes. If any repo is blocked it pushes
-   NONE and tells you which repo + why — fix that repo (respawn/integrate), then re-run claude-fleet --ship-all.
+   origin/main, and pushes the repos to origin/main ONLY if EVERY repo passes the dry-run. If any repo is blocked it
+   pushes NONE and tells you which repo + why — fix that repo (respawn/integrate), then re-run claude-fleet --ship-all.
+   (Not a cross-repo transaction: if a push fails mid-sequence, earlier repos stay pushed — just re-run to finish.)
    NEVER push any repo's main yourself; --ship-all is the only path to origin/main.
 5. Report a per-repo summary; record durable facts in each repo's CLAUDE.md/memory; then claude-fleet --watch and
    wait for the next goal. Repeat the whole cycle with fresh workers.
@@ -587,12 +602,15 @@ cmd_orchestrator() {
     "$(json_str "$odir")" "$(json_str "$(spawn_orchestrator_prompt "$odir" "$DBR" "$seed")")"
 }
 
-# Atomic multi-repo ship: dry-run EVERY repo, then push ALL or NONE. The "hold-all" gate for Gyftalala mode.
-# Phase 1 dry-runs every CLAUDE_FLEET_REPOS repo's integrated _main HEAD against origin/<DBR>; if ANY repo can't
-# land cleanly (no integration checkout, empty HEAD, or a non-fast-forward against its remote tip) we push NOTHING
-# and exit non-zero with every blocker listed. Phase 2 only runs when all repos are feasible: it pushes each repo
-# in REPOS_LIST order (re-fetching + re-confirming ff right before each push); a mid-sequence push failure reports
-# which repos already landed and exits non-zero.
+# Multi-repo ship: dry-run EVERY repo, then push them. NOT a true cross-repo transaction — git has no such thing —
+# so this is a BEST-EFFORT hold-all with a resumable tail, not strict all-or-nothing. Phase 1 dry-runs every
+# CLAUDE_FLEET_REPOS repo's integrated _main HEAD against origin/<DBR>; if ANY repo can't land cleanly (no
+# integration checkout, empty HEAD, or a non-fast-forward against its remote tip) we push NOTHING and exit non-zero
+# with every blocker listed — this is the real "hold all if any can't go" guarantee. Phase 2 runs only when all
+# repos are feasible: it pushes each repo in REPOS_LIST order (re-fetching + re-confirming ff right before each
+# push). The residual gap: if a push fails mid-sequence (auth drop, remote moved between dry-run and push, network),
+# the repos already pushed STAY pushed. That partial state is reported with the exact landed list and is RESUMABLE —
+# re-running --ship-all re-dry-runs (already-landed repos are now ff no-ops) and finishes the rest.
 # FEASIBILITY: a repo is shippable iff its remote default branch is ABSENT (first push) OR its remote tip is an
 # ANCESTOR of the integrated _main HEAD (a clean fast-forward: `git merge-base --is-ancestor <tip> <head>`). Any
 # divergence (the remote moved out from under us, e.g. an external push) is a non-ff → NOT feasible → held. This
@@ -654,12 +672,13 @@ _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
   [ -d "$STATUS" ] || die "no active session"
   local slug base k=2 branch dir
   slug="$(slugify "$heading")"; [ -n "$slug" ] || slug="worker"; base="$slug"
-  while [ -d "$FLEET/$slug" ] || grep -qx "$slug" "$MANIFEST" 2>/dev/null; do slug="$base-$k"; k=$((k + 1)); done
   # Multi-repo: cut this worker's worktree from the requested repo's fleet (FLEET re-points to <repo>-fleet-<sid>).
   # STATUS stays the shared coordination dir, so the manifest/markers remain on the one board. Single-repo path
-  # (no --repo) leaves FLEET/REPO exactly as-is → original behavior.
+  # (no --repo) leaves FLEET/REPO exactly as-is → original behavior. Re-point BEFORE the uniqueness loop so the
+  # directory half ([ -d "$FLEET/$slug" ]) inspects the correct fleet dir, not the orchestrator's ambient one.
   local target_repo=""
   if [ -n "${SPAWN_REPO:-}" ]; then select_repo "$SPAWN_REPO"; target_repo="$REPO"; fi
+  while [ -d "$FLEET/$slug" ] || grep -qx "$slug" "$MANIFEST" 2>/dev/null; do slug="$base-$k"; k=$((k + 1)); done
   branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
   # cut from the orchestrator's LATEST INTEGRATED STATE (_main HEAD) so dependency-phased workers build on the
   # finished foundation from earlier phases — works with or without a remote. Fall back to origin/DBR then DBR.
@@ -677,9 +696,12 @@ _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
     repo_field=",\"repo\":$(json_str "$target_repo")"
     printf '%s\n' "$target_repo" > "$STATUS/$slug.repo"   # sidecar: lets --ready/--ship-all/--handoff find this slug's repo
   fi
+  # Write the (multi-KB) marker atomically: tmp + mv, so the app's fs.watch never reads a truncated JSON blob and
+  # drops the worker pane (a single `>` of a large prompt is not guaranteed to be one write()).
   printf '{"slug":%s,"heading":%s,"dir":%s,"prompt":%s%s%s}' \
     "$(json_str "$slug")" "$(json_str "$heading")" "$(json_str "$dir")" \
-    "$(json_str "$(spawn_worker_prompt "$heading" "$slug" "$dir" "$task")")" "$effort_field" "$repo_field" > "$STATUS/$slug.spawn"
+    "$(json_str "$(spawn_worker_prompt "$heading" "$slug" "$dir" "$task")")" "$effort_field" "$repo_field" > "$STATUS/$slug.spawn.tmp"
+  mv -f "$STATUS/$slug.spawn.tmp" "$STATUS/$slug.spawn"
   printf 'Spawned worker "%s" (%s).\n' "$heading" "$slug"
 }
 
@@ -749,8 +771,11 @@ cmd_handoff() { # <target-pane> <task-file>
   # <slug>.closed marker when the pane's pty dies (user closed it / claude exited), so the worktree-exists check above
   # is not enough — a handoff would write a .task no live claude ever reads (the "black hole"). Fail loudly.
   [ -f "$STATUS/$slug.closed" ] && die "pane '$target' (slug '$slug') was CLOSED — its claude is no longer running; handoff CANNOT deliver, spawn a FRESH worker for this brief instead."
-  cp "$path" "$STATUS/$slug.task"             # the app types this into the pane (unchanged contract)
-  cp "$path" "$STATUS/$slug.handoff"          # marker: outstanding handed-off unit of work, keeps --next tracking it
+  # Atomic delivery (tmp + mv): the app types `.task` into the pane and reads `.handoff` for --next tracking; a plain
+  # `cp` is non-atomic, so a watcher/reader can see a truncated brief. Write `.handoff` BEFORE re-arming so --next
+  # never observes a re-armed-but-untracked state.
+  cp "$path" "$STATUS/$slug.handoff.tmp" && mv -f "$STATUS/$slug.handoff.tmp" "$STATUS/$slug.handoff"   # marker: outstanding handed-off unit of work
+  cp "$path" "$STATUS/$slug.task.tmp"    && mv -f "$STATUS/$slug.task.tmp"    "$STATUS/$slug.task"      # the app types this into the pane (unchanged contract)
   rm -f "$STATUS/$slug.merged" "$STATUS/$slug.done" "$STATUS/$slug.failed"   # RE-ARM: tracked, pending, not ALL DONE
   # DEDUP: if this handoff came FROM a worker worktree, link it to that worker so a
   # co-recorded --need covering the same work isn't ALSO re-dispatched by the
@@ -859,6 +884,10 @@ cmd_watch() {
 cmd_merged() {
   [ -n "${1:-}" ] || die "--merged needs a slug"; [ -d "$STATUS" ] || die "no active fleet"
   touch "$STATUS/$1.merged"; rm -f "$STATUS/$1.status" "$STATUS/$1.handoff" "$STATUS/$1.working"; printf 'Marked "%s" integrated.\n' "$1"
+  # Multi-repo: this slug may belong to a member repo other than the orchestrator's ambient one. Point FLEET/REPO at
+  # the slug's repo (via its .repo sidecar) BEFORE advancing, so advance_canonical_branch persists the RIGHT repo's
+  # integrated _main — not the ambient repo's. (cmd_handoff does the same; single-repo: no sidecar → unchanged.)
+  [ -f "$STATUS/$1.repo" ] && select_repo "$(cat "$STATUS/$1.repo")"
   # DATA-LOSS FIX: when there is no origin to push to, the orchestrator integrated this slug into its DETACHED `_main`
   # HEAD only. Persist that integrated state onto the canonical branch ref NOW (ff-only) so the commits are reachable
   # from refs/heads/$DBR and survive teardown. With an origin, this is a no-op (the push path is unchanged). If it
@@ -1052,7 +1081,8 @@ cmd_clean() {
   fi
   if [ "${CLAUDE_FLEET_FORCE:-}" != 1 ]; then
     printf 'Remove this session'\''s fleet worktrees + %s/* branches? [y/N] ' "$BR_PREFIX"
-    read -r ans; [ "$ans" = y ] || [ "$ans" = Y ] || { echo "aborted"; exit 0; }
+    read -r ans || ans=""   # non-interactive/EOF: don't let set -e abort on read's non-zero before the prompt resolves
+    [ "$ans" = y ] || [ "$ans" = Y ] || { echo "aborted"; exit 0; }
   fi
   git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}' | while IFS= read -r wt; do
     case "$wt" in "$FLEET"/*) git -C "$REPO" worktree remove --force "$wt" || true ;; esac
@@ -1138,6 +1168,11 @@ gc_one_session() { # <fleet-dir> <sid>
   [ -d "$REPO/.git" ] || { printf 'SKIP %s (parent repo %s missing — cannot verify merge state)\n' "$gdir" "$REPO"; return 1; }
 
   set_default_branch
+  # DATA-LOSS GUARD (mirror cmd_clean): persist any integrated `_main` onto canonical $DBR BEFORE inspecting
+  # reachability (no-op when an origin exists or already in sync). Scope FLEET to this candidate dir in a subshell so
+  # advance_canonical_branch operates on $gdir/_main without clobbering the sweep's globals. Best-effort: a REFUSE
+  # (non-ff / dirty) just leaves $DBR where it is, and the reachability guard below then HOLDS the folder.
+  ( FLEET="$gdir"; advance_canonical_branch ) >/dev/null 2>&1 || true
   local dbr_sha
   dbr_sha="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$DBR" 2>/dev/null || true)"
   [ -n "$dbr_sha" ] || { printf 'SKIP %s (canonical %s ref does not exist — not safe to gc)\n' "$gdir" "$DBR"; return 1; }
@@ -1149,6 +1184,23 @@ gc_one_session() { # <fleet-dir> <sid>
     ahead="$(git -C "$REPO" rev-list --count "$DBR..$br" 2>/dev/null || echo 1)"
     [ "$ahead" = 0 ] || { printf 'SKIP %s (branch %s has unmerged work — %s commit(s) not in %s)\n' "$gdir" "$br" "$ahead" "$DBR"; return 1; }
   done < <(git -C "$REPO" for-each-ref --format='%(refname:short)' "$br_glob" 2>/dev/null)
+
+  # G3.5 — REACHABILITY (the 2026-06-18 data-loss class). G3 only covers fleet/* BRANCH tips; the orchestrator's
+  # DETACHED `_main` HEAD (and any worker worktree HEAD) can hold commits not on any branch. If such a commit isn't
+  # reachable from $DBR, `git worktree remove` + `rm -rf` below would strand it. SKIP if ANY worktree HEAD under
+  # $gdir is not an ancestor of $DBR. (cmd_clean does the same check; gc_one_session previously did not.)
+  local rwt rhead
+  while IFS= read -r rwt; do
+    [ -n "$rwt" ] || continue
+    case "$rwt" in
+      "$gdir"/*)
+        rhead="$(git -C "$rwt" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+        [ -n "$rhead" ] || continue
+        git -C "$REPO" merge-base --is-ancestor "$rhead" "$dbr_sha" 2>/dev/null \
+          || { printf 'SKIP %s (worktree %s HEAD %s not reachable from %s — integrate/advance first; refusing to strand commits)\n' "$gdir" "$rwt" "${rhead:0:12}" "$DBR"; return 1; }
+        ;;
+    esac
+  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
 
   # G4 — no registered worktree UNDER this session dir may have uncommitted changes (real git status, not filtered:
   # for gc we want a strict empty tree). Enumerate worktrees the same way cmd_clean does, scoped to this session dir.
@@ -1513,7 +1565,8 @@ cmd_grid_spawn() { # <name> <task-file>
   printf '%s\n' "$slug" >> "$MANIFEST"
   printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}' \
     "$(json_str "$slug")" "$(json_str "$name")" "$(json_str "$dir")" \
-    "$(json_str "$(grid_worker_prompt "$name" "$slug" "$dir" "$req")")" > "$STATUS/$slug.spawn"
+    "$(json_str "$(grid_worker_prompt "$name" "$slug" "$dir" "$req")")" > "$STATUS/$slug.spawn.tmp"
+  mv -f "$STATUS/$slug.spawn.tmp" "$STATUS/$slug.spawn"   # atomic: app's fs.watch never reads a partial marker
   printf 'Spawned new product pane "%s" (%s), seeded with the requirement. It is working now.\n' "$name" "$slug"
 }
 

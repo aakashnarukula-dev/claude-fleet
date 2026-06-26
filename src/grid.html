@@ -339,10 +339,11 @@
 
     const term = new Terminal({ theme: THEME, fontFamily: 'SF Mono, Menlo, monospace', fontSize: 12, cursorBlink: true, allowProposedApi: true, macOptionIsMeta: false, altClickMovesCursor: true, scrollback: 5000 });
     const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(termEl); fit.fit();
-    sess.terms[p.id] = { term, fit, started: false, paneEl: pane, heading: p.heading, role: p.role };   // PTY spawned later, in layout(), at full size
+    const ro = new ResizeObserver(() => { if (SUPPRESS_FIT) return; try { fit.fit(); window.fleet.termResize({ sid, id: p.id, cols: term.cols, rows: term.rows }); } catch (_) {} });
+    ro.observe(termEl);
+    sess.terms[p.id] = { term, fit, ro, started: false, paneEl: pane, heading: p.heading, role: p.role };   // PTY spawned later, in layout(), at full size; ro disconnected on teardown (disposeTerm)
     term.write('\x1b[90m  Starting Claude…\x1b[0m');
     term.onData((data) => window.fleet.termInput({ sid, id: p.id, data }));
-    new ResizeObserver(() => { if (SUPPRESS_FIT) return; try { fit.fit(); window.fleet.termResize({ sid, id: p.id, cols: term.cols, rows: term.rows }); } catch (_) {} }).observe(termEl);
 
     // focus the CLICKED pane (esp. when activating the window from another app), point file tree at its worktree.
     // NEVER switch the active SESSION here: a pane belongs to a hidden/inactive tab when sid !== activeSid, and on a
@@ -426,11 +427,30 @@
     if (!(await window.fleet.confirmClose('session', sessions[sid].title))) return;
     doCloseTab(sid);
   }
+  // dispose one term record's view objects: disconnect its ResizeObserver (else it pins the detached element +
+  // disposed Terminal/FitAddon closure) AND dispose the xterm. Use on every pane/session teardown path.
+  function disposeTerm(t) { if (!t) return; try { t.ro && t.ro.disconnect(); } catch (_) {} try { t.term.dispose(); } catch (_) {} }
+  // the VISUAL neighbor tab of a session (next sibling, else previous), mapped back to its sid — so closing the
+  // active tab jumps to the adjacent tab, not the highest-numbered session (Object.keys order is numeric, not visual).
+  function neighborSid(sid) {
+    const s = sessions[sid]; if (!s || !s.tabEl) return null;
+    const sib = s.tabEl.nextElementSibling || s.tabEl.previousElementSibling; if (!sib) return null;
+    const found = Object.keys(sessions).find((k) => sessions[k].tabEl === sib);
+    return found != null ? +found : null;
+  }
+  function pickNextActive(closingSid) {   // call BEFORE removing the tab/session; activates the visual neighbor or clears
+    const next = neighborSid(closingSid);
+    if (next != null) return next;
+    const ids = Object.keys(sessions).filter((k) => +k !== closingSid);
+    return ids.length ? +ids[ids.length - 1] : null;
+  }
   function doCloseTab(sid) {
     const s = sessions[sid]; if (!s) return;
     window.fleet.closeSession(sid);
+    Object.values(s.terms).forEach(disposeTerm);   // dispose ALL terminals + observers (closing a tab killed the PTYs but leaked the xterm views)
+    const next = activeSid === sid ? pickNextActive(sid) : null;   // resolve neighbor BEFORE dropping the tab from the DOM
     s.tabEl.remove(); s.sessEl.remove(); delete sessions[sid];
-    if (activeSid === sid) { const ids = Object.keys(sessions); if (ids.length) activate(+ids[ids.length - 1]); else { activeSid = null; window.fleet.setActiveSession(null); window.fleet.lastTabClosed(); } }
+    if (activeSid === sid) { if (next != null) activate(next); else { activeSid = null; window.fleet.setActiveSession(null); window.fleet.lastTabClosed(); } }
   }
 
   // close a single pane: kill its pty, drop its terminal, reflow the grid (last pane closes the session).
@@ -445,7 +465,7 @@
     const lastPane = Object.keys(s.terms).length === 1;   // closing the last pane closes the whole project
     if (!(await window.fleet.confirmClose(lastPane ? 'session' : 'pane', lastPane ? s.title : t.heading))) return;
     window.fleet.closePane(sid, paneId);
-    try { t.term.dispose(); } catch (_) {} if (t.paneEl) t.paneEl.remove();
+    disposeTerm(t); if (t.paneEl) t.paneEl.remove();   // disconnect the pane's ResizeObserver + dispose its xterm
     delete s.terms[paneId];
     if (s.paneStates) delete s.paneStates[paneId];
     if (!Object.keys(s.terms).length) { doCloseTab(sid); return; }   // already confirmed — no second prompt
@@ -458,6 +478,8 @@
   // blocked (handled in closePane). Orchestrator alone → closes the project, then jumps to another tab or config.
   window.fleet.onCmdW(() => {
     if (document.activeElement && document.activeElement.closest && document.activeElement.closest('#editor')) { closeEditor(); return; }
+    // Don't pop a pane-close confirm when focus is in the file sidebar / a modal — ⌘W there means "close that", not the pane.
+    if (document.activeElement && document.activeElement.closest && document.activeElement.closest('#filepanel, #modal')) return;
     if (activeSid == null) return;
     const s = sessions[activeSid]; if (!s) return;
     const id = (s.activePaneId != null && s.terms[s.activePaneId]) ? s.activePaneId : +Object.keys(s.terms)[0];
@@ -519,11 +541,12 @@
   // rebuilds the session from the live PTYs via the normal add-session path. If we just emptied the window, main closes it.
   window.fleet.onRemoveSession(({ sid }) => {
     const s = sessions[sid]; if (!s) return;
-    Object.values(s.terms).forEach((t) => { try { t.term.dispose(); } catch (_) {} });
+    Object.values(s.terms).forEach(disposeTerm);   // disconnect observers + dispose xterm views (PTYs stay alive in main)
+    const next = activeSid === sid ? pickNextActive(sid) : null;   // visual neighbor, resolved before the tab leaves the DOM
     if (s.tabEl) s.tabEl.remove();
     if (s.sessEl) s.sessEl.remove();
     delete sessions[sid];
-    if (activeSid === sid) { const ids = Object.keys(sessions); activeSid = ids.length ? +ids[ids.length - 1] : null; if (activeSid != null) activate(activeSid); else window.fleet.setActiveSession(null); }
+    if (activeSid === sid) { activeSid = next; if (activeSid != null) activate(activeSid); else window.fleet.setActiveSession(null); }
   });
   // another window's tab bar lights up while a tab is dragged over it (re-dock target feedback)
   window.fleet.onTabbarHighlight(({ on }) => tabbarEl.classList.toggle('drop-target', !!on));
@@ -564,7 +587,10 @@
   let monaco = null, mEditor = null, monacoLoading = false, fmFile = null, lastSel = null;
 
   // sidebar/editor changes resize the panes but DON'T re-fit the terminals (withNoFit) — that avoids the reflow zebra
-  function closeEditor() { withNoFit(() => { edPanel.classList.remove('open'); sessEl.classList.remove('editing'); edSplit.classList.remove('show'); }); }
+  function closeEditor() {
+    withNoFit(() => { edPanel.classList.remove('open'); sessEl.classList.remove('editing'); edSplit.classList.remove('show'); });
+    if (mEditor) { const m = mEditor.getModel(); try { mEditor.setModel(null); } catch (_) {} if (m) { try { m.dispose(); } catch (_) {} } }   // free the last model (openFile only disposes the PREVIOUS one)
+  }
   filesBtn.onclick = () => {
     withNoFit(() => {
       const open = filePanel.classList.toggle('open'); filesBtn.classList.toggle('on', open);

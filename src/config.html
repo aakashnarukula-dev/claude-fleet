@@ -378,10 +378,11 @@
   async function disconnectAccount(user) {
     if (!window.confirm('Disconnect GitHub account "' + user + '"?')) return;
     const r = await window.fleet.ghDisconnect(user);
-    if (r && r.error) { errEl.textContent = 'Disconnect failed: ' + r.error; return; }
+    if (r && r.error) { errEl.textContent = 'Disconnect failed: ' + r.error; fit(); return; }   // multi-line error can clip without a refit
     if (account === user) clearGithub();
     delete repoCache[user];
     loadAccounts();
+    if (mode === 'gyftalala') loadGyfRepos();   // refresh the multi-repo checklist (was showing the now-removed account's repos)
   }
   // device-code connect modal
   const ghModal = document.getElementById('ghModal'), ghCode = document.getElementById('ghCode'), ghStatus = document.getElementById('ghStatus');
@@ -417,7 +418,7 @@
       } else {
         ghSetStatus('Failed: ' + ((r && r.error) || 'unknown') + '. Is the GitHub CLI (gh) installed?', true);
       }
-    });
+    }).catch((e) => ghSetStatus('Failed: ' + ((e && e.message) || e), true));   // a rejected invoke must not leave the modal stuck on "Starting…"
   }
   document.getElementById('ghConnectBtn').onclick = connectAccount;
 
@@ -431,7 +432,8 @@
     account = id; repo = ''; newProject = false; newProjBtn.classList.remove('on');   // choosing GitHub clears the local folder + new-project
     setProjLabel();
     [...acctsEl.children].forEach((c) => c.classList.toggle('on', c.dataset.id === id));
-    renderRecent(); document.getElementById('repoPickRow').style.display = ''; loadRepos(id);
+    renderRecent(); document.getElementById('repoPickRow').style.display = (mode === 'gyftalala') ? 'none' : '';   // multi-repo uses the checklist, not the single dropdown
+    loadRepos(id);
     if (mode === 'gyftalala') loadGyfRepos();
   }
   async function loadRepos(acct) {
@@ -440,7 +442,11 @@
     repoSel.innerHTML = '<option>Loading repos…</option>'; repoSel.disabled = true; fit();
     const res = await window.fleet.listAccountRepos(acct);
     if (account !== acct) return;   // user switched account while loading
-    if (!res || res.error) { repoSel.innerHTML = '<option>' + (res && res.error ? 'error: ' + res.error : 'no repos') + '</option>'; repoSel.disabled = true; fit(); return; }
+    if (!res || res.error) {   // build via textContent — res.error is gh stderr, never interpolate it into innerHTML
+      repoSel.innerHTML = ''; const o = document.createElement('option');
+      o.textContent = res && res.error ? 'error: ' + res.error : 'no repos';
+      repoSel.appendChild(o); repoSel.disabled = true; fit(); return;
+    }
     repoCache[acct] = res.repos || [];
     fillRepos(repoCache[acct], acct);
   }
@@ -491,6 +497,7 @@
     document.getElementById('modeGyf').classList.toggle('on', m === 'gyftalala');
     document.body.classList.toggle('wide', m === 'gyftalala');   // multi-repo → wide 2-col layout (repo picker in right column)
     document.querySelector('.opt').style.display = m === 'gyftalala' ? 'none' : '';   // hide orchestrator toggle in multi-repo
+    document.getElementById('repoPickRow').style.display = (m === 'gyftalala' || !account) ? 'none' : '';   // single dropdown only in Single mode (checklist owns multi)
     gridCfg.style.display = (m === 'single' && !useOrchEl.checked) ? '' : 'none';
     if (m === 'gyftalala') { goEl.textContent = 'Launch multi-repo fleet'; loadGyfRepos(); }
     else syncOrch();
@@ -500,7 +507,14 @@
   function loadGyfRepos() {
     if (!account) { gyfAll = []; emptyRepoMsg('Connect a GitHub account above, then choose its repos.'); updateRepoCount(); fit(); return; }
     const repos = repoCache[account];
-    if (!repos) { emptyRepoMsg('Loading repos…'); loadRepos(account).then(() => { if (mode === 'gyftalala') loadGyfRepos(); }); return; }
+    if (!repos) {
+      // Account switched but its repos aren't cached yet. CLEAR the previous account's selection/list NOW so Launch
+      // can't fire with {account:B, repos:[A's]} during the fetch — refreshGo() gates on gyfChecked.size.
+      gyfAll = []; gyfChecked = new Set(); gyfLoadedAccount = null;
+      emptyRepoMsg('Loading repos…'); updateRepoCount(); refreshGo();
+      loadRepos(account).then(() => { if (mode === 'gyftalala') loadGyfRepos(); });
+      return;
+    }
     gyfAll = repos;
     if (gyfLoadedAccount !== account) {                 // new account → reset selection, pre-check the Gyftalala defaults present here
       gyfChecked = new Set(GYF_DEFAULT.filter((d) => repos.some((r) => r.nameWithOwner === d)));
