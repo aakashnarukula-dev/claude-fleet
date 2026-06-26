@@ -281,7 +281,20 @@
 
   // single project = narrow window; multi-repo = wide window (the repo picker lives in a second column).
   // Always pass the target width so main can clamp + keep the window fully on-screen.
-  function fit() { requestAnimationFrame(() => window.fleet.resizeWindow(document.querySelector('.wrap').getBoundingClientRect().bottom + 8, document.body.classList.contains('wide') ? 900 : 540)); }
+  let lastSent = { w: 0, h: 0 };
+  function fit() {
+    requestAnimationFrame(() => {
+      const w = document.body.classList.contains('wide') ? 900 : 540;
+      const h = document.querySelector('.wrap').getBoundingClientRect().bottom + 8;
+      if (w === lastSent.w && Math.abs(h - lastSent.h) < 1) return;   // unchanged → don't spam / loop
+      lastSent = { w, h };
+      window.fleet.resizeWindow(h, w);
+    });
+  }
+  // Main applies a width change asynchronously; the 2-column layout only reflows once the window is actually
+  // wide, so re-measure on the resulting resize (the dedup guard above converges + stops the loop). Without this
+  // the height is measured while the right column is still crushed at the old width → dead space below the button.
+  window.addEventListener('resize', fit);
   function refreshGo() {
     if (mode === 'gyftalala') { goEl.disabled = !(account && gyfChecked.size); return; }
     goEl.disabled = !(repo || repoNWO || newProject);
