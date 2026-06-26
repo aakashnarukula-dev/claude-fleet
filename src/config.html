@@ -19,6 +19,15 @@
   .drag { height:34px; -webkit-app-region:drag; }
   .wrap { padding:2px 26px 26px; }
 
+  /* responsive layout: single project = one narrow column; multi-repo = two wide columns side by side
+     (the repo picker moves into its own right column instead of pushing the window tall + off-screen) */
+  .layout { display:grid; grid-template-columns:1fr; gap:0 14px; align-items:start; }
+  .col { min-width:0; }
+  #colRight { display:none; }
+  body.wide .layout { grid-template-columns:352px 1fr; }
+  body.wide #colRight { display:block; }
+  body.wide .repolist { max-height:312px; }
+
   /* header */
   .hdr { display:flex; align-items:center; gap:14px; margin:0 0 20px; }
   .logo { width:44px; height:44px; flex:none; border-radius:12px; display:flex; align-items:center; justify-content:center;
@@ -161,54 +170,61 @@
     </div>
   </header>
 
-  <section class="card">
-    <div class="repobar">
-      <button class="gh-btn" id="ghConnectBtn"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>Connect GitHub</button>
-      <div class="accts" id="accts"></div>
-    </div>
-    <div class="select-wrap" id="repoPickRow" style="display:none;">
-      <select class="sel" id="repoSel"><option>Pick a repo…</option></select>
-      <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
-    </div>
-    <div class="or-sep">or</div>
-    <div class="proj">
-      <button class="pickbtn" id="pickBtn">Choose folder…</button>
-      <button class="pickbtn" id="newProjBtn" title="Launch with no folder — tell Claude what to build and it sets up the project for you.">New project</button>
-      <span class="projpath" id="projPath">No folder selected</span>
-    </div>
-  </section>
-
-  <section class="card">
-    <div class="label">Mode</div>
-    <div class="counts" id="modeSel" style="grid-template-columns:repeat(2,1fr); margin-bottom:13px;">
-      <button id="modeSingle" class="on">Single project</button>
-      <button id="modeGyf">Gyftalala — multi-repo</button>
-    </div>
-    <div id="gyfCfg" style="display:none">
-      <div class="label">Repos <span class="hintnote">— one task across every checked repo; branched, integrated &amp; pushed together</span></div>
-      <div class="repopick">
-        <div class="repopick-bar">
-          <div class="repo-search">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-            <input id="repoSearch" type="text" placeholder="Filter repos…" spellcheck="false" autocomplete="off" />
-          </div>
-          <button class="mini" id="repoAll">All</button>
-          <button class="mini" id="repoNone">None</button>
+  <div class="layout">
+    <div class="col" id="colLeft">
+      <section class="card">
+        <div class="repobar">
+          <button class="gh-btn" id="ghConnectBtn"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>Connect GitHub</button>
+          <div class="accts" id="accts"></div>
         </div>
-        <div class="repolist" id="gyfRepos"></div>
-        <div class="repopick-foot"><span id="repoCount">0 selected</span><span id="repoTotal"></span></div>
-      </div>
-    </div>
-    <label class="opt"><input type="checkbox" id="useOrch" checked />
-      <span class="otxt"><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly.</span></label>
+        <div class="select-wrap" id="repoPickRow" style="display:none;">
+          <select class="sel" id="repoSel"><option>Pick a repo…</option></select>
+          <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+        </div>
+        <div class="or-sep">or</div>
+        <div class="proj">
+          <button class="pickbtn" id="pickBtn">Choose folder…</button>
+          <button class="pickbtn" id="newProjBtn" title="Launch with no folder — tell Claude what to build and it sets up the project for you.">New project</button>
+          <span class="projpath" id="projPath">No folder selected</span>
+        </div>
+      </section>
 
-    <div id="gridCfg" style="display:none">
-      <div class="label">Panes <span class="hintnote">— each is a worker you task directly, max 9</span></div>
-      <div class="counts" id="counts"></div>
-      <div class="label">Pane names <span class="hintnote">— each owns its area and pushes itself</span></div>
-      <div class="heads" id="heads"></div>
+      <section class="card">
+        <div class="label">Mode</div>
+        <div class="counts" id="modeSel" style="grid-template-columns:repeat(2,1fr); margin-bottom:13px;">
+          <button id="modeSingle" class="on">Single project</button>
+          <button id="modeGyf">Multi project</button>
+        </div>
+        <label class="opt"><input type="checkbox" id="useOrch" checked />
+          <span class="otxt"><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly.</span></label>
+
+        <div id="gridCfg" style="display:none">
+          <div class="label">Panes <span class="hintnote">— each is a worker you task directly, max 9</span></div>
+          <div class="counts" id="counts"></div>
+          <div class="label">Pane names <span class="hintnote">— each owns its area and pushes itself</span></div>
+          <div class="heads" id="heads"></div>
+        </div>
+      </section>
     </div>
-  </section>
+
+    <div class="col" id="colRight">
+      <section class="card" id="gyfCfg">
+        <div class="label">Repos <span class="hintnote">— one task across every checked repo; branched, integrated &amp; pushed together</span></div>
+        <div class="repopick">
+          <div class="repopick-bar">
+            <div class="repo-search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+              <input id="repoSearch" type="text" placeholder="Filter repos…" spellcheck="false" autocomplete="off" />
+            </div>
+            <button class="mini" id="repoAll">All</button>
+            <button class="mini" id="repoNone">None</button>
+          </div>
+          <div class="repolist" id="gyfRepos"></div>
+          <div class="repopick-foot"><span id="repoCount">0 selected</span><span id="repoTotal"></span></div>
+        </div>
+      </section>
+    </div>
+  </div>
 
   <button class="go" id="go" disabled>Launch fleet</button>
   <div class="err" id="err"></div>
@@ -263,7 +279,9 @@
   const repoCache = {};
   let accounts = [];
 
-  function fit() { requestAnimationFrame(() => window.fleet.resizeWindow(document.querySelector('.wrap').getBoundingClientRect().bottom + 8)); }
+  // single project = narrow window; multi-repo = wide window (the repo picker lives in a second column).
+  // Always pass the target width so main can clamp + keep the window fully on-screen.
+  function fit() { requestAnimationFrame(() => window.fleet.resizeWindow(document.querySelector('.wrap').getBoundingClientRect().bottom + 8, document.body.classList.contains('wide') ? 900 : 540)); }
   function refreshGo() {
     if (mode === 'gyftalala') { goEl.disabled = !(account && gyfChecked.size); return; }
     goEl.disabled = !(repo || repoNWO || newProject);
@@ -458,10 +476,10 @@
     mode = m;
     document.getElementById('modeSingle').classList.toggle('on', m === 'single');
     document.getElementById('modeGyf').classList.toggle('on', m === 'gyftalala');
-    gyfCfg.style.display = m === 'gyftalala' ? '' : 'none';
+    document.body.classList.toggle('wide', m === 'gyftalala');   // multi-repo → wide 2-col layout (repo picker in right column)
     document.querySelector('.opt').style.display = m === 'gyftalala' ? 'none' : '';   // hide orchestrator toggle in multi-repo
     gridCfg.style.display = (m === 'single' && !useOrchEl.checked) ? '' : 'none';
-    if (m === 'gyftalala') { goEl.textContent = 'Launch Gyftalala fleet'; loadGyfRepos(); }
+    if (m === 'gyftalala') { goEl.textContent = 'Launch multi-repo fleet'; loadGyfRepos(); }
     else syncOrch();
     refreshGo(); fit();
   }

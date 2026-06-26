@@ -4,7 +4,7 @@ contextBridge.exposeInMainWorld('fleet', {
   // config window
   launch: (cfg) => ipcRenderer.invoke('launch-fleet', cfg),
   pickFolder: () => ipcRenderer.invoke('pick-folder'),
-  resizeWindow: (h) => ipcRenderer.send('resize-window', h),
+  resizeWindow: (h, w) => ipcRenderer.send('resize-window', { h, w }),
   onLaunchError: (cb) => ipcRenderer.on('launch-error', (_e, d) => cb(d)),
 
   // grid window — multi-session (tabs)

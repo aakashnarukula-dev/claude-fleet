@@ -508,13 +508,13 @@ function sendAddSession(sid, title, color, meta, mode, win, migrated) {
 async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, account, orchestrator, count, names, newProject, mode, repos }) {
   if (!pty) { if (configWin) configWin.webContents.send('launch-error', 'node-pty failed to load — run `npm run rebuild`.'); return { ok: false, error: 'node-pty not loaded' }; }
   if (mode === 'gyftalala') {
-    if (!Array.isArray(repos) || !repos.length) return { ok: false, error: 'Gyftalala mode needs at least one repo.' };
+    if (!Array.isArray(repos) || !repos.length) return { ok: false, error: 'Multi-repo mode needs at least one repo.' };
     const cl = await cloneRepos(repos, account);
     if (!cl.ok) return { ok: false, error: cl.error };
     const sid = nextSid++;
     const coord = coordDir(sid);
     try { fsmod.mkdirSync(path.join(coord, '.status'), { recursive: true }); } catch (e) { nextSid--; return { ok: false, error: 'coord init failed: ' + ((e && e.message) || e) }; }
-    const title = 'Gyftalala', color = account ? accountColor(account) : tabColor(title);
+    const title = 'Multi-repo', color = account ? accountColor(account) : tabColor(title);
     sessions[sid] = {
       repo: coord, repos: cl.paths, coordDir: coord, title, color,
       mode: 'gyftalala', bypass: false, autonomous: true, newProject: false,
@@ -809,7 +809,32 @@ ipcMain.handle('pick-folder', async () => {
   const r = await dialog.showOpenDialog(win, { title: 'Choose project folder', properties: ['openDirectory', 'createDirectory'], buttonLabel: 'Use this project' });
   return (r.canceled || !r.filePaths.length) ? null : r.filePaths[0];
 });
-ipcMain.on('resize-window', (_e, h) => { if (configWin && h > 0) { const [w] = configWin.getSize(); configWin.setSize(w, Math.ceil(h)); } });
+// Size the config window to its content. Width is mode-driven (narrow single / wide multi-repo); height tracks
+// content. Always CLAMP both to the active display's work area and keep the window fully on-screen so a tall
+// multi-repo picker can never run off the bottom. Recenter on a width change (mode switch); otherwise only nudge
+// back into view if a corner is clipped (so it doesn't jump while the user is typing/scrolling the repo list).
+ipcMain.on('resize-window', (_e, arg) => {
+  if (!configWin) return;
+  const b = configWin.getBounds();
+  let h = typeof arg === 'number' ? arg : (arg && arg.h);
+  let w = (arg && typeof arg === 'object' && arg.w) ? arg.w : b.width;
+  if (!(h > 0)) return;
+  const wa = activeDisplay().workArea;
+  h = Math.min(Math.ceil(h), wa.height - 16);
+  w = Math.min(w, wa.width - 16);
+  const widthChanged = w !== b.width;
+  let x = b.x, y = b.y;
+  if (widthChanged) {                                  // mode toggle → re-center the new size
+    x = Math.round(wa.x + (wa.width - w) / 2);
+    y = Math.round(wa.y + (wa.height - h) / 2);
+  } else {                                             // height-only change → only pull back into view if clipped
+    if (x + w > wa.x + wa.width) x = wa.x + wa.width - w - 8;
+    if (x < wa.x) x = wa.x + 8;
+    if (y + h > wa.y + wa.height) y = wa.y + wa.height - h - 8;
+    if (y < wa.y) y = wa.y + 8;
+  }
+  configWin.setBounds({ x, y, width: w, height: h });
+});
 ipcMain.on('new-session', openConfigForNew);
 ipcMain.on('close-session', (_e, sid) => closeSession(sid));
 ipcMain.on('close-pane', (_e, { sid, id }) => {
