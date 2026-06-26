@@ -1168,11 +1168,11 @@ gc_one_session() { # <fleet-dir> <sid>
   [ -d "$REPO/.git" ] || { printf 'SKIP %s (parent repo %s missing — cannot verify merge state)\n' "$gdir" "$REPO"; return 1; }
 
   set_default_branch
-  # DATA-LOSS GUARD (mirror cmd_clean): persist any integrated `_main` onto canonical $DBR BEFORE inspecting
-  # reachability (no-op when an origin exists or already in sync). Scope FLEET to this candidate dir in a subshell so
-  # advance_canonical_branch operates on $gdir/_main without clobbering the sweep's globals. Best-effort: a REFUSE
-  # (non-ff / dirty) just leaves $DBR where it is, and the reachability guard below then HOLDS the folder.
-  ( FLEET="$gdir"; advance_canonical_branch ) >/dev/null 2>&1 || true
+  # NOTE: unlike cmd_clean we do NOT advance_canonical_branch here. GC is a passive sweep (runs on startup + the
+  # --next ALL-DONE hook); auto-advancing would MOVE a no-origin repo's live `main` (potentially a --no-ff merge
+  # commit) as a side effect of cleanup — surprising. The reachability guard (G3.5) below already PREVENTS the
+  # data loss by HOLDING any folder whose _main/worktree HEAD isn't reachable from $DBR. To actually reap such a
+  # folder, advance via the normal flow (claude-fleet --merged / --rebuild / manual --clean, which DO advance).
   local dbr_sha
   dbr_sha="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$DBR" 2>/dev/null || true)"
   [ -n "$dbr_sha" ] || { printf 'SKIP %s (canonical %s ref does not exist — not safe to gc)\n' "$gdir" "$DBR"; return 1; }

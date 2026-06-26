@@ -589,6 +589,7 @@
   // sidebar/editor changes resize the panes but DON'T re-fit the terminals (withNoFit) — that avoids the reflow zebra
   function closeEditor() {
     withNoFit(() => { edPanel.classList.remove('open'); sessEl.classList.remove('editing'); edSplit.classList.remove('show'); });
+    fmFile = null;   // no file is open once the editor is closed — prevents a later save targeting a now-modelless editor
     if (mEditor) { const m = mEditor.getModel(); try { mEditor.setModel(null); } catch (_) {} if (m) { try { m.dispose(); } catch (_) {} } }   // free the last model (openFile only disposes the PREVIOUS one)
   }
   filesBtn.onclick = () => {
@@ -700,7 +701,7 @@
   }
   function setDirty(d) { edSave.disabled = !d; edPath.textContent = (d ? '● ' : '') + (fmFile ? fmFile.split('/').slice(-2).join('/') : ''); }
   async function saveFile() {
-    if (!fmFile || !mEditor) return;
+    if (!fmFile || !mEditor || !mEditor.getModel()) return;   // never write an empty body from a closed/modelless editor
     const res = await window.fleet.fsWrite(activeSid, fmFile, mEditor.getValue());
     if (res && res.ok) setDirty(false); else window.alert((res && res.error) || 'save failed');
   }

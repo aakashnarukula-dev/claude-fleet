@@ -505,14 +505,23 @@
   }
   function emptyRepoMsg(text) { gyfReposEl.innerHTML = ''; const d = document.createElement('div'); d.className = 'repo-empty'; d.textContent = text; gyfReposEl.appendChild(d); }
   function loadGyfRepos() {
-    if (!account) { gyfAll = []; emptyRepoMsg('Connect a GitHub account above, then choose its repos.'); updateRepoCount(); fit(); return; }
+    if (!account) {   // no account (e.g. just disconnected the current one) → clear selection so Launch disables + count zeroes
+      gyfAll = []; gyfChecked = new Set(); gyfLoadedAccount = null;
+      emptyRepoMsg('Connect a GitHub account above, then choose its repos.'); updateRepoCount(); refreshGo(); fit(); return;
+    }
     const repos = repoCache[account];
     if (!repos) {
       // Account switched but its repos aren't cached yet. CLEAR the previous account's selection/list NOW so Launch
       // can't fire with {account:B, repos:[A's]} during the fetch — refreshGo() gates on gyfChecked.size.
       gyfAll = []; gyfChecked = new Set(); gyfLoadedAccount = null;
       emptyRepoMsg('Loading repos…'); updateRepoCount(); refreshGo();
-      loadRepos(account).then(() => { if (mode === 'gyftalala') loadGyfRepos(); });
+      loadRepos(account).then(() => {
+        if (mode !== 'gyftalala') return;
+        // Only recurse on SUCCESS (repos now cached). On a persistent error loadRepos doesn't cache → recursing would
+        // refetch forever (a gh process each round); show a terminal message instead.
+        if (repoCache[account]) loadGyfRepos();
+        else { emptyRepoMsg('Could not load repos for this account.'); fit(); }
+      });
       return;
     }
     gyfAll = repos;
