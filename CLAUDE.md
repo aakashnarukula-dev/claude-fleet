@@ -4,6 +4,63 @@ Electron desktop app: a multi-mode Claude Code terminal grid. Spawns a grid of
 `claude` PTYs, each in its own git worktree, and orchestrates parallel agent work.
 Package name `claude-fleet`, v2.0.0. `main` entry = `src/main.js`.
 
+## Installing on a fresh Mac — "clone and install the app" (READ FIRST)
+
+When the user says **"clone this repo and install the app"**, they mean: produce a
+**double-clickable `Claude Fleet.app` in `/Applications`** — NOT just `npm install`.
+`npm install` only makes it runnable from source (`npm start`); it does NOT create an
+app in `/Applications`. Do BOTH: set up the source, then package + install the bundle.
+This is a desktop (Electron) app, so it CAN and SHOULD become an `/Applications` app.
+
+### Environment gotchas (verified on this Mac, 2026-07)
+- **Clone with `gh`.** This repo is private; `git clone https://…` fails ("could not
+  read Username") and no SSH keys exist. Use `gh repo clone aakashnarukula-dev/claude-fleet`
+  (the `gh` CLI is installed + authed as `aakashnarukula-dev`).
+- **Use Node 22 LTS for ALL build/tooling, not the default `node`.** The system `node`
+  on PATH may be too new (v26+), which breaks `electron-rebuild`/`electron-builder`
+  (`ReferenceError: require is not defined in ES module scope`). Node 22 LTS lives at
+  `/opt/homebrew/opt/node@22/bin` — prepend it: `export PATH="/opt/homebrew/opt/node@22/bin:$PATH"`
+  (install once with `brew install node@22`).
+- **npm blocks package install scripts.** npm 11/12 skips `postinstall` by default. This
+  repo now commits an `allowScripts` field in `package.json` for `electron` + `node-pty`,
+  so a normal `npm install` runs them. If you still see "packages have install scripts not
+  yet covered by allowScripts", run `npm approve-scripts electron node-pty`.
+- **Electron postinstall may not finish → `node_modules/electron/path.txt` missing**
+  (`electron --version` throws "Electron failed to install correctly"). Fix:
+  `node node_modules/electron/install.js`, then verify `./node_modules/.bin/electron --version`.
+
+### Full install (copy-paste)
+```bash
+export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+cd ~/developer
+gh repo clone aakashnarukula-dev/claude-fleet
+cd claude-fleet
+npm install
+[ -f node_modules/electron/path.txt ] || node node_modules/electron/install.js  # finish electron postinstall if skipped
+npm run rebuild                              # rebuild node-pty for Electron's ABI (required once)
+./node_modules/.bin/electron --version       # sanity: should print v33.x
+
+# --- build a real /Applications app ---
+npm run dist                                 # → dist/mac-arm64/Claude Fleet.app  (unsigned)
+codesign --force --deep --sign - "dist/mac-arm64/Claude Fleet.app"   # ad-hoc sign
+cp -R "dist/mac-arm64/Claude Fleet.app" /Applications/
+
+# --- make the icon render + register the app ---
+touch "/Applications/Claude Fleet.app"
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f "/Applications/Claude Fleet.app"
+killall Finder Dock 2>/dev/null || true
+```
+First launch: right-click → **Open** (ad-hoc signed → one Gatekeeper prompt). If the
+`/Applications` icon looks blank, that's a stale Finder icon cache — the `lsregister` +
+`killall Finder Dock` above fixes it (a logout/login clears it fully). The icon file is
+already embedded in the bundle (`Contents/Resources/icon.icns`).
+
+> Note: the packaged app is what the user double-clicks. `npm run dist` under Node 22 also
+> re-runs the node-pty rebuild against Electron's ABI, so a stale/blocked `npm run rebuild`
+> won't leave the bundle broken. `.app` install location is `/Applications` (system) or
+> `~/Applications` — this repo's `--rebuild` reinstall path checks `~/Applications` then
+> `/Applications`; match wherever the user's existing copy lives.
+
 ## Build / Run / Test
 
 - `npm start` — launch the app (`electron .`).
