@@ -34,6 +34,8 @@ function saveState() {
       .map(([sid, s]) => ({
         sid: +sid, autonomous: !!s.autonomous, repo: s.repo, title: s.title, color: s.color, mode: s.mode, bypass: !!s.bypass,
         repos: s.repos || null, coordDir: s.coordDir || null,
+        account: s.account || null,   // persist the SELECTED gh account (a safe string); NEVER the raw token — it's re-resolved on restore
+
         panes: (s.panes || []).map((p, i) => (p ? { id: i, role: p.role, heading: p.heading, slug: p.slug, dir: p.dir, repo: p.repo } : null)).filter(Boolean),
       })).filter((x) => x.panes.length);
     fsmod.writeFileSync(stateFile(), JSON.stringify(data));
@@ -361,7 +363,7 @@ app.whenReady().then(() => {
         ss.coordDir
           ? [ss.coordDir, ...(ss.repos || []).map((r) => fleetDir(r, ss.sid))]
           : [fleetDir(ss.repo || DEFAULT_REPO, ss.sid)]);
-      if (choice === 0) { restoreSessions(saved); gcAll(savedDirs); return; }
+      if (choice === 0) { restoreSessions(saved).then(() => gcAll(savedDirs)); return; }
       // Start fresh: discard the previous sessions' worktrees so <repo>-fleet-N folders don't pile up. A multi-repo
       // (gyftalala) session must be --clean'd PER MEMBER REPO — CLAUDE_FLEET_REPO=coordDir cleans nothing (the coord
       // holds only .status), so the member fleets would otherwise leak. Each --clean keeps its own data-loss guard.
@@ -523,8 +525,11 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
     const coord = coordDir(sid);
     try { fsmod.mkdirSync(path.join(coord, '.status'), { recursive: true }); } catch (e) { nextSid--; return { ok: false, error: 'coord init failed: ' + ((e && e.message) || e) }; }
     const title = 'Multi-repo', color = account ? accountColor(account) : tabColor(title);
+    // resolve the SELECTED account's gh token ONCE; spawnPane (sync) injects it as GH_TOKEN so every pane's gh/git
+    // authenticates as that account WITHOUT switching the globally-active gh account. ghTokenFor(null) → null (no-op).
+    const ghToken = await ghTokenFor(account);
     sessions[sid] = {
-      repo: coord, repos: cl.paths, coordDir: coord, title, color,
+      repo: coord, repos: cl.paths, coordDir: coord, title, color, account: account || null, ghToken,
       mode: 'gyftalala', bypass: false, autonomous: true, newProject: false,
       panes: [], planReady: false, pending: {}, slugIdx: {},
       statusDir: path.join(coord, '.status'), watcher: null,
@@ -583,8 +588,11 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
   if (sid == null) sid = nextSid++;   // newProject already reserved its sid above (for the scratch dir name)
   const title = scratch ? 'New project' : projTitle(repoPath);           // tab = the repo name (don't show .cfleet-scratch-N)
   const color = account ? accountColor(account) : tabColor(title);
+  // resolve the SELECTED account's gh token ONCE; spawnPane (sync) injects it as GH_TOKEN so every pane's gh/git
+  // authenticates as that account WITHOUT switching the globally-active gh account. ghTokenFor(null) → null (no-op).
+  const ghToken = await ghTokenFor(account);
   sessions[sid] = {
-    repo: repoPath, title, color,
+    repo: repoPath, title, color, account: account || null, ghToken,
     mode: useOrch ? 'dispatch' : 'grid',   // 'grid' = named-worker grid (enables the live + Pane button)
     bypass: !useOrch,                            // grid workers push themselves → broad allowlist incl. push
     autonomous: useOrch ? !!autonomous : true,
@@ -618,7 +626,13 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
 }
 
 // rebuild saved sessions into the grid and resume each pane (claude --continue) in its existing worktree
-function restoreSessions(saved) {
+async function restoreSessions(saved) {
+  // Re-resolve each SELECTED account's gh token BEFORE adding any pane to the renderer (the raw token isn't persisted;
+  // only the account string is). We await here so s.ghToken is populated before sendAddSession → term-ready → spawnPane
+  // fires — no race, and spawnPane stays sync. ghTokenFor(account) → null if the account/token is gone (best-effort).
+  const accounts = [...new Set(saved.map((ss) => ss.account).filter(Boolean))];
+  const tokenByAccount = {};
+  await Promise.all(accounts.map((a) => ghTokenFor(a).then((t) => { tokenByAccount[a] = t; })));
   const win = createGridWindow();   // all restored tabs reopen in a single window
   let maxSid = 0;
   saved.forEach((ss) => {
@@ -628,6 +642,7 @@ function restoreSessions(saved) {
     const title = ss.title || projTitle(ss.repo), color = ss.color || tabColor(title);
     const s = {
       repo: ss.repo, title, color, mode: ss.mode || 'dispatch', bypass: !!ss.bypass, autonomous: !!ss.autonomous, planReady: true,
+      account: ss.account || null, ghToken: ss.account ? (tokenByAccount[ss.account] || null) : null,
       repos: ss.repos || null, coordDir: ss.coordDir || null, panes: [],
       pending: {}, slugIdx: {}, statusDir: ss.coordDir
         ? path.join(ss.coordDir, '.status')
@@ -1155,6 +1170,11 @@ function spawnPane(sid, idx, cols, rows) {
     CARGO_TARGET_DIR: path.join(fleetDir(paneRepo, sid), '.cargo-target'),
     PATH: extraPath + (process.env.PATH ? ':' + process.env.PATH : ''),
   });
+  // Make the account picked in preferences the EFFECTIVE identity in this pane: GH_TOKEN makes BOTH gh AND `git push`
+  // over https (gh's git-credential helper) authenticate as that account's token — without touching the user's
+  // globally-active gh account (no `gh auth switch`, so parallel sessions on other accounts aren't clobbered). Only set
+  // when a token was resolved (s.ghToken); a folder/local launch with no GitHub account leaves the env untouched.
+  if (s.ghToken) env.GH_TOKEN = s.ghToken;
   if (multi) {
     env.CLAUDE_FLEET_STATUS_DIR = s.statusDir;        // all panes share the coordination .status
     if (p.role === 'orchestrator') {
