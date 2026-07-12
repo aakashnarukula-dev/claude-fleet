@@ -110,6 +110,49 @@ gh_align() (
   exit 0
 )
 
+# Ensure the repo has a VALID git commit identity BEFORE any integrate/worker commit.
+# With no user.name/user.email configured, git falls back to the machine default
+# (<user>@<host>.local / "(none)") — an unverifiable author that Vercel and other CI
+# REJECT ("commit author email is not valid" -> Deployment Blocked), so integrated
+# work silently never deploys. Fires ONLY when the EFFECTIVE identity (local|global)
+# is missing or a machine fallback — it NEVER overrides a real identity the user
+# configured. Sets a REPO-LOCAL identity derived from the origin owner's GitHub
+# numeric-id noreply email, which is always associated with the pushing account and
+# never CI-rejected. Non-fatal, stderr-only, returns 0 always. Idempotent (a valid
+# email short-circuits before any network call).
+ensure_git_identity() (
+  set +euo pipefail
+  {
+    [ -d "$REPO/.git" ] || exit 0
+    email="$(git -C "$REPO" config user.email 2>/dev/null || true)"   # effective (local|global)
+    case "$email" in
+      ""|*.local|"(none)") : ;;          # missing or git's machine fallback -> fix below
+      *) exit 0 ;;                        # a real email is already configured -> respect it
+    esac
+    command -v gh >/dev/null 2>&1 || exit 0
+    url="$(git -C "$REPO" remote get-url origin 2>/dev/null || true)"
+    case "$url" in
+      git@github.com:*)       owner="${url#git@github.com:}" ;;
+      https://github.com/*)   owner="${url#https://github.com/}" ;;
+      ssh://git@github.com/*) owner="${url#ssh://git@github.com/}" ;;
+      *) exit 0 ;;
+    esac
+    owner="${owner%%/*}"; owner="${owner%.git}"
+    [ -n "$owner" ] || exit 0
+    id="$(gh api "users/$owner" --jq .id 2>/dev/null || true)"
+    if [ -n "$id" ] && [ "$id" != null ]; then
+      new_email="${id}+${owner}@users.noreply.github.com"
+    else
+      new_email="${owner}@users.noreply.github.com"
+    fi
+    git -C "$REPO" config user.email "$new_email" >/dev/null 2>&1 || true
+    [ -n "$(git -C "$REPO" config user.name 2>/dev/null || true)" ] \
+      || git -C "$REPO" config user.name "$owner" >/dev/null 2>&1 || true
+    printf '[claude-fleet] git identity for %s set -> %s <%s> (was unset/invalid; prevents CI author-blocked deploys)\n' "$(basename "$REPO")" "$owner" "$new_email" >&2
+  }
+  exit 0
+)
+
 set_default_branch() {
   # `|| true` is REQUIRED: under set -euo pipefail a repo with no origin/HEAD would otherwise abort silently.
   DBR="$(git -C "$REPO" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || true)"
@@ -140,6 +183,7 @@ select_repo() { # <name-or-path>
   REPO="$p"
   FLEET="$SESSIONS_DIR/$(basename "$REPO")-fleet${SESSION:+-$SESSION}"
   set_default_branch
+  ensure_git_identity   # guarantee a valid commit author for this repo's worktrees (no-op if already valid)
 }
 
 # DATA-LOSS FIX (2026-06-18): when there is NO 'origin' remote, the documented `git push origin HEAD:$DBR` step is
@@ -1573,6 +1617,7 @@ cmd_grid_spawn() { # <name> <task-file>
 # ---------------------------------------------------------------- dispatch
 if [ "${CFLEET_NO_MAIN:-}" != 1 ]; then
 gh_align   # align gh active account to origin owner before any git/gh work (self-guarded, non-fatal)
+ensure_git_identity   # guarantee a valid commit author for the top-level (single-repo) $REPO (no-op if already valid)
 
 case "${1:-}" in
   --orchestrator) cmd_orchestrator ;;
