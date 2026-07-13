@@ -1268,12 +1268,46 @@ function routeTextToPane(sid, idx, data) {
   setTimeout(() => { const tt = ptys[`${sid}:${idx}`]; if (tt) tt.write('\r'); }, 250);
 }
 
+// PUSH counterpart to the orchestrator's PULL --watch/--next loop. An already-integrated worker that picks up a NEW
+// in-pane task and re-runs `claude-fleet --done` has the engine clear its .merged/.working and touch a fresh .done —
+// but if the orchestrator pane has gone idle and is no longer polling --watch, nobody learns the work is re-signalled
+// and the user has to poke it. So inject a one-line nudge into the orchestrator pane to wake it. Guards: (1) only the
+// RE-SIGNAL case — the slug was seen integrated (.merged) earlier this session; the engine deletes the .merged FILE on
+// --done, so this in-memory record is what distinguishes a re-signal from a never-integrated first-time .done; (2) only
+// when the orchestrator is IDLE — a busy/watching orchestrator catches its own work, and pasting into a running
+// foreground command is messy; (3) DEBOUNCE on the .done's mtime — macOS fs.watch fires several events per write, so we
+// nudge once per distinct .done. A genuinely later re-signal (new mtime) or a fresh integration re-arms it.
+function noteMerged(s, slug) {
+  if (!s.mergedSeen) s.mergedSeen = new Set();
+  s.mergedSeen.add(slug);
+  if (s.doneNudged) delete s.doneNudged[slug];   // a fresh integration re-arms the nudge so a subsequent re-signal pushes again
+}
+function maybeNudgeOrchestrator(sid, filename) {
+  const s = sessions[sid]; if (!s || !s.statusDir) return;
+  const slug = filename.slice(0, -5);            // strip ".done"
+  if (!s.mergedSeen || !s.mergedSeen.has(slug)) return;   // never integrated → the orchestrator's live --next loop owns this
+  const orchIdx = (s.panes || []).findIndex((p) => p && p.role === 'orchestrator');
+  if (orchIdx < 0 || !s.panes[orchIdx] || !ptys[`${sid}:${orchIdx}`]) return;   // no live orchestrator pane → nothing to nudge
+  const r = s.pstate && s.pstate[orchIdx];
+  if (!r || r.state !== 'idle') return;          // busy/watching orchestrator will catch it itself; don't inject into a running command
+  let mtime = 0;
+  try { mtime = fsmod.statSync(path.join(s.statusDir, filename)).mtimeMs; } catch (_) { return; }   // marker vanished (race) → nothing to nudge
+  if (!s.doneNudged) s.doneNudged = {};
+  if (s.doneNudged[slug] === mtime) return;      // same .done, a duplicate fs.watch event → already nudged
+  s.doneNudged[slug] = mtime;
+  const wp = s.panes[s.slugIdx[slug]];
+  const heading = (wp && wp.heading) || slug;
+  routeTextToPane(sid, orchIdx, `[claude-fleet] worker "${heading}" re-signalled --done after being integrated — run: claude-fleet --ready  and integrate it (then go back to claude-fleet --watch).`);
+}
+
 function startWatcher(sid) {
   const s = sessions[sid]; if (!s) return;
   const onMarker = (filename) => {
     if (!filename) return;
     if (filename.endsWith('.spawn')) { handleSpawn(sid, filename); return; }   // orchestrator created a new worker
     if (filename.endsWith('.retarget')) { handleRetarget(sid, filename); return; }   // new-project named → retarget to ~/Developer/<name>
+    if (filename.endsWith('.merged')) { noteMerged(s, filename.slice(0, -7)); return; }   // engine integrated this slug — remember it for the re-signal nudge
+    if (filename.endsWith('.done')) { maybeNudgeOrchestrator(sid, filename); return; }    // a re-signalled worker may need to wake an idle orchestrator
     if (!filename.endsWith('.task')) return;
     const slug = filename.slice(0, -5);
     const full = path.join(s.statusDir, filename);
@@ -1301,6 +1335,7 @@ function startWatcher(sid) {
   try {
     fsmod.readdirSync(s.statusDir).forEach((f) => {
       if (f.endsWith('.spawn') || f.endsWith('.retarget')) onMarker(f);   // creation markers only; .task routes to a live pane via events
+      else if (f.endsWith('.merged')) noteMerged(s, f.slice(0, -7));      // seed mergedSeen from a restored session; do NOT replay .done here (no nudge on rescan)
     });
   } catch (_) { /* status dir not ready */ }
 }
