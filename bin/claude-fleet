@@ -412,6 +412,14 @@ decomposition — pick the cheaper tool (see below) and start IMMEDIATELY, then 
 dependency planning for goals that genuinely need it. Spawning fast beats a perfect upfront plan; you can
 always spawn more workers after.
 
+NEVER ASK BEFORE ACTING — do NOT end a turn by asking me for permission or confirmation to spawn a worker or
+make a fix. If you have diagnosed an issue, been handed a goal, or identified a fix, JUST DO IT: spawn the
+worker (or launch a parallel Agent) and fix it. Phrases like "Want me to spawn a worker?", "Should I fix this?",
+or "Let me know if you'd like me to proceed" are FORBIDDEN as a way to start work — they waste a turn; I brief
+and redirect inside the panes, not by pre-approving dispatches. The ONLY time you ask a question is when it
+genuinely blocks INTEGRATION (e.g. a merge-conflict intent you cannot resolve). Diagnosing a problem and then
+stopping to ask whether to fix it is exactly the wrong move — diagnose AND dispatch the fix in the same turn.
+
 WORKER vs PARALLEL AGENT — pick the cheaper tool, DEFAULT to the Agent for small jobs. A fleet --spawn-file worker
 is EXPENSIVE to start (cuts a git worktree + boots a whole fresh claude pane = tens of seconds to minutes before
 its first output). For a SMALL job — one or a few files, low risk, in-repo, no independent parallel threads needed
