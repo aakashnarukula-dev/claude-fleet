@@ -4,6 +4,7 @@ const os = require('os');
 const fsmod = require('fs');
 const { execFile, execFileSync } = require('child_process');
 const https = require('https');
+const { ensureCaveman } = require('./caveman-install');
 
 // Keep the app LIVE in the background: macOS otherwise throttles the renderer (pauses requestAnimationFrame,
 // clamps timers) when the window isn't focused — which stalls pane/PTY spawning until you return. These switches
@@ -343,6 +344,18 @@ function createConfigWindow() {
 
 app.whenReady().then(() => {
   buildMenu();
+  // One-time OFFLINE install of the vendored caveman plugin into ~/.claude, so every
+  // spawned `claude` PTY inherits caveman mode via its global SessionStart hook.
+  // Idempotent (marker-guarded), non-blocking, best-effort — never delays window
+  // creation or throws into startup. Vendored files may be unpacked from the asar.
+  {
+    let vendorDir = path.join(__dirname, 'vendor', 'caveman');
+    if (vendorDir.includes('app.asar' + path.sep)) {
+      const unpacked = vendorDir.replace('app.asar' + path.sep, 'app.asar.unpacked' + path.sep);
+      if (fsmod.existsSync(unpacked)) vendorDir = unpacked;
+    }
+    setImmediate(() => { try { ensureCaveman({ vendorDir }); } catch (_) {} });
+  }
   if (process.env.CFLEET_TEST) {
     buildFleet({ autonomous: !!process.env.CFLEET_AUTON, repo: DEFAULT_REPO });
   } else {
