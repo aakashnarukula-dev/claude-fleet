@@ -106,7 +106,11 @@ Electron, no bundler — plain HTML + vendored libs, loaded directly.
 - `src/preload.js` — `contextBridge` IPC surface (`window.fleet`). Edit this when
   adding any new main↔renderer channel.
 - `src/vendor/` — bundled `@xterm/xterm` + addon-fit + css. Vendored, not from npm
-  at runtime; don't import xterm via require in renderer.
+  at runtime; don't import xterm via require in renderer. Also `src/vendor/caveman/`
+  — the vendored caveman Claude Code plugin (see caveman auto-install below).
+- `src/caveman-install.js` — standalone CommonJS module (no `electron` require;
+  unit-testable). Exports `ensureCaveman({ vendorDir, homeDir })`: a one-time OFFLINE
+  install of the vendored caveman plugin into the user's global `~/.claude`.
 - `build/icon.icns` — app icon.
 
 ### Three modes (`config.html`)
@@ -192,6 +196,26 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   orchestrator pane keeps MCP (it may use it for deploys). Add MCP back to a worker only
   if a task genuinely needs a browser/etc.
 - `node-pty` is the one native dep — the usual breakage source after Electron bumps.
+- **Caveman auto-install (added 2026-07-16):** on launch (`app.whenReady`, right after
+  `buildMenu()`, before the `CFLEET_TEST` branch so it runs on EVERY launch) the app fires
+  `ensureCaveman({ vendorDir })` (`src/caveman-install.js`) in a `setImmediate` + try/catch —
+  fire-and-forget, non-blocking, can never delay window creation or throw into startup. It does a
+  ONE-TIME OFFLINE install of the VENDORED caveman plugin (`src/vendor/caveman/`, pinned to
+  JuliusBrussee/caveman **v1.9.1** / commit `033f918`, MIT, security-audited before vendoring — NO
+  network, NO remote fetch): copies the hooks+skill into `~/.claude/caveman-fleet/` and the slash
+  commands into `~/.claude/commands/`, then idempotently wires a `SessionStart`
+  (`caveman-activate.js`) + `UserPromptSubmit` (`caveman-mode-tracker.js`) hook into
+  `~/.claude/settings.json` (via the vendored `lib/settings.js` JSONC-tolerant merge). Effect: every
+  `claude` PTY the app spawns inherits caveman mode by default (~65% fewer output tokens; code/
+  commands/errors kept verbatim). Guards: marker `~/.claude/.caveman-fleet-installed` (skip if
+  present — the fast every-launch-after path); also SKIPS wiring if a caveman `SessionStart` hook is
+  already present (user installed it themselves → no double-firing). **Force a reinstall:** delete the
+  marker. **Update caveman:** bump the tag, re-vendor the same file set, re-audit + re-run the sandbox
+  test — see `src/vendor/caveman/VENDOR.md`. **Packaging:** `src/vendor/caveman/**` is in
+  `build.asarUnpack` (the runtime copy needs real on-disk files, not asar entries); `main.js` swaps
+  `app.asar`→`app.asar.unpacked` in `vendorDir` when packaged. Verify WITHOUT launching the app:
+  `node --check` + the offline sandbox test (call `ensureCaveman` against a temp `homeDir`, assert
+  files/hooks/marker + idempotent second run + `caveman-activate.js` emits `CAVEMAN MODE ACTIVE`).
 - Status-dir IPC is file-based (write `.task` / `.spawn`, watcher consumes + unlinks).
 - No `origin` remote on this repo. Integration stays local in `_main`; `git push
   origin HEAD:main` is a no-op here (skip it).
