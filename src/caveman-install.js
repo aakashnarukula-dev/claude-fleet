@@ -41,15 +41,29 @@ function ensureCaveman(opts = {}) {
     const vendorDir = opts.vendorDir;
     const claudeDir = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude');
     const marker = path.join(claudeDir, '.caveman-fleet-installed');
+    const dest = path.join(claudeDir, 'caveman-fleet');
+    const settingsPath = path.join(claudeDir, 'settings.json');
 
-    // 1) Fast path: already installed by us.
-    if (fs.existsSync(marker)) return { skipped: 'marker' };
+    // Read settings up front — both the fast-path health check and step 2 need it.
+    let settings = SETTINGS.readSettings(settingsPath);
+    if (settings === null) settings = {}; // unreadable/corrupt -> start clean, don't crash
+
+    // 1) Fast path: already installed by us — but VERIFY, don't trust the marker
+    //    blindly. A stale marker (settings.json reset/restored, hooks hand-edited
+    //    out, or an earlier run that wrote the marker without fully wiring things)
+    //    would otherwise silently keep caveman OFF forever. "Actually installed"
+    //    = our SessionStart hook is present in settings.json AND the vendored
+    //    activate script exists on disk. Healthy install → skip (fast path kept);
+    //    stale marker → fall through and (re)install to self-heal.
+    if (fs.existsSync(marker)) {
+      const hookWired = SETTINGS.hasCavemanHook(settings, 'SessionStart');
+      const filesPresent = fs.existsSync(path.join(dest, 'hooks', 'caveman-activate.js'));
+      if (hookWired && filesPresent) return { skipped: 'marker' };
+      // else: stale marker — treat as not-installed and re-install below.
+    }
 
     // 2) Respect a pre-existing caveman install (user wired it themselves) —
     //    don't double-wire.
-    const settingsPath = path.join(claudeDir, 'settings.json');
-    let settings = SETTINGS.readSettings(settingsPath);
-    if (settings === null) settings = {}; // unreadable/corrupt -> start clean, don't crash
     if (SETTINGS.hasCavemanHook(settings, 'SessionStart')) {
       try {
         fs.mkdirSync(claudeDir, { recursive: true });
@@ -59,7 +73,6 @@ function ensureCaveman(opts = {}) {
     }
 
     // 3) Copy the vendored tree into ~/.claude/caveman-fleet/ (recursive, overwrite).
-    const dest = path.join(claudeDir, 'caveman-fleet');
     copyDirSync(path.join(vendorDir, 'hooks'), path.join(dest, 'hooks'));
     copyDirSync(path.join(vendorDir, 'skills'), path.join(dest, 'skills'));
     // Commands go where Claude Code loads user slash-commands from:
