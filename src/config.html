@@ -129,6 +129,16 @@
   .repopick-foot { display:flex; align-items:center; justify-content:space-between; padding:8px 12px; border-top:1px solid var(--line); font-size:11.5px; color:var(--muted); }
   .repopick-foot b { color:var(--accent); font-weight:650; }
 
+  /* gyftalala worker-pane naming (orchestrator OFF): one editable name row per checked repo */
+  #gyfPanes .gyfpane-list { display:flex; flex-direction:column; }
+  .gyfpane-row { display:flex; align-items:center; gap:10px; padding:7px 2px; }
+  .gyfpane-row + .gyfpane-row { border-top:1px solid rgba(255,255,255,.045); }
+  .gyfpane-repo { flex:none; width:132px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11.5px; font-weight:600; color:var(--muted); }
+  .gyfpane-row input { -webkit-app-region:no-drag; -webkit-user-select:text; flex:1; min-width:0; padding:8px 10px; border-radius:8px; border:1px solid var(--line);
+    background:var(--card-2); color:var(--fg); font-size:12.5px; outline:none; transition:.14s; }
+  .gyfpane-row input:focus { border-color:var(--accent); }
+  .gyfpane-hint { padding:6px 2px; color:var(--faint); font-size:12px; }
+
   /* CTA */
   .go { -webkit-app-region:no-drag; margin-top:16px; width:100%; padding:13px; border:none; border-radius:12px; cursor:pointer;
     background:linear-gradient(180deg, #e08763, var(--accent)); color:var(--accent-ink); font-size:14px; font-weight:700; letter-spacing:.01em;
@@ -223,6 +233,11 @@
           <div class="repopick-foot"><span id="repoCount">0 selected</span><span id="repoTotal"></span></div>
         </div>
       </section>
+
+      <section class="card" id="gyfPanes" style="display:none;">
+        <div class="label">Worker panes <span class="hintnote">— each checked repo opens one pane you task directly</span></div>
+        <div class="gyfpane-list" id="gyfPaneList"></div>
+      </section>
     </div>
   </div>
 
@@ -276,6 +291,7 @@
   const headsEl = document.getElementById('heads');
   let repo = '', repoNWO = '', repoBranch = 'main', account = '', count = 3, newProject = false;
   let mode = 'single', gyfAll = [], gyfChecked = new Set(), gyfLoadedAccount = null;
+  const gyfPaneNames = {};   // multi + orchestrator OFF: user-typed worker-pane names, keyed by repo nameWithOwner (preserved across re-renders)
   const repoCache = {};
   let accounts = [];
 
@@ -483,14 +499,17 @@
     if (!on && newProject) setNewProject(false);   // named-pane mode can't be a scratch new-project; clear it
     if (mode === 'gyftalala') {
       // Multi-repo: the workers are DERIVED from the checked repos (one pane per repo), so the single-project grid
-      // count/names UI never shows here — only the button label reflects the orchestrator choice.
+      // count/names UI never shows here. When the orchestrator is OFF we show a per-repo worker-pane naming section
+      // (#gyfPanes) so the mode isn't a blank void; ON hides it. The button label reflects the orchestrator choice.
       gridCfg.style.display = 'none';
       goEl.textContent = on ? 'Launch multi-repo fleet' : 'Launch multi-repo panes';
+      renderGyfPanes();
       fit();
       return;
     }
     gridCfg.style.display = on ? 'none' : '';
     goEl.textContent = on ? 'Launch fleet' : 'Launch panes';
+    renderGyfPanes();   // hides #gyfPanes in single-project mode (guarded inside)
     if (!on) renderGrids(); else fit();
   }
   useOrchEl.onchange = syncOrch;
@@ -501,6 +520,8 @@
   const repoSearchEl = document.getElementById('repoSearch');
   const repoCountEl = document.getElementById('repoCount');
   const repoTotalEl = document.getElementById('repoTotal');
+  const gyfPanesEl = document.getElementById('gyfPanes');
+  const gyfPaneListEl = document.getElementById('gyfPaneList');
   function setMode(m) {
     mode = m;
     document.getElementById('modeSingle').classList.toggle('on', m === 'single');
@@ -558,13 +579,38 @@
       const on = gyfChecked.has(r.nameWithOwner);
       const row = document.createElement('label'); row.className = 'repo-row' + (on ? ' on' : '');
       const cb = document.createElement('input'); cb.type = 'checkbox'; cb.value = r.nameWithOwner; cb.dataset.branch = r.defaultBranch || 'main'; cb.checked = on;
-      cb.onchange = () => { if (cb.checked) gyfChecked.add(r.nameWithOwner); else gyfChecked.delete(r.nameWithOwner); row.classList.toggle('on', cb.checked); updateRepoCount(); refreshGo(); };
+      cb.onchange = () => { if (cb.checked) gyfChecked.add(r.nameWithOwner); else gyfChecked.delete(r.nameWithOwner); row.classList.toggle('on', cb.checked); updateRepoCount(); refreshGo(); renderGyfPanes(); };
       const nm = document.createElement('span'); nm.className = 'rn'; nm.textContent = r.name;
       row.appendChild(cb); row.appendChild(nm);
       if (String(r.visibility || '').toLowerCase() === 'private') { const v = document.createElement('span'); v.className = 'rv'; v.textContent = 'private'; row.appendChild(v); }
       gyfReposEl.appendChild(row);
     });
-    updateRepoCount(); refreshGo(); fit();
+    updateRepoCount(); refreshGo(); renderGyfPanes(); fit();
+  }
+  // Multi + orchestrator OFF: one editable name row per CHECKED repo (checklist order). The pane defaults to the repo
+  // basename; a typed name overrides only the human heading (the worktree/slug is still basename-keyed by the CLI).
+  // User-typed values persist across re-renders (keyed by nameWithOwner) so re/un-checking siblings never loses them.
+  function renderGyfPanes() {
+    if (!gyfPanesEl) return;
+    if (!(mode === 'gyftalala' && !useOrchEl.checked)) { gyfPanesEl.style.display = 'none'; return; }
+    gyfPanesEl.style.display = '';
+    [...gyfPaneListEl.querySelectorAll('input')].forEach((inp) => { gyfPaneNames[inp.dataset.nwo] = inp.value; });   // snapshot current edits before rebuild
+    gyfPaneListEl.innerHTML = '';
+    const sel = checkedGyfRepos();
+    if (!sel.length) {
+      const d = document.createElement('div'); d.className = 'gyfpane-hint';
+      d.textContent = 'Check repos above — each becomes a worker pane.';
+      gyfPaneListEl.appendChild(d); return;
+    }
+    sel.forEach((r) => {
+      const base = r.nameWithOwner.split('/').pop() || r.nameWithOwner;
+      const row = document.createElement('div'); row.className = 'gyfpane-row';
+      const tag = document.createElement('div'); tag.className = 'gyfpane-repo'; tag.textContent = base; tag.title = r.nameWithOwner;
+      const inp = document.createElement('input'); inp.dataset.nwo = r.nameWithOwner; inp.placeholder = base;
+      inp.value = gyfPaneNames[r.nameWithOwner] !== undefined ? gyfPaneNames[r.nameWithOwner] : '';
+      inp.oninput = () => { gyfPaneNames[r.nameWithOwner] = inp.value; };
+      row.appendChild(tag); row.appendChild(inp); gyfPaneListEl.appendChild(row);
+    });
   }
   function updateRepoCount() {
     if (repoCountEl) repoCountEl.innerHTML = '<b>' + gyfChecked.size + '</b> selected';
@@ -572,7 +618,11 @@
   }
   function checkedGyfRepos() {
     const by = {}; gyfAll.forEach((r) => { by[r.nameWithOwner] = r; });
-    return [...gyfChecked].filter((n) => by[n]).map((n) => ({ nameWithOwner: n, defaultBranch: by[n].defaultBranch || 'main' }));
+    return [...gyfChecked].filter((n) => by[n]).map((n) => {
+      const base = n.split('/').pop() || n;
+      const nm = ((gyfPaneNames[n] || '').trim()) || base;   // orchestrator OFF: chosen worker-pane name (blank → basename). Ignored by the orchestrated path.
+      return { nameWithOwner: n, defaultBranch: by[n].defaultBranch || 'main', paneName: nm };
+    });
   }
   repoSearchEl.oninput = () => renderGyfRepos();
   document.getElementById('repoAll').onclick = () => { visibleRepos().forEach((r) => gyfChecked.add(r.nameWithOwner)); renderGyfRepos(); };

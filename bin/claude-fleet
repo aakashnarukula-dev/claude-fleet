@@ -20,7 +20,8 @@
 #                          RE-ARMS T as tracked PENDING work even if T was already --merged/--done (so --statuses
 #                          shows it active and --next WAITS for its re-signalled --done instead of ALL DONE).
 #                          FAILS LOUDLY (non-zero) if T's slug/worktree is gone — then spawn a FRESH worker.
-#   --grid-plan-multi      (multi-repo, no orchestrator) emit JSON for ONE named worker pane PER CLAUDE_FLEET_REPOS
+#   --grid-plan-multi [n…] (multi-repo, no orchestrator) emit JSON for ONE named worker pane PER CLAUDE_FLEET_REPOS
+#                          (optional positional headings parallel to CLAUDE_FLEET_REPOS order; blank/absent → basename)
 #                          repo — each cut into its own <repo>-fleet-<sid>/<slug>, self-pushing; STATUS = shared coord
 #   --spawn-grid N FILE    (grid mode) open a NEW worker pane N seeded with the brief in FILE (no pane owned it)
 #   --next                 block until a worker is ready; print its slug (or FAILED:<slug>); exit 3 = ALL DONE,
@@ -1618,18 +1619,21 @@ cmd_grid_plan() { # <N> <name1> <name2> ...
 # GC markers live on the one board), and each emitted pane is tagged with its absolute repo path ("repo") so the app
 # spawns it with CLAUDE_FLEET_REPO=that repo. Writes the coord `members` + per-member `.status/repo` gc markers +
 # per-slug `.repo` sidecars, matching the orchestrated multi path so --handoff/--gc-all resolve correctly.
-cmd_grid_plan_multi() {
+cmd_grid_plan_multi() { # [heading1 heading2 ...]  optional per-repo pane names, parallel to CLAUDE_FLEET_REPOS order
   [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--grid-plan-multi is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
   [ -n "$REPOS_LIST" ] || die "--grid-plan-multi needs CLAUDE_FLEET_REPOS"
+  local -a NAMES=("$@")                           # optional per-repo HEADINGS (parallel to REPOS_LIST); blank/absent → basename. Display-only: worktree dir/slug/branch stay keyed on basename.
   assert_unique_repo_basenames                   # fail loud on duplicate basenames (would collide onto one fleet)
   reset_state                                    # coordination STATUS (CLAUDE_FLEET_STATUS_DIR); manifest seeded (REPO=coord)
-  local r slug branch dir name
+  local r slug branch dir name heading ri=0
   local -a member_fleets=() P_SLUG P_HEAD P_DIR P_REPO P_PROMPT
   local IFS=:
   for r in $REPOS_LIST; do
     [ -d "$r/.git" ] || die "not a git repository: $r"
     select_repo "$r"; fetch_origin               # re-points REPO/FLEET/DBR to this repo (STATUS stays the coord dir)
     name="$(basename "$REPO")"; slug="$(slugify "$name")"; [ -n "$slug" ] || slug="repo"
+    heading="${NAMES[$ri]:-}"; [ -n "$heading" ] || heading="$name"   # custom pane name (display/prompt only); slug/dir/branch stay from basename
+    ri=$((ri + 1))
     branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
     if [ -d "$dir" ]; then :
     elif git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
@@ -1645,8 +1649,8 @@ cmd_grid_plan_multi() {
     mkdir -p "$FLEET/.status"; printf '%s\n' "$REPO" > "$FLEET/.status/repo"   # member fleet gc marker (G0-G4)
     member_fleets+=("$FLEET")
     # generate the prompt NOW, while REPO/DBR point at this repo (generic_worker_prompt reads origin/$DBR from $REPO)
-    P_SLUG+=("$slug"); P_HEAD+=("$name"); P_DIR+=("$dir"); P_REPO+=("$REPO")
-    P_PROMPT+=("$(grid_worker_prompt "$name" "$slug" "$dir")")
+    P_SLUG+=("$slug"); P_HEAD+=("$heading"); P_DIR+=("$dir"); P_REPO+=("$REPO")
+    P_PROMPT+=("$(grid_worker_prompt "$heading" "$slug" "$dir")")
   done
   local coord; coord="$(dirname "$STATUS")"       # the coordination dir (parent of .status)
   mkdir -p "$coord/.status"
@@ -1720,7 +1724,7 @@ ensure_git_identity   # guarantee a valid commit author for the top-level (singl
 case "${1:-}" in
   --orchestrator) cmd_orchestrator ;;
   --grid-plan)    shift; cmd_grid_plan "$@" ;;
-  --grid-plan-multi) cmd_grid_plan_multi ;;
+  --grid-plan-multi) shift; cmd_grid_plan_multi "$@" ;;
   --grid-add)     shift; cmd_grid_add "${1:-}" ;;
   --spawn)        shift; cmd_spawn "$@" ;;
   --spawn-file)   shift; cmd_spawn_file "$@" ;;

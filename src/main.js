@@ -569,9 +569,15 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
       sendAddSession(sid, title, color, [{ id: 0, role: 'orchestrator', heading: 'Orchestrator' }], 'gyftalala', win);
       runMultiOrchestrator(sid, coord, cl.paths).then(onReady).catch(onErr);
     } else {
-      const names = cl.paths.map((p) => path.basename(p));   // one worker pane per repo, named after the repo
+      // one worker pane per repo. Heading = the user-typed name from config (repos[i].paneName), else the repo
+      // basename. cloneRepos preserves order, so cl.paths[i] ↔ repos[i]. The name is DISPLAY-only: the CLI still
+      // keys the worktree/slug/branch on basename (its own collision guard), so a custom name can't move the tree.
+      const names = cl.paths.map((p, i) => {
+        const custom = repos[i] && typeof repos[i].paneName === 'string' ? repos[i].paneName.trim() : '';
+        return custom || path.basename(p);
+      });
       sendAddSession(sid, title, color, names.map((n, i) => ({ id: i, role: 'worker', heading: n })), 'grid', win);
-      runGridPlanMulti(sid, coord, cl.paths).then(onReady).catch(onErr);
+      runGridPlanMulti(sid, coord, cl.paths, names).then(onReady).catch(onErr);
     }
     return { ok: true };
   }
@@ -724,7 +730,7 @@ function runGridPlan(count, names, sid, repo) {
 // worktree (fleet/s<sid>/<slug>), each self-pushing its own repo. Like runMultiOrchestrator it passes the multi
 // env (CLAUDE_FLEET_MULTI/REPOS + the shared coordination CLAUDE_FLEET_STATUS_DIR), so the manifest/GC markers land
 // on the one board; the CLI emits a pane object per repo, each tagged with its absolute repo path ("repo").
-function runGridPlanMulti(sid, coord, repoPaths) {
+function runGridPlanMulti(sid, coord, repoPaths, names) {
   return new Promise((resolve, reject) => {
     const env = Object.assign({}, process.env, {
       CLAUDE_FLEET_SESSION: String(sid),
@@ -733,7 +739,8 @@ function runGridPlanMulti(sid, coord, repoPaths) {
       CLAUDE_FLEET_REPOS: repoPaths.join(':'),
       CLAUDE_FLEET_STATUS_DIR: path.join(coord, '.status'),
     });
-    execFile(FLEET_CLI, ['--grid-plan-multi'], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
+    // per-repo pane headings (parallel to CLAUDE_FLEET_REPOS order); the CLI falls back to basename for any blank.
+    execFile(FLEET_CLI, ['--grid-plan-multi', ...(names || [])], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
       if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
       try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty plan'); resolve(p); } catch (e) { reject(e); }
     });
