@@ -479,6 +479,14 @@
   function syncOrch() {
     const on = useOrchEl.checked;
     if (!on && newProject) setNewProject(false);   // named-pane mode can't be a scratch new-project; clear it
+    if (mode === 'gyftalala') {
+      // Multi-repo: the workers are DERIVED from the checked repos (one pane per repo), so the single-project grid
+      // count/names UI never shows here — only the button label reflects the orchestrator choice.
+      gridCfg.style.display = 'none';
+      goEl.textContent = on ? 'Launch multi-repo fleet' : 'Launch multi-repo panes';
+      fit();
+      return;
+    }
     gridCfg.style.display = on ? 'none' : '';
     goEl.textContent = on ? 'Launch fleet' : 'Launch panes';
     if (!on) renderGrids(); else fit();
@@ -496,11 +504,10 @@
     document.getElementById('modeSingle').classList.toggle('on', m === 'single');
     document.getElementById('modeGyf').classList.toggle('on', m === 'gyftalala');
     document.body.classList.toggle('wide', m === 'gyftalala');   // multi-repo → wide 2-col layout (repo picker in right column)
-    document.querySelector('.opt').style.display = m === 'gyftalala' ? 'none' : '';   // hide orchestrator toggle in multi-repo
+    document.querySelector('.opt').style.display = '';   // orchestrator toggle now shows in BOTH modes (multi: default on = current behavior)
     document.getElementById('repoPickRow').style.display = (m === 'gyftalala' || !account) ? 'none' : '';   // single dropdown only in Single mode (checklist owns multi)
-    gridCfg.style.display = (m === 'single' && !useOrchEl.checked) ? '' : 'none';
-    if (m === 'gyftalala') { goEl.textContent = 'Launch multi-repo fleet'; loadGyfRepos(); }
-    else syncOrch();
+    syncOrch();                                          // mode-aware: sets the button label + gridCfg visibility for single AND multi
+    if (m === 'gyftalala') loadGyfRepos();
     refreshGo(); fit();
   }
   function emptyRepoMsg(text) { gyfReposEl.innerHTML = ''; const d = document.createElement('div'); d.className = 'repo-empty'; d.textContent = text; gyfReposEl.appendChild(d); }
@@ -572,7 +579,9 @@
       const sel = checkedGyfRepos();
       if (!sel.length) { errEl.textContent = 'Check at least one repo.'; return; }
       goEl.disabled = true; goEl.textContent = 'Setting up…';
-      const res = await window.fleet.launch({ mode: 'gyftalala', account, repos: sel, autonomous: true, orchestrator: true });
+      // orchestrator ON (default) = super-orchestrator across the repos; OFF = one named worker pane per repo, each
+      // self-pushing its own repo (still autonomous — grid workers push themselves).
+      const res = await window.fleet.launch({ mode: 'gyftalala', account, repos: sel, autonomous: true, orchestrator: useOrchEl.checked });
       if (!(res && res.ok)) { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; setMode('gyftalala'); }
       return;
     }
