@@ -532,6 +532,7 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
   if (!pty) { if (configWin) configWin.webContents.send('launch-error', 'node-pty failed to load — run `npm run rebuild`.'); return { ok: false, error: 'node-pty not loaded' }; }
   if (mode === 'gyftalala') {
     if (!Array.isArray(repos) || !repos.length) return { ok: false, error: 'Multi-repo mode needs at least one repo.' };
+    const useMultiOrch = orchestrator !== false;   // default ON (super-orchestrator); OFF = one named worker pane per repo
     const cl = await cloneRepos(repos, account);
     if (!cl.ok) return { ok: false, error: cl.error };
     const sid = nextSid++;
@@ -543,7 +544,12 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
     const ghToken = await ghTokenFor(account);
     sessions[sid] = {
       repo: coord, repos: cl.paths, coordDir: coord, title, color, account: account || null, ghToken,
-      mode: 'gyftalala', bypass: false, autonomous: true, newProject: false,
+      // orchestrated → 'gyftalala' (super-orchestrator, integrates + atomic ship). No orchestrator → 'grid': ONE named
+      // worker pane per repo, each self-pushing its own repo (enables the live +Pane UI shape). Both keep the shared
+      // coordination .status (coordDir) so the watcher surface + GC markers match; spawnPane keys "multi" off coordDir.
+      mode: useMultiOrch ? 'gyftalala' : 'grid',
+      bypass: !useMultiOrch,                        // grid workers push themselves → broad allowlist incl. push
+      autonomous: true, newProject: false,          // both multi shapes run autonomous
       panes: [], planReady: false, pending: {}, slugIdx: {},
       statusDir: path.join(coord, '.status'), watcher: null,
     };
@@ -559,8 +565,14 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
       startWatcher(sid); saveState(); updateBadgeAndTray();
     };
     const onErr = (err) => sendToSid(sid, 'fleet-error', { sid, msg: String(err.message || err) });
-    sendAddSession(sid, title, color, [{ id: 0, role: 'orchestrator', heading: 'Orchestrator' }], 'gyftalala', win);
-    runMultiOrchestrator(sid, coord, cl.paths).then(onReady).catch(onErr);
+    if (useMultiOrch) {
+      sendAddSession(sid, title, color, [{ id: 0, role: 'orchestrator', heading: 'Orchestrator' }], 'gyftalala', win);
+      runMultiOrchestrator(sid, coord, cl.paths).then(onReady).catch(onErr);
+    } else {
+      const names = cl.paths.map((p) => path.basename(p));   // one worker pane per repo, named after the repo
+      sendAddSession(sid, title, color, names.map((n, i) => ({ id: i, role: 'worker', heading: n })), 'grid', win);
+      runGridPlanMulti(sid, coord, cl.paths).then(onReady).catch(onErr);
+    }
     return { ok: true };
   }
   const useOrch = orchestrator !== false;   // default ON (orchestrator); OFF = named worker panes you task directly
@@ -708,6 +720,26 @@ function runGridPlan(count, names, sid, repo) {
   });
 }
 
+// Multi-repo GRID (no orchestrator): ONE named worker pane per repo in repoPaths, each in that repo's own fleet
+// worktree (fleet/s<sid>/<slug>), each self-pushing its own repo. Like runMultiOrchestrator it passes the multi
+// env (CLAUDE_FLEET_MULTI/REPOS + the shared coordination CLAUDE_FLEET_STATUS_DIR), so the manifest/GC markers land
+// on the one board; the CLI emits a pane object per repo, each tagged with its absolute repo path ("repo").
+function runGridPlanMulti(sid, coord, repoPaths) {
+  return new Promise((resolve, reject) => {
+    const env = Object.assign({}, process.env, {
+      CLAUDE_FLEET_SESSION: String(sid),
+      CLAUDE_FLEET_REPO: coord,                 // basename → coordination fleet name; not a git repo (multi path skips that check)
+      CLAUDE_FLEET_MULTI: '1',
+      CLAUDE_FLEET_REPOS: repoPaths.join(':'),
+      CLAUDE_FLEET_STATUS_DIR: path.join(coord, '.status'),
+    });
+    execFile(FLEET_CLI, ['--grid-plan-multi'], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
+      if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
+      try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty plan'); resolve(p); } catch (e) { reject(e); }
+    });
+  });
+}
+
 ipcMain.handle('launch-fleet', (_e, cfg) => buildFleet(cfg));
 
 // ── GitHub accounts (gh multi-account) ───────────────────────────────────────────────────────────────────────
@@ -825,6 +857,9 @@ ipcMain.handle('list-account-repos', async (_e, account) => {
 function addGridWorker(sid, name) {
   const s = sessions[sid];
   if (!s || s.mode !== 'grid') return Promise.resolve({ ok: false, error: 'not a grid session' });
+  // Multi-repo grid: panes are ONE-per-repo (derived from the checked repos), and --grid-add has no repo to target
+  // (s.repo is the coordination dir, not a git repo). +Pane isn't supported here — add another repo at launch instead.
+  if (s.coordDir) return Promise.resolve({ ok: false, error: 'multi-repo grid: one pane per repo — +Pane not supported' });
   if (!s.planReady) return Promise.resolve({ ok: false, error: 'session is still starting — try again in a moment' });
   const nm = String(name || '').trim();
   if (!nm) return Promise.resolve({ ok: false, error: 'name required' });
@@ -1176,7 +1211,7 @@ function spawnPane(sid, idx, cols, rows) {
   // Orchestrator defaults to 'high' (not xhigh) for a faster first dispatch — it can still raise a
   // specific worker to xhigh per-task via `claude-fleet --spawn[-file] … --effort xhigh`.
   const effort = (p.role === 'orchestrator') ? 'high' : (p.effort || 'high');
-  const multi = s.mode === 'gyftalala';
+  const multi = !!s.coordDir;                        // multi-repo (orchestrated 'gyftalala' OR no-orchestrator 'grid'): shared coord .status
   const paneRepo = p.repo || s.repo;                 // worker: its tagged repo; orchestrator/single: the session repo
   const env = Object.assign({}, process.env, {
     TERM: 'xterm-256color', COLORTERM: 'truecolor',
