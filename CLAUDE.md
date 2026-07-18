@@ -217,8 +217,10 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   `node --check` + the offline sandbox test (call `ensureCaveman` against a temp `homeDir`, assert
   files/hooks/marker + idempotent second run + `caveman-activate.js` emits `CAVEMAN MODE ACTIVE`).
 - Status-dir IPC is file-based (write `.task` / `.spawn`, watcher consumes + unlinks).
-- No `origin` remote on this repo. Integration stays local in `_main`; `git push
-  origin HEAD:main` is a no-op here (skip it).
+- `origin` = `github.com/aakashnarukula-dev/claude-fleet` (verified 2026-07-18; the old
+  "no origin remote" note is stale). The primary checkout `main` tracks `origin/main` and
+  was in sync as of 2026-07-18 (HEAD `918baac`). Integration still happens locally in
+  `_main`; push to `origin HEAD:main` only on a reviewed final ship.
 - `~/Developer/claude-fleet-app` is the primary checkout (has `main`) — it's both the
   dev surface AND where the app is launched (`npm start`). The user hand-edits here.
 - `.claude-fleet/rebuild` IS configured: after a batch, `claude-fleet --rebuild`
