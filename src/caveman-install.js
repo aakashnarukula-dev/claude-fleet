@@ -44,27 +44,55 @@ function ensureCaveman(opts = {}) {
     const dest = path.join(claudeDir, 'caveman-fleet');
     const settingsPath = path.join(claudeDir, 'settings.json');
 
-    // Read settings up front — both the fast-path health check and step 2 need it.
+    // Read settings up front — the fast-path health check, the orphan prune,
+    // and the pre-existing detection all need it.
     let settings = SETTINGS.readSettings(settingsPath);
     if (settings === null) settings = {}; // unreadable/corrupt -> start clean, don't crash
 
-    // 1) Fast path: already installed by us — but VERIFY, don't trust the marker
-    //    blindly. A stale marker (settings.json reset/restored, hooks hand-edited
-    //    out, or an earlier run that wrote the marker without fully wiring things)
-    //    would otherwise silently keep caveman OFF forever. "Actually installed"
-    //    = our SessionStart hook is present in settings.json AND the vendored
-    //    activate script exists on disk. Healthy install → skip (fast path kept);
-    //    stale marker → fall through and (re)install to self-heal.
-    if (fs.existsSync(marker)) {
-      const hookWired = SETTINGS.hasCavemanHook(settings, 'SessionStart');
-      const filesPresent = fs.existsSync(path.join(dest, 'hooks', 'caveman-activate.js'));
-      if (hookWired && filesPresent) return { skipped: 'marker' };
-      // else: stale marker — treat as not-installed and re-install below.
+    // The two vendored hook scripts we manage + a full health read of the
+    // install. Healthy = BOTH hooks wired (SessionStart activate + UserPromptSubmit
+    // tracker) AND BOTH scripts on disk. We match on the exact script BASENAMES,
+    // NOT the bare 'caveman' substring (hasCavemanHook's default) — a bare match
+    // false-positives on an unrelated user hook whose command merely contains
+    // "caveman" somewhere in its path, which would wrongly suppress our install.
+    const activateFile = path.join(dest, 'hooks', 'caveman-activate.js');
+    const trackerFile = path.join(dest, 'hooks', 'caveman-mode-tracker.js');
+    const activateWired = SETTINGS.hasCavemanHook(settings, 'SessionStart', 'caveman-activate.js');
+    const trackerWired = SETTINGS.hasCavemanHook(settings, 'UserPromptSubmit', 'caveman-mode-tracker.js');
+    const filesPresent = fs.existsSync(activateFile) && fs.existsSync(trackerFile);
+    const healthy = activateWired && trackerWired && filesPresent;
+
+    // 1) Fast path: our marker present AND the install is fully healthy — skip.
+    //    Anything less than fully healthy falls through to self-heal below. A
+    //    stale marker (settings.json reset/restored, a hook hand-edited out, the
+    //    tracker hook missing, or an earlier run that wrote the marker without
+    //    fully wiring things) or — critically — files deleted out from under a
+    //    still-wired hook must NOT keep caveman silently OFF / crashing every
+    //    session on `node "<missing>"`.
+    if (fs.existsSync(marker) && healthy) return { skipped: 'marker' };
+
+    // 1b) Self-heal orphaned managed hooks: a hook we manage that points at a
+    //     script no longer on disk (e.g. ~/.claude/caveman-fleet/ deleted while
+    //     settings.json kept the SessionStart/UserPromptSubmit entries) makes
+    //     Claude Code run `node "<missing>"` and crash every session. Prune those
+    //     stale entries first so the (re)wire in step 4 installs a clean pointer
+    //     instead of leaving/duplicating a broken one. A managed hook whose
+    //     script still EXISTS is left untouched, so this is safe on a healthy
+    //     user install and on our own healthy install alike.
+    if (SETTINGS.pruneOrphanedManagedHooks(settings, claudeDir) > 0) {
+      SETTINGS.writeSettings(settingsPath, settings);
     }
 
-    // 2) Respect a pre-existing caveman install (user wired it themselves) —
-    //    don't double-wire.
-    if (SETTINGS.hasCavemanHook(settings, 'SessionStart')) {
+    // 2) Respect a pre-existing GENUINE caveman install (the user wired it
+    //    themselves) — don't double-wire. Two guards keep this precise:
+    //     - No marker of ours: if our marker exists we OWN this install and must
+    //       heal it (fall through), even when the activate hook alone still looks
+    //       wired but the tracker or the vendored files are gone.
+    //     - Precise + post-prune probe: after 1b, any surviving caveman-activate.js
+    //       hook is guaranteed to point at a script that exists — a real, usable
+    //       install, not an orphan and not a coincidental "caveman" path.
+    if (!fs.existsSync(marker) &&
+        SETTINGS.hasCavemanHook(settings, 'SessionStart', 'caveman-activate.js')) {
       try {
         fs.mkdirSync(claudeDir, { recursive: true });
         fs.writeFileSync(marker, 'skipped: caveman SessionStart hook already present\n');

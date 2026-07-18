@@ -433,8 +433,10 @@
     setProjLabel();
     [...acctsEl.children].forEach((c) => c.classList.toggle('on', c.dataset.id === id));
     renderRecent(); document.getElementById('repoPickRow').style.display = (mode === 'gyftalala') ? 'none' : '';   // multi-repo uses the checklist, not the single dropdown
-    loadRepos(id);
+    // In multi-repo mode loadGyfRepos OWNS the fetch (it calls loadRepos(account) itself when uncached); calling
+    // loadRepos(id) here too would race a SECOND identical `gh repo list` subprocess to fill the same cache.
     if (mode === 'gyftalala') loadGyfRepos();
+    else loadRepos(id);
   }
   async function loadRepos(acct) {
     repoNWO = ''; refreshGo();
@@ -506,6 +508,11 @@
     document.body.classList.toggle('wide', m === 'gyftalala');   // multi-repo → wide 2-col layout (repo picker in right column)
     document.querySelector('.opt').style.display = '';   // orchestrator toggle now shows in BOTH modes (multi: default on = current behavior)
     document.getElementById('repoPickRow').style.display = (m === 'gyftalala' || !account) ? 'none' : '';   // single dropdown only in Single mode (checklist owns multi)
+    // Local-folder / new-project pickers are single-repo only: in multi-repo mode they'd call clearGithub() and
+    // orphan the account (→ Launch silently disables). Hide the "or" separator + the .proj row there; restore on Single.
+    const showFolderPick = (m !== 'gyftalala');
+    const orSepEl = document.querySelector('.or-sep'); if (orSepEl) orSepEl.style.display = showFolderPick ? '' : 'none';
+    const projRowEl = document.querySelector('.proj'); if (projRowEl) projRowEl.style.display = showFolderPick ? '' : 'none';
     syncOrch();                                          // mode-aware: sets the button label + gridCfg visibility for single AND multi
     if (m === 'gyftalala') loadGyfRepos();
     refreshGo(); fit();
@@ -606,6 +613,13 @@
     if (res && res.ok) { if (repo) pushRecent(repo); }
     else { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; syncOrch(); }
   };
+
+  // Surface main's actionable launch failure (e.g. node-pty ABI mismatch → "run npm run rebuild"); this can arrive
+  // AFTER launch() resolved, so also re-enable the button + restore its label so the user can act/retry.
+  window.fleet.onLaunchError((msg) => {
+    errEl.textContent = msg || 'Launch failed.';
+    goEl.disabled = false; syncOrch(); refreshGo(); fit();
+  });
 
   renderRecent(); setProjLabel(); syncOrch(); fit();
   // on startup, if a GitHub account is connected and nothing else is chosen yet, auto-select it so its repos

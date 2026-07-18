@@ -1279,7 +1279,7 @@ function spawnPane(sid, idx, cols, rows) {
     if (FAILED_RE.test(clean)) noteEvent(sid, idx, 'failed');
     else if (DONE_RE.test(clean)) noteEvent(sid, idx, 'done');
   });
-  term.onExit(() => { sendToSid(sid, 'pty-exit', { sid, id: idx }); delete ptys[`${sid}:${idx}`]; delete ptyBuf[`${sid}:${idx}`]; const ss = sessions[sid]; if (ss) (ss.exited || (ss.exited = {}))[idx] = true; clearPaneState(sid, idx); markPaneClosed(closedStatusDir, closedSlug); });
+  term.onExit(() => { sendToSid(sid, 'pty-exit', { sid, id: idx }); delete ptys[`${sid}:${idx}`]; delete ptyBuf[`${sid}:${idx}`]; const ss = sessions[sid]; if (ss) (ss.exited || (ss.exited = {}))[idx] = true; sendToSid(sid, 'pane-state', { sid, id: idx, state: 'exited' }); clearPaneState(sid, idx); markPaneClosed(closedStatusDir, closedSlug); });
 }
 
 ipcMain.on('term-ready', (_e, { sid, id, cols, rows }) => {
@@ -1542,8 +1542,12 @@ function closeSession(sid) {
   if (s.newProject) { teardownScratch(sid); saveState(); return; }
   if (s.watcher) { try { s.watcher.close(); } catch (_) {} }
   s.panes.forEach((_p, i) => { const t = ptys[`${sid}:${i}`]; if (t) { try { t.kill(); } catch (_) {} delete ptys[`${sid}:${i}`]; } delete ptyBuf[`${sid}:${i}`]; });
-  // tear down this session's worktrees in the background (force = no prompt) — target this session's repo/fleet
-  execFile(FLEET_CLI, ['--clean'], { env: Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: s.repo || DEFAULT_REPO, CLAUDE_FLEET_FORCE: '1' }) }, () => {});
+  // tear down this session's worktrees in the background (force = no prompt) — target this session's repo/fleet. A
+  // multi-repo (gyftalala) session must be --clean'd PER MEMBER REPO — CLAUDE_FLEET_REPO=s.repo is the COORD dir (holds
+  // only .status, no .git), so cmd_clean would die "not a git repository" and every member fleet (<repo>-fleet-<sid>) +
+  // its fleet/s<sid>/* branches would leak. Mirror the Start-fresh teardown (see app.whenReady restore path).
+  const cleanRepos = s.coordDir ? (s.repos || []) : [s.repo || DEFAULT_REPO];
+  cleanRepos.forEach((r) => execFile(FLEET_CLI, ['--clean'], { env: Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: r, CLAUDE_FLEET_FORCE: '1' }) }, () => {}));
   delete sessions[sid];
   sidWin.delete(Number(sid));   // drop the routing entry — no stale sid->window mapping after a close
   saveState();   // an explicitly-closed session is discarded — won't be offered for restore

@@ -188,6 +188,32 @@ select_repo() { # <name-or-path>
   ensure_git_identity   # guarantee a valid commit author for this repo's worktrees (no-op if already valid)
 }
 
+# COLLISION GUARD (multi-repo): every member fleet dir, slug, and branch is keyed on basename(repo)
+# (FLEET="$SESSIONS_DIR/$(basename "$REPO")-fleet-<sid>"; slug=slugify(basename)). Two SELECTED repos that
+# share a basename (e.g. foo/api and bar/api) would silently map to the SAME _main/worktree/branch, so the
+# 2nd repo reuses the 1st's — commits land in the WRONG repo. There is no per-repo namespacing, so we fail
+# LOUD here (preferred over silent corruption) BEFORE any worktree is created. Invoked from BOTH multi-repo
+# entrypoints (cmd_orchestrator multi + cmd_grid_plan_multi). bash-3.2-safe: no associative arrays — a plain
+# nested scan over the (tiny) repo set; respects the existing IFS=: colon-split idiom.
+assert_unique_repo_basenames() {
+  local IFS=: a b ba bb
+  for a in $REPOS_LIST; do
+    [ -n "$a" ] || continue
+    ba="$(basename "${a%/}")"
+    for b in $REPOS_LIST; do
+      [ -n "$b" ] || continue
+      [ "${a%/}" = "${b%/}" ] && continue          # same entry (or exact-dup path) — not a real collision
+      bb="$(basename "${b%/}")"
+      if [ "$ba" = "$bb" ]; then
+        die "multi-repo: two selected repos share the folder name '$ba' and would collide onto the same fleet dir/branch:
+  - ${a%/}
+  - ${b%/}
+Commits for one would land in the other. Rename or deselect one so every selected repo has a unique folder name."
+      fi
+    done
+  done
+}
+
 # DATA-LOSS FIX (2026-06-18): when there is NO 'origin' remote, the documented `git push origin HEAD:$DBR` step is
 # skipped, so integrated merge commits live ONLY on the orchestrator's DETACHED `_main` HEAD — they were NEVER written
 # into the canonical repo's real branch ref (refs/heads/$DBR). On teardown/prune those commits became unreachable →
@@ -621,6 +647,7 @@ EOF
 cmd_orchestrator() {
   if [ "${CLAUDE_FLEET_MULTI:-}" = 1 ]; then
     [ -n "$REPOS_LIST" ] || die "multi-repo orchestrator needs CLAUDE_FLEET_REPOS"
+    assert_unique_repo_basenames                  # fail loud on duplicate basenames (would collide onto one fleet)
     reset_state                                   # coordination STATUS (CLAUDE_FLEET_STATUS_DIR); manifest seeded
     local r odir IFS=:
     local -a member_fleets=()                      # collected member fleet paths for the coord's gc `members` marker
@@ -1594,6 +1621,7 @@ cmd_grid_plan() { # <N> <name1> <name2> ...
 cmd_grid_plan_multi() {
   [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--grid-plan-multi is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
   [ -n "$REPOS_LIST" ] || die "--grid-plan-multi needs CLAUDE_FLEET_REPOS"
+  assert_unique_repo_basenames                   # fail loud on duplicate basenames (would collide onto one fleet)
   reset_state                                    # coordination STATUS (CLAUDE_FLEET_STATUS_DIR); manifest seeded (REPO=coord)
   local r slug branch dir name
   local -a member_fleets=() P_SLUG P_HEAD P_DIR P_REPO P_PROMPT
