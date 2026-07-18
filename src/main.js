@@ -1056,6 +1056,10 @@ function setPaneState(sid, idx, state) {
     : { sid, id: idx, remove: true };
   permUpsert(permMsg);                       // system-wide overlay (global across ALL sessions/windows)
   markPaneWorking(s, idx, state === 'working');   // bridge a re-activated (already-integrated) worker to the engine
+  // The orchestrator just went idle → flush any re-signal nudges that were queued while it was busy (see
+  // maybeNudgeOrchestrator). Without this, a worker the user re-tasked directly while the orchestrator was busy would
+  // --done into a dropped fs event and never be caught.
+  if (state === 'idle' && s.panes[idx] && s.panes[idx].role === 'orchestrator') flushPendingNudges(sid, idx);
 }
 // A worker pane that's already been --merged/--done but picks up a NEW in-pane task goes back to running with NO engine
 // status marker until it next runs --done — so --next reports ALL DONE and --statuses shows nothing for it, and an
@@ -1295,22 +1299,45 @@ function noteMerged(s, slug) {
   s.mergedSeen.add(slug);
   if (s.doneNudged) delete s.doneNudged[slug];   // a fresh integration re-arms the nudge so a subsequent re-signal pushes again
 }
+function nudgeText(verb, list) {
+  return `[claude-fleet] ${verb} ${list} re-signalled --done after being integrated — run: claude-fleet --ready  and integrate it (then go back to claude-fleet --watch).`;
+}
 function maybeNudgeOrchestrator(sid, filename) {
   const s = sessions[sid]; if (!s || !s.statusDir) return;
   const slug = filename.slice(0, -5);            // strip ".done"
   if (!s.mergedSeen || !s.mergedSeen.has(slug)) return;   // never integrated → the orchestrator's live --next loop owns this
   const orchIdx = (s.panes || []).findIndex((p) => p && p.role === 'orchestrator');
   if (orchIdx < 0 || !s.panes[orchIdx] || !ptys[`${sid}:${orchIdx}`]) return;   // no live orchestrator pane → nothing to nudge
-  const r = s.pstate && s.pstate[orchIdx];
-  if (!r || r.state !== 'idle') return;          // busy/watching orchestrator will catch it itself; don't inject into a running command
   let mtime = 0;
   try { mtime = fsmod.statSync(path.join(s.statusDir, filename)).mtimeMs; } catch (_) { return; }   // marker vanished (race) → nothing to nudge
   if (!s.doneNudged) s.doneNudged = {};
-  if (s.doneNudged[slug] === mtime) return;      // same .done, a duplicate fs.watch event → already nudged
+  if (s.doneNudged[slug] === mtime) return;      // same .done, a duplicate fs.watch event → already handled (nudged or queued)
   s.doneNudged[slug] = mtime;
   const wp = s.panes[s.slugIdx[slug]];
   const heading = (wp && wp.heading) || slug;
-  routeTextToPane(sid, orchIdx, `[claude-fleet] worker "${heading}" re-signalled --done after being integrated — run: claude-fleet --ready  and integrate it (then go back to claude-fleet --watch).`);
+  const r = s.pstate && s.pstate[orchIdx];
+  if (!r || r.state !== 'idle') {
+    // Orchestrator is BUSY (mid another task, not in a live --watch loop). Injecting into a running foreground command is
+    // messy, AND the .done fs event fires only once — dropping it here would lose the re-signal forever (the old bug: a
+    // worker the user re-tasked directly while the orchestrator was busy would never be caught). So QUEUE it and flush the
+    // moment the orchestrator returns to idle (flushPendingNudges, hooked in setPaneState).
+    if (!s.pendingNudge) s.pendingNudge = {};
+    s.pendingNudge[slug] = heading;
+    return;
+  }
+  routeTextToPane(sid, orchIdx, nudgeText('worker', `"${heading}"`));
+}
+// Flush re-signal nudges queued while the orchestrator was busy (see maybeNudgeOrchestrator). Called the instant the
+// orchestrator pane returns to idle, so a directly re-tasked worker's --done is never silently lost. Coalesces multiple
+// queued slugs into one line.
+function flushPendingNudges(sid, orchIdx) {
+  const s = sessions[sid]; if (!s || !s.pendingNudge) return;
+  const slugs = Object.keys(s.pendingNudge);
+  if (!slugs.length) return;
+  if (!ptys[`${sid}:${orchIdx}`]) return;        // no live orchestrator pty → keep queued for the next idle transition
+  const list = slugs.map((sl) => `"${s.pendingNudge[sl]}"`).join(', ');
+  routeTextToPane(sid, orchIdx, nudgeText(slugs.length > 1 ? 'workers' : 'worker', list));
+  s.pendingNudge = {};
 }
 
 function startWatcher(sid) {
