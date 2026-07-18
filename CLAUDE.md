@@ -220,7 +220,20 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
 - `origin` = `github.com/aakashnarukula-dev/claude-fleet` (verified 2026-07-18; the old
   "no origin remote" note is stale). The primary checkout `main` tracks `origin/main` and
   was in sync as of 2026-07-18 (HEAD `918baac`). Integration still happens locally in
-  `_main`; push to `origin HEAD:main` only on a reviewed final ship.
+  `_main`; by DEFAULT the orchestrator pushes `origin HEAD:main` per integrated batch (see
+  auto-ship below).
+- **Auto-ship is the DEFAULT (changed 2026-07-19):** the single-repo orchestrator prompt
+  (`spawn_orchestrator_prompt` in `bin/claude-fleet`) now pushes `git push origin HEAD:${dbr}`
+  ONCE per integrated+verified batch (auto-deploys) and runs `claude-fleet --rebuild` if that
+  batch changed the app's OWN code — no waiting, no "ship it". The multi-repo prompt
+  (`spawn_multi_orchestrator_prompt`) auto-runs `claude-fleet --ship-all` as soon as each phase
+  reaches ALL DONE. **Opt out with `CLAUDE_FLEET_HOLD_MAIN=1`:** restores the OLD hold-and-wait
+  behavior — the orchestrator holds `main` (single-repo: pushes only to its session
+  `fleet/s<sid>/_integrated` branch per batch) and ships to `main` (or runs `--ship-all`) only at
+  the FINAL SHIP when the user says "ship it". Set it when running PARALLEL fleet/Claude sessions
+  on the same repo so `main` moves only on one final reviewed cross-session merge. Legacy
+  `CLAUDE_FLEET_AUTOSHIP=1` is now the default → accepted as a recognized no-op alias. This is
+  PROMPT prose only — no runtime flag; `--ship-all`'s own semantics are unchanged.
 - `~/Developer/claude-fleet-app` is the primary checkout (has `main`) — it's both the
   dev surface AND where the app is launched (`npm start`). The user hand-edits here.
 - `.claude-fleet/rebuild` IS configured: after a batch, `claude-fleet --rebuild`
