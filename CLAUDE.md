@@ -192,6 +192,20 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   commits + self-pushes its own branch in each repo it changed, then `--done`. `main.js`
   `runGridPlanShared` shells the verb; orchestrated-multi + single-grid paths are UNCHANGED.
   (Stale: `main.js` +Pane guard still says "one pane per repo" — +Pane unsupported in shared mode.)
+- **Integrator mode (added 2026-07-19):** ADDITIVE option on the shared N-pane multi-repo grid
+  (multi + orchestrator OFF). A FIXED dedicated 9th pane named **Integrator** owns ALL pushing;
+  worker count caps at 1–8. The 8 workers commit + `--done` and DO NOT push (spawnPane withholds
+  `Bash(git push:*)` when `s.integrator`); the Integrator receives each `--done` and lands it
+  INCREMENTALLY — it does NOT batch-wait. Per worker S: it merges S into each TOUCHED repo's
+  `_main`, TEST-GATES (that repo's build/test), then pushes the per-worker changeset ATOMICALLY
+  via the NEW `claude-fleet --ship <repo…>` (like `--ship-all` but scoped to exactly the repos S
+  changed — all-or-none, resumable; both share the `ship_repos` helper). Independent workers land
+  without waiting for siblings; overlapping ready branches are serialized + resolved; genuine
+  intent doubt → the Integrator ASKS in its pane, waits, resolves, pushes. CLI:
+  `--grid-plan-integrator N [name…]` (builds worker worktrees + per-repo `_main` + emits the
+  Integrator pane), `spawn_integrator_prompt` (the integrate-only loop), `--ship` (per-changeset
+  push). `main.js` `runIntegratorPlan`. It's the arbiter/merge-gate the plain shared-grid mode
+  lacked (whoever-pushes-second-resolves-blind). Orchestrated-multi + plain shared-grid still work.
 
 ## Conventions / gotchas
 
