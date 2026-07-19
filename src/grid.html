@@ -458,9 +458,9 @@
   async function closePane(sid, paneId) {
     const s = sessions[sid]; if (!s || !s.terms[paneId]) return;
     const t = s.terms[paneId];
-    if (t.role === 'orchestrator') {
+    if (t.role === 'orchestrator' || t.role === 'integrator') {
       const workers = Object.values(s.terms).filter((x) => x.role === 'worker').length;
-      if (workers > 0) { window.alert('Close the worker panes first — the Orchestrator can’t be closed while its workers are still running.'); return; }
+      if (workers > 0) { window.alert('Close the worker panes first — the ' + (t.role === 'integrator' ? 'Integrator' : 'Orchestrator') + ' can’t be closed while its workers are still running.'); return; }
     }
     const lastPane = Object.keys(s.terms).length === 1;   // closing the last pane closes the whole project
     if (!(await window.fleet.confirmClose(lastPane ? 'session' : 'pane', lastPane ? s.title : t.heading))) return;
