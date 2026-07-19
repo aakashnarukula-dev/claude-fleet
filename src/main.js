@@ -34,7 +34,7 @@ function saveState() {
       .filter(([, s]) => !s.newProject)   // don't persist throwaway scratch sessions — their dir is disposable/torn down
       .map(([sid, s]) => ({
         sid: +sid, autonomous: !!s.autonomous, repo: s.repo, title: s.title, color: s.color, mode: s.mode, bypass: !!s.bypass,
-        repos: s.repos || null, coordDir: s.coordDir || null,
+        repos: s.repos || null, coordDir: s.coordDir || null, sharedMulti: !!s.sharedMulti,
         account: s.account || null,   // persist the SELECTED gh account (a safe string); NEVER the raw token — it's re-resolved on restore
 
         panes: (s.panes || []).map((p, i) => (p ? { id: i, role: p.role, heading: p.heading, slug: p.slug, dir: p.dir, repo: p.repo } : null)).filter(Boolean),
@@ -532,7 +532,13 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
   if (!pty) { if (configWin) configWin.webContents.send('launch-error', 'node-pty failed to load — run `npm run rebuild`.'); return { ok: false, error: 'node-pty not loaded' }; }
   if (mode === 'gyftalala') {
     if (!Array.isArray(repos) || !repos.length) return { ok: false, error: 'Multi-repo mode needs at least one repo.' };
-    const useMultiOrch = orchestrator !== false;   // default ON (super-orchestrator); OFF = one named worker pane per repo
+    const useMultiOrch = orchestrator !== false;   // default ON (super-orchestrator); OFF = N GENERAL worker panes, each spanning ALL repos
+    // no-orchestrator SHARED grid: N named panes (count + names from the config's 1–9 grid), each spanning every repo.
+    let sharedNames = [];
+    if (!useMultiOrch) {
+      sharedNames = (names || []).slice(0, count || 0).map((n, i) => (n && n.trim()) || ('Pane ' + (i + 1)));
+      if (!sharedNames.length) return { ok: false, error: 'Name at least one worker pane.' };
+    }
     const cl = await cloneRepos(repos, account);
     if (!cl.ok) return { ok: false, error: cl.error };
     const sid = nextSid++;
@@ -544,10 +550,11 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
     const ghToken = await ghTokenFor(account);
     sessions[sid] = {
       repo: coord, repos: cl.paths, coordDir: coord, title, color, account: account || null, ghToken,
-      // orchestrated → 'gyftalala' (super-orchestrator, integrates + atomic ship). No orchestrator → 'grid': ONE named
-      // worker pane per repo, each self-pushing its own repo (enables the live +Pane UI shape). Both keep the shared
+      // orchestrated → 'gyftalala' (super-orchestrator, integrates + atomic ship). No orchestrator → 'grid': N GENERAL
+      // named worker panes, EACH spanning every repo, each self-pushing the repos it changes. Both keep the shared
       // coordination .status (coordDir) so the watcher surface + GC markers match; spawnPane keys "multi" off coordDir.
       mode: useMultiOrch ? 'gyftalala' : 'grid',
+      sharedMulti: !useMultiOrch,                   // shared-multi grid workers span ALL repos → get CLAUDE_FLEET_MULTI/REPOS (not just the orchestrator)
       bypass: !useMultiOrch,                        // grid workers push themselves → broad allowlist incl. push
       autonomous: true, newProject: false,          // both multi shapes run autonomous
       panes: [], planReady: false, pending: {}, slugIdx: {},
@@ -569,15 +576,11 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
       sendAddSession(sid, title, color, [{ id: 0, role: 'orchestrator', heading: 'Orchestrator' }], 'gyftalala', win);
       runMultiOrchestrator(sid, coord, cl.paths).then(onReady).catch(onErr);
     } else {
-      // one worker pane per repo. Heading = the user-typed name from config (repos[i].paneName), else the repo
-      // basename. cloneRepos preserves order, so cl.paths[i] ↔ repos[i]. The name is DISPLAY-only: the CLI still
-      // keys the worktree/slug/branch on basename (its own collision guard), so a custom name can't move the tree.
-      const names = cl.paths.map((p, i) => {
-        const custom = repos[i] && typeof repos[i].paneName === 'string' ? repos[i].paneName.trim() : '';
-        return custom || path.basename(p);
-      });
-      sendAddSession(sid, title, color, names.map((n, i) => ({ id: i, role: 'worker', heading: n })), 'grid', win);
-      runGridPlanMulti(sid, coord, cl.paths, names).then(onReady).catch(onErr);
+      // N GENERAL worker panes (count + names from the config grid), EACH spanning ALL selected repos. The CLI cuts a
+      // worktree per (pane × repo) + a per-pane workspace dir exposing every repo, so a pane can work across the whole
+      // set. Panes are NOT repo-tagged (no p.repo) — each spans them all; spawnPane anchors per-repo env to cl.paths[0].
+      sendAddSession(sid, title, color, sharedNames.map((n, i) => ({ id: i, role: 'worker', heading: n })), 'grid', win);
+      runGridPlanShared(sid, coord, cl.paths, sharedNames.length, sharedNames).then(onReady).catch(onErr);
     }
     return { ok: true };
   }
@@ -674,7 +677,7 @@ async function restoreSessions(saved) {
     const s = {
       repo: ss.repo, title, color, mode: ss.mode || 'dispatch', bypass: !!ss.bypass, autonomous: !!ss.autonomous, planReady: true,
       account: ss.account || null, ghToken: ss.account ? (tokenByAccount[ss.account] || null) : null,
-      repos: ss.repos || null, coordDir: ss.coordDir || null, panes: [],
+      repos: ss.repos || null, coordDir: ss.coordDir || null, sharedMulti: !!ss.sharedMulti, panes: [],
       pending: {}, slugIdx: {}, statusDir: ss.coordDir
         ? path.join(ss.coordDir, '.status')
         : path.join(fleetDir(ss.repo, sid), '.status'), watcher: null,
@@ -741,6 +744,27 @@ function runGridPlanMulti(sid, coord, repoPaths, names) {
     });
     // per-repo pane headings (parallel to CLAUDE_FLEET_REPOS order); the CLI falls back to basename for any blank.
     execFile(FLEET_CLI, ['--grid-plan-multi', ...(names || [])], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
+      if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
+      try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty plan'); resolve(p); } catch (e) { reject(e); }
+    });
+  });
+}
+
+// Multi-repo SHARED GRID (no orchestrator): N GENERAL worker panes, EACH spanning every repo in repoPaths. Unlike
+// runGridPlanMulti (one pane pinned per repo), the CLI here cuts a worktree per (pane × repo) on branch
+// fleet/s<sid>/<slug> AND builds a per-pane workspace dir (<coord>/workers/<slug>/) with one symlink per repo, which
+// becomes the pane's cwd — so a single pane can `cd` into any repo. Same shared coordination env as runGridPlanMulti;
+// emitted panes carry NO "repo" tag (each spans them all). names = the N pane headings (parallel to slugs).
+function runGridPlanShared(sid, coord, repoPaths, count, names) {
+  return new Promise((resolve, reject) => {
+    const env = Object.assign({}, process.env, {
+      CLAUDE_FLEET_SESSION: String(sid),
+      CLAUDE_FLEET_REPO: coord,                 // basename → coordination fleet name; not a git repo (multi path skips that check)
+      CLAUDE_FLEET_MULTI: '1',
+      CLAUDE_FLEET_REPOS: repoPaths.join(':'),
+      CLAUDE_FLEET_STATUS_DIR: path.join(coord, '.status'),
+    });
+    execFile(FLEET_CLI, ['--grid-plan-shared', String(count), ...(names || [])], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
       if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
       try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty plan'); resolve(p); } catch (e) { reject(e); }
     });
@@ -1219,7 +1243,10 @@ function spawnPane(sid, idx, cols, rows) {
   // specific worker to xhigh per-task via `claude-fleet --spawn[-file] … --effort xhigh`.
   const effort = (p.role === 'orchestrator') ? 'high' : (p.effort || 'high');
   const multi = !!s.coordDir;                        // multi-repo (orchestrated 'gyftalala' OR no-orchestrator 'grid'): shared coord .status
-  const paneRepo = p.repo || s.repo;                 // worker: its tagged repo; orchestrator/single: the session repo
+  // paneRepo drives CLAUDE_FLEET_REPO + the CARGO_TARGET_DIR cache. A repo-tagged worker uses its repo; a SHARED-multi
+  // grid worker (spans every repo, so no p.repo) anchors to the FIRST selected repo — a REAL git repo/fleet dir, not
+  // the non-git coord (which would break set_default_branch + point the cargo cache at a bogus dir). Else session repo.
+  const paneRepo = p.repo || (s.sharedMulti && s.repos && s.repos[0]) || s.repo;
   const env = Object.assign({}, process.env, {
     TERM: 'xterm-256color', COLORTERM: 'truecolor',
     CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: paneRepo,
@@ -1236,7 +1263,10 @@ function spawnPane(sid, idx, cols, rows) {
   if (s.ghToken) env.GH_TOKEN = s.ghToken;
   if (multi) {
     env.CLAUDE_FLEET_STATUS_DIR = s.statusDir;        // all panes share the coordination .status
-    if (p.role === 'orchestrator') {
+    // The super-orchestrator AND every shared-multi grid worker (each spans all repos) need the full multi context so
+    // their claude-fleet calls (self-push loop, --done) know every repo. A repo-PINNED grid worker (cmd_grid_plan_multi)
+    // deliberately does NOT get these — it owns exactly one repo.
+    if (p.role === 'orchestrator' || s.sharedMulti) {
       env.CLAUDE_FLEET_MULTI = '1';
       env.CLAUDE_FLEET_REPOS = (s.repos || []).join(':');
     }
