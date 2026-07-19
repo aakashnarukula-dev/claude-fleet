@@ -920,26 +920,48 @@ ipcMain.handle('list-account-repos', async (_e, account) => {
 
 // Grid mode: add one more named worker to a running session (no restart). Engine creates a fresh
 // worktree+branch off origin/main and emits the pane spec; we push it as a new pane (term-ready -> spawnPane).
+// Single-repo: `--grid-add` cuts one worktree in s.repo. Multi-repo (s.coordDir set): `--grid-add-shared` cuts a
+// worktree in EVERY repo on fleet/s<sid>/<slug> + builds the per-pane workspace dir (the same shape the shared /
+// Integrator grids build at launch), so the new pane spans all repos live. In Integrator mode (s.integrator) the
+// worker prompt commits + --done only (no self-push); spawnPane withholds `Bash(git push:*)` from it via s.integrator.
 function addGridWorker(sid, name) {
   const s = sessions[sid];
   if (!s || s.mode !== 'grid') return Promise.resolve({ ok: false, error: 'not a grid session' });
-  // Multi-repo grid: the pane set is FIXED at launch (shared workers each span all repos, plus an optional Integrator
-  // pane), and +Pane has no single repo to target (s.repo is the coordination dir, not a git repo). Add more panes at launch.
-  if (s.coordDir) return Promise.resolve({ ok: false, error: 'multi-repo grid: panes are fixed at launch — +Pane not supported' });
   if (!s.planReady) return Promise.resolve({ ok: false, error: 'session is still starting — try again in a moment' });
   const nm = String(name || '').trim();
   if (!nm) return Promise.resolve({ ok: false, error: 'name required' });
+  // pushPane: turn the CLI's single pane-spec JSON into a live worker pane. Shared by both branches.
+  const pushPane = (info) => {
+    if (!info || info.slug == null || s.slugIdx[info.slug] != null) return { ok: false, error: 'duplicate or invalid worker' };
+    const idx = s.panes.length;
+    s.panes.push({ role: 'worker', slug: info.slug, heading: info.heading, dir: info.dir, prompt: info.prompt });
+    s.slugIdx[info.slug] = idx;
+    sendToSid(sid, 'add-pane', { sid, pane: { id: idx, role: 'worker', heading: info.heading } });
+    saveState();
+    return { ok: true, heading: info.heading };
+  };
+  if (s.coordDir) {
+    // Multi-repo shared / Integrator grid: same coordination env as runGridPlanShared/runIntegratorPlan.
+    const env = Object.assign({}, process.env, {
+      CLAUDE_FLEET_SESSION: String(sid),
+      CLAUDE_FLEET_REPO: s.coordDir,
+      CLAUDE_FLEET_MULTI: '1',
+      CLAUDE_FLEET_REPOS: s.repos.join(':'),
+      CLAUDE_FLEET_STATUS_DIR: path.join(s.coordDir, '.status'),
+    });
+    return new Promise((resolve) => {
+      execFile(FLEET_CLI, ['--grid-add-shared', nm, s.integrator ? 'integrator' : 'shared'], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
+        if (err) return resolve({ ok: false, error: (errOut && errOut.trim()) || err.message });
+        let info; try { info = JSON.parse(out); } catch (_) { return resolve({ ok: false, error: 'bad plan output' }); }
+        resolve(pushPane(info));
+      });
+    });
+  }
   return new Promise((resolve) => {
     execFile(FLEET_CLI, ['--grid-add', nm], { maxBuffer: 16 * 1024 * 1024, env: sessionEnv(sid, s.repo) }, (err, out, errOut) => {
       if (err) return resolve({ ok: false, error: (errOut && errOut.trim()) || err.message });
       let info; try { info = JSON.parse(out); } catch (_) { return resolve({ ok: false, error: 'bad plan output' }); }
-      if (!info || info.slug == null || s.slugIdx[info.slug] != null) return resolve({ ok: false, error: 'duplicate or invalid worker' });
-      const idx = s.panes.length;
-      s.panes.push({ role: 'worker', slug: info.slug, heading: info.heading, dir: info.dir, prompt: info.prompt });
-      s.slugIdx[info.slug] = idx;
-      sendToSid(sid, 'add-pane', { sid, pane: { id: idx, role: 'worker', heading: info.heading } });
-      saveState();
-      resolve({ ok: true, heading: info.heading });
+      resolve(pushPane(info));
     });
   });
 }
