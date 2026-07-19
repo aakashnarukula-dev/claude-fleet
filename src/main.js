@@ -35,9 +35,10 @@ function saveState() {
       .map(([sid, s]) => ({
         sid: +sid, autonomous: !!s.autonomous, repo: s.repo, title: s.title, color: s.color, mode: s.mode, bypass: !!s.bypass,
         repos: s.repos || null, coordDir: s.coordDir || null, sharedMulti: !!s.sharedMulti, integrator: !!s.integrator,
+        products: !!s.products, master: !!s.master, tasks: s.tasks || null,   // PRODUCTS mode session fields
         account: s.account || null,   // persist the SELECTED gh account (a safe string); NEVER the raw token — it's re-resolved on restore
 
-        panes: (s.panes || []).map((p, i) => (p ? { id: i, role: p.role, heading: p.heading, slug: p.slug, dir: p.dir, repo: p.repo } : null)).filter(Boolean),
+        panes: (s.panes || []).map((p, i) => (p ? { id: i, role: p.role, heading: p.heading, slug: p.slug, dir: p.dir, repo: p.repo, product: p.product, tier: p.tier } : null)).filter(Boolean),
       })).filter((x) => x.panes.length);
     fsmod.writeFileSync(stateFile(), JSON.stringify(data));
   } catch (_) {}
@@ -237,6 +238,13 @@ function fleetDir(repo, sid) { return path.join(SESSIONS_DIR, `${path.basename(S
 // Gyftalala (multi-repo) session: ONE coordination dir holds the shared .status the watcher observes; each repo
 // keeps its own <basename>-fleet-<sid> dir (created by the engine). Name is stable + sid-scoped.
 function coordDir(sid) { return path.join(SESSIONS_DIR, `gyftalala-multi-fleet-${sid}`); }
+// Products mode (3-tier MASTER → per-product TASK-ORCHESTRATOR → WORKERS): ONE master coordination dir holds the shared
+// .status the watcher observes; each repo keeps its own <basename>-fleet-<sid> dir (created by the engine). Distinct name
+// from the gyftalala coord so GC (gc_one_products, flagged by .status/tasks) routes it correctly.
+function productsCoordDir(sid) { return path.join(SESSIONS_DIR, `products-master-fleet-${sid}`); }
+// Mirror bin/claude-fleet's slugify (lowercase, non-alnum → '-', trim '-') so the renderer-facing product hint on a pane
+// matches the CLI-authoritative slug the engine emits. No length cap / dot-stripping (that's slugifyProjectName's job).
+function fleetSlug(name) { return String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, ''); }
 function sessionEnv(sid, repo) { return Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: repo }); }
 
 // Per-account chip color, derived deterministically from the account name — no hardcoded account list.
@@ -528,8 +536,52 @@ function sendAddSession(sid, title, color, meta, mode, win, migrated) {
   sendToWin(target, 'add-session', payload);
 }
 
-async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, account, orchestrator, count, names, newProject, mode, repos, integrator }) {
+async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, account, orchestrator, count, names, newProject, mode, repos, integrator, tasks }) {
   if (!pty) { if (configWin) configWin.webContents.send('launch-error', 'node-pty failed to load — run `npm run rebuild`.'); return { ok: false, error: 'node-pty not loaded' }; }
+  if (mode === 'products') {
+    // 3-tier PRODUCTS mode: a MASTER pane owns each repo's shared _main + all pushing; one TASK-ORCHESTRATOR pane per
+    // user-named PRODUCT decomposes that product across ALL repos and integrates its workers into fleet/s<sid>/<P>/_product.
+    // Reuses the gyftalala clone path + the coord/shared-.status shape; only the pane roles + engine plan verb differ.
+    if (!Array.isArray(repos) || !repos.length) return { ok: false, error: 'Products mode needs at least one repo.' };
+    const taskNames = (tasks || []).map((t) => String(t || '').trim()).filter(Boolean);
+    if (!taskNames.length) return { ok: false, error: 'Products mode needs at least one product/task name.' };
+    const cl = await cloneRepos(repos, account);
+    if (!cl.ok) return { ok: false, error: cl.error };
+    const sid = nextSid++;
+    const coord = productsCoordDir(sid);
+    try { fsmod.mkdirSync(path.join(coord, '.status'), { recursive: true }); } catch (e) { nextSid--; return { ok: false, error: 'coord init failed: ' + ((e && e.message) || e) }; }
+    const title = 'Products', color = account ? accountColor(account) : tabColor(title);
+    const ghToken = await ghTokenFor(account);
+    sessions[sid] = {
+      repo: coord, repos: cl.paths, coordDir: coord, title, color, account: account || null, ghToken,
+      mode: 'products', products: true, master: true,
+      tasks: taskNames,
+      sharedMulti: true,       // workers span ALL repos → get CLAUDE_FLEET_MULTI/REPOS (like the shared/integrator grids)
+      integrator: false, bypass: false,   // push policy is products-specific (only the MASTER pushes) — keyed on s.products in spawnPane
+      autonomous: true, newProject: false,
+      panes: [], planReady: false, pending: {}, slugIdx: {},
+      statusDir: path.join(coord, '.status'), watcher: null,
+    };
+    const win = targetGridWin();
+    sidWin.set(sid, win.id);
+    updatePowerBlocker();
+    if (configWin) configWin.hide();
+    const onReady = (panes) => {
+      const s = sessions[sid]; if (!s) return;
+      s.panes = panes; s.planReady = true;
+      panes.forEach((p, i) => { if (p.slug) s.slugIdx[p.slug] = i; });
+      Object.keys(s.pending).forEach((idx) => spawnPane(sid, +idx, s.pending[idx].cols, s.pending[idx].rows));
+      startWatcher(sid); saveState(); updateBadgeAndTray();
+    };
+    const onErr = (err) => sendToSid(sid, 'fleet-error', { sid, msg: String(err.message || err) });
+    // MASTER pane first (id 0 → renders top-left; the app keys pane id = array index), then one task-orchestrator per
+    // product. The `product` hint lets Phase-2's sidebar group panes; authoritative slugs arrive via onReady.
+    const meta = [{ id: 0, role: 'master', heading: 'Master' }]
+      .concat(taskNames.map((n, i) => ({ id: i + 1, role: 'orchestrator', heading: n, product: fleetSlug(n) })));
+    sendAddSession(sid, title, color, meta, 'products', win);
+    runProductsPlan(sid, coord, cl.paths, taskNames).then(onReady).catch(onErr);
+    return { ok: true };
+  }
   if (mode === 'gyftalala') {
     if (!Array.isArray(repos) || !repos.length) return { ok: false, error: 'Multi-repo mode needs at least one repo.' };
     const useMultiOrch = orchestrator !== false;   // default ON (super-orchestrator); OFF = N GENERAL worker panes, each spanning ALL repos
@@ -692,14 +744,16 @@ async function restoreSessions(saved) {
     const s = {
       repo: ss.repo, title, color, mode: ss.mode || 'dispatch', bypass: !!ss.bypass, autonomous: !!ss.autonomous, planReady: true,
       account: ss.account || null, ghToken: ss.account ? (tokenByAccount[ss.account] || null) : null,
-      repos: ss.repos || null, coordDir: ss.coordDir || null, sharedMulti: !!ss.sharedMulti, integrator: !!ss.integrator, panes: [],
+      repos: ss.repos || null, coordDir: ss.coordDir || null, sharedMulti: !!ss.sharedMulti, integrator: !!ss.integrator,
+      products: !!ss.products, master: !!ss.master, tasks: ss.tasks || null,   // PRODUCTS mode session fields
+      panes: [],
       pending: {}, slugIdx: {}, statusDir: ss.coordDir
         ? path.join(ss.coordDir, '.status')
         : path.join(fleetDir(ss.repo, sid), '.status'), watcher: null,
     };
-    panes.forEach((p) => { s.panes[p.id] = { role: p.role, slug: p.slug, heading: p.heading, dir: p.dir, repo: p.repo, prompt: '', resume: true }; if (p.slug) s.slugIdx[p.slug] = p.id; });
+    panes.forEach((p) => { s.panes[p.id] = { role: p.role, slug: p.slug, heading: p.heading, dir: p.dir, repo: p.repo, product: p.product, tier: p.tier, prompt: '', resume: true }; if (p.slug) s.slugIdx[p.slug] = p.id; });
     sessions[sid] = s;
-    sendAddSession(sid, title, color, panes.map((p) => ({ id: p.id, role: p.role, heading: p.heading })), s.mode, win);
+    sendAddSession(sid, title, color, panes.map((p) => ({ id: p.id, role: p.role, heading: p.heading, product: p.product })), s.mode, win);
     startWatcher(sid);
   });
   nextSid = Math.max(nextSid, maxSid + 1);
@@ -800,6 +854,25 @@ function runIntegratorPlan(sid, coord, repoPaths, count, names) {
       CLAUDE_FLEET_STATUS_DIR: path.join(coord, '.status'),
     });
     execFile(FLEET_CLI, ['--grid-plan-integrator', String(count), ...(names || [])], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
+      if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
+      try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty plan'); resolve(p); } catch (e) { reject(e); }
+    });
+  });
+}
+
+// Products mode (3-tier): shells `--products-plan <N> <task names…>` with the same shared-coordination env as the other
+// multi-repo plans (CLAUDE_FLEET_MULTI/REPOS + the coord's .status). The CLI creates each repo's shared _main + each
+// product's _product branch/checkout and emits the MASTER pane (id 0) followed by one TASK-ORCHESTRATOR pane per product.
+function runProductsPlan(sid, coord, repoPaths, taskNames) {
+  return new Promise((resolve, reject) => {
+    const env = Object.assign({}, process.env, {
+      CLAUDE_FLEET_SESSION: String(sid),
+      CLAUDE_FLEET_REPO: coord,                 // basename → coordination fleet name; not a git repo (multi path skips that check)
+      CLAUDE_FLEET_MULTI: '1',
+      CLAUDE_FLEET_REPOS: repoPaths.join(':'),
+      CLAUDE_FLEET_STATUS_DIR: path.join(coord, '.status'),
+    });
+    execFile(FLEET_CLI, ['--products-plan', String(taskNames.length), ...taskNames], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
       if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
       try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty plan'); resolve(p); } catch (e) { reject(e); }
     });
@@ -971,6 +1044,40 @@ function addGridWorker(sid, name) {
   });
 }
 ipcMain.handle('add-grid-worker', (_e, { sid, name }) => addGridWorker(sid, name));
+
+// Products mode: add ONE more product to a running Products session (no restart). The engine scaffolds the product's
+// _product branch/checkout across every repo and emits a single task-orchestrator pane spec; we push it as a new pane
+// (term-ready → spawnPane). Mirrors addGridWorker but shells `--add-product`; the new pane carries role:'orchestrator',
+// tier:'task', and its product slug so spawnPane sets CLAUDE_FLEET_PRODUCT and Phase-2's sidebar groups it.
+function addProduct(sid, name) {
+  const s = sessions[sid];
+  if (!s || !s.products || !s.coordDir) return Promise.resolve({ ok: false, error: 'not a products session' });
+  if (!s.planReady) return Promise.resolve({ ok: false, error: 'session is still starting — try again in a moment' });
+  const nm = String(name || '').trim();
+  if (!nm) return Promise.resolve({ ok: false, error: 'name required' });
+  const env = Object.assign({}, process.env, {
+    CLAUDE_FLEET_SESSION: String(sid),
+    CLAUDE_FLEET_REPO: s.coordDir,
+    CLAUDE_FLEET_MULTI: '1',
+    CLAUDE_FLEET_REPOS: s.repos.join(':'),
+    CLAUDE_FLEET_STATUS_DIR: path.join(s.coordDir, '.status'),
+  });
+  return new Promise((resolve) => {
+    execFile(FLEET_CLI, ['--add-product', nm], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
+      if (err) return resolve({ ok: false, error: (errOut && errOut.trim()) || err.message });
+      let info; try { info = JSON.parse(out); } catch (_) { return resolve({ ok: false, error: 'bad plan output' }); }
+      if (!info || info.slug == null || s.slugIdx[info.slug] != null) return resolve({ ok: false, error: 'duplicate or invalid product' });
+      const idx = s.panes.length;
+      s.panes.push({ role: info.role || 'orchestrator', tier: info.tier, product: info.product, slug: info.slug, heading: info.heading, dir: info.dir, prompt: info.prompt });
+      s.slugIdx[info.slug] = idx;
+      sendToSid(sid, 'add-pane', { sid, pane: { id: idx, role: info.role || 'orchestrator', heading: info.heading, product: info.product } });
+      if (s.tasks) s.tasks.push(nm);
+      saveState();
+      resolve({ ok: true, heading: info.heading });
+    });
+  });
+}
+ipcMain.handle('add-product', (_e, { sid, name }) => addProduct(sid, name));
 ipcMain.handle('pick-folder', async () => {
   const win = configWin || focusedGridWin() || anyGridWin();
   const r = await dialog.showOpenDialog(win, { title: 'Choose project folder', properties: ['openDirectory', 'createDirectory'], buttonLabel: 'Use this project' });
@@ -1286,6 +1393,10 @@ function answerPane(sid, idx, digit) {
   setTimeout(() => { try { t.write('\r'); } catch (_) {} }, 60);   // commit the selection
   setPaneState(sid, idx, 'working');   // answered → back to working
 }
+// A COORDINATOR pane coordinates + integrates but does not do worker implementation work: the dispatch/gyftalala
+// orchestrator, the Integrator, the Products master, AND a Products task-orchestrator (role 'orchestrator' with a
+// product). They keep MCP + get the full multi context; workers don't. (Push policy is separate — see mayPush.)
+function isCoordinator(role) { return role === 'orchestrator' || role === 'integrator' || role === 'master'; }
 function spawnPane(sid, idx, cols, rows) {
   const s = sessions[sid];
   if (!pty || !s || ptys[`${sid}:${idx}`] || !s.panes[idx]) return;
@@ -1310,7 +1421,10 @@ function spawnPane(sid, idx, cols, rows) {
   // panes. Env var is silently ignored if unsupported, so it can't break the launch.
   // Orchestrator defaults to 'high' (not xhigh) for a faster first dispatch — it can still raise a
   // specific worker to xhigh per-task via `claude-fleet --spawn[-file] … --effort xhigh`.
-  const effort = (p.role === 'orchestrator') ? 'high' : (p.effort || 'high');
+  // Products MASTER runs xhigh (max reasoning for cross-product conflict resolution / integration); the dispatch/gyftalala
+  // orchestrator + Products task-orchestrator run 'high' (faster first dispatch); everything else honors the marker's
+  // per-worker effort (Integrator carries 'xhigh' via p.effort), defaulting to 'high'.
+  const effort = (p.role === 'master') ? 'xhigh' : (p.role === 'orchestrator') ? 'high' : (p.effort || 'high');
   const multi = !!s.coordDir;                        // multi-repo (orchestrated 'gyftalala' OR no-orchestrator 'grid'): shared coord .status
   // paneRepo drives CLAUDE_FLEET_REPO + the CARGO_TARGET_DIR cache. A repo-tagged worker uses its repo; a SHARED-multi
   // grid worker (spans every repo, so no p.repo) anchors to the FIRST selected repo — a REAL git repo/fleet dir, not
@@ -1335,10 +1449,10 @@ function spawnPane(sid, idx, cols, rows) {
   if (s.ghToken) env.GH_TOKEN = s.ghToken;
   if (multi) {
     env.CLAUDE_FLEET_STATUS_DIR = s.statusDir;        // all panes share the coordination .status
-    // The super-orchestrator AND every shared-multi grid worker (each spans all repos) need the full multi context so
-    // their claude-fleet calls (self-push loop, --done) know every repo. A repo-PINNED grid worker (cmd_grid_plan_multi)
-    // deliberately does NOT get these — it owns exactly one repo.
-    if (p.role === 'orchestrator' || s.sharedMulti) {
+    // Every COORDINATOR (orchestrator / integrator / Products master + task-orchestrator) AND every shared-multi grid /
+    // Products worker (each spans all repos) needs the full multi context so its claude-fleet calls (self-push loop,
+    // --done, --ship, --touched) know every repo. A repo-PINNED grid worker (cmd_grid_plan_multi) deliberately does NOT.
+    if (isCoordinator(p.role) || s.sharedMulti) {
       env.CLAUDE_FLEET_MULTI = '1';
       env.CLAUDE_FLEET_REPOS = (s.repos || []).join(':');
     } else {
@@ -1346,10 +1460,14 @@ function spawnPane(sid, idx, cols, rows) {
       // multi flags the app process may carry (e.g. it was launched from inside a fleet pane).
       delete env.CLAUDE_FLEET_MULTI; delete env.CLAUDE_FLEET_REPOS;
     }
+    // PRODUCTS mode: a task-orchestrator + its workers carry the product slug (p.product); it scopes every claude-fleet
+    // verb to that product (branch namespace fleet/s<sid>/<P>, "<P>__*" board slugs). The MASTER pane has NO product (it
+    // sees only top-level product slugs). Non-products multi panes never have p.product, so this is a no-op for them.
+    if (p.product) env.CLAUDE_FLEET_PRODUCT = String(p.product); else delete env.CLAUDE_FLEET_PRODUCT;
   } else {
     // single-repo pane: never inherit multi coordination vars the app process may have inherited (launched from inside
     // a fleet pane) — they'd route this pane's self-signals to the wrong .status or flip the CLI into bogus multi mode.
-    delete env.CLAUDE_FLEET_STATUS_DIR; delete env.CLAUDE_FLEET_MULTI; delete env.CLAUDE_FLEET_REPOS;
+    delete env.CLAUDE_FLEET_STATUS_DIR; delete env.CLAUDE_FLEET_MULTI; delete env.CLAUDE_FLEET_REPOS; delete env.CLAUDE_FLEET_PRODUCT;
   }
   // new-project scratch session: the CLI emits the new-project brief (name → retarget) when this is set.
   if (s.newProject && p.role === 'orchestrator') env.CLAUDE_FLEET_NEW_PROJECT = '1';
@@ -1357,13 +1475,15 @@ function spawnPane(sid, idx, cols, rows) {
   // runs with no prompts for normal work AND no --dangerously-skip-permissions accept screen. Truly unusual verbs
   // (curl/sudo/…) still ask. Dispatch mode: scoped allowlist; only the orchestrator may push. Integrator mode: the
   // Integrator pane owns ALL pushing, workers withhold it (commit + --done, hand off).
-  const mayPush = (p.role === 'orchestrator' || p.role === 'integrator');
+  // PRODUCTS mode: ONLY the MASTER pushes (task-orchestrators + workers withhold push — they commit/integrate + --done/
+  // --merged, and the master ships). Otherwise the orchestrator (dispatch/gyftalala) or Integrator pushes, as before.
+  const mayPush = s.products ? (p.role === 'master') : (p.role === 'orchestrator' || p.role === 'integrator');
   let allowList;
   if (s.bypass) {
     allowList = ALLOW.concat(['Bash(git push:*)', 'Bash(rm:*)']);                 // plain grid worker → self-pushes its area
-  } else if (s.integrator) {
-    // Integrator mode: the Integrator pane may push (+rm); workers get the broad allowlist MINUS push (they commit +
-    // --done and hand off). All panes here are autonomous.
+  } else if (s.integrator || s.products) {
+    // Integrator / Products mode: the pusher (Integrator pane, or Products master) gets push (+rm); everyone else gets
+    // the broad allowlist MINUS push (they commit/integrate + --done/--merged and hand up). All panes here are autonomous.
     allowList = mayPush ? ALLOW.concat(['Bash(git push:*)', 'Bash(rm:*)']) : ALLOW.concat(['Bash(rm:*)']);
   } else {
     allowList = s.autonomous ? ALLOW.concat(mayPush ? ['Bash(git push:*)'] : []) : null;   // dispatch: only the orchestrator pushes
@@ -1378,9 +1498,9 @@ function spawnPane(sid, idx, cols, rows) {
   // restored panes resume their prior conversation in this worktree (Claude's built-in --continue); fresh panes get the prompt
   const cmd = p.resume ? 'claude --continue' : 'claude ' + shQuote(p.prompt);
   // Workers rarely need external MCP servers (playwright/canva/…); connecting them slows every
-  // launch. --strict-mcp-config + no --mcp-config => zero MCP servers. The orchestrator AND the
-  // Integrator keep MCP (they may use it for deploys/verification).
-  const mcpArgs = (p.role === 'orchestrator' || p.role === 'integrator') ? '' : ' --strict-mcp-config';
+  // launch. --strict-mcp-config + no --mcp-config => zero MCP servers. Every COORDINATOR (orchestrator /
+  // Integrator / Products master + task-orchestrator) keeps MCP (they may use it for deploys/verification).
+  const mcpArgs = isCoordinator(p.role) ? '' : ' --strict-mcp-config';
   let term;
   try {
     term = pty.spawn(shell, ['-l', '-c', `exec ${cmd}${mcpArgs}${allowArgs}${permArgs}`], {
@@ -1555,9 +1675,13 @@ function handleSpawn(sid, filename) {
     fsmod.unlink(full, () => {});
     if (info.slug == null || s.slugIdx[info.slug] != null) return;
     const idx = s.panes.length;
-    s.panes.push({ role: 'worker', slug: info.slug, heading: info.heading, dir: info.dir, prompt: info.prompt, effort: info.effort, repo: info.repo });
+    // Role/product/tier are carried by the marker (PRODUCTS mode: a task-orchestrator's workers arrive as
+    // role:'worker' with a "product"; the app's --add-product path spawns role:'orchestrator',tier:'task'). Default
+    // role 'worker' keeps every existing single/gyftalala/integrator spawn byte-identical (no role field → 'worker').
+    const role = info.role || 'worker';
+    s.panes.push({ role, slug: info.slug, heading: info.heading, dir: info.dir, prompt: info.prompt, effort: info.effort, repo: info.repo, product: info.product, tier: info.tier });
     s.slugIdx[info.slug] = idx;
-    sendToSid(sid, 'add-pane', { sid, pane: { id: idx, role: 'worker', heading: info.heading } });
+    sendToSid(sid, 'add-pane', { sid, pane: { id: idx, role, heading: info.heading, product: info.product } });
     saveState();
   });
 }

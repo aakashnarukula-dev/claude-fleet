@@ -31,6 +31,11 @@
 #                          --grid-plan-shared BUT workers COMMIT + --done only (never self-push); ALSO creates each repo's
 #                          _main integration checkout and emits a fixed "Integrator" pane (cwd = coord dir) that
 #                          INCREMENTALLY merges + test-gates + pushes each worker's change into the repos it touched.
+#   --products-plan N NAME… (multi-repo) build a 3-tier PRODUCTS session: a MASTER pane (owns each repo's shared _main +
+#                          all pushing) + one TASK-ORCHESTRATOR pane per named PRODUCT. Each product integrates its own
+#                          workers into fleet/s<sid>/<P>/_product; when ready its --done signals the master, which merges
+#                          _product into every repo's _main, test-gates, and ships. Emits the pane JSON array (master first).
+#   --add-product NAME     (products) add ONE product to a running session; emits a single task-orchestrator pane spec.
 #   --spawn-grid N FILE    (grid mode) open a NEW worker pane N seeded with the brief in FILE (no pane owned it)
 #   --next                 block until a worker is ready; print its slug (or FAILED:<slug>); exit 3 = ALL DONE,
 #                          exit 5 = TIMEOUT (only when CLAUDE_FLEET_NEXT_TIMEOUT>0 seconds is set)
@@ -83,10 +88,45 @@ FLEET="$SESSIONS_DIR/$(basename "$REPO")-fleet${SESSION:+-$SESSION}"        # e.
 STATUS="${CLAUDE_FLEET_STATUS_DIR:-$FLEET/.status}"                         # multi-repo: ONE shared coordination dir; single-repo: per-fleet (unchanged)
 MANIFEST="$STATUS/manifest"
 BR_PREFIX="fleet${SESSION:+/s$SESSION}"                                    # worker branch prefix
+# PRODUCTS mode (3-tier MASTER → TASK-ORCHESTRATOR → WORKERS). CLAUDE_FLEET_PRODUCT=<P>, set by the app on a product's
+# task-orchestrator + its workers, scopes this process to product <P>: branches nest under fleet/s<sid>/<P>, board slugs
+# carry the "<P>__" prefix, and manifest/board scans filter to that product. UNSET (single/gyftalala/integrator/master
+# context) → everything behaves EXACTLY as before (add-only, guarded on this var). The master pane runs with it UNSET
+# and sees only TOP-LEVEL product slugs (no "__"). See the Products-mode section near cmd_products_plan.
+PRODUCT="${CLAUDE_FLEET_PRODUCT:-}"
+[ -n "$PRODUCT" ] && BR_PREFIX="$BR_PREFIX/$PRODUCT"                        # product context: branches nest under the product
 DBR="main"                                                                 # default branch, set by set_default_branch
 
 die() { printf 'claude-fleet: %s\n' "$*" >&2; exit 1; }
 slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'; }
+
+# ── Products-mode slug/branch/scope helpers (all NO-OP when CLAUDE_FLEET_PRODUCT is unset) ──────────────────────────
+# board slug ↔ git branch bijection. A product worker's BOARD slug is "<P>__<localslug>"; its git BRANCH is
+# "fleet/s<sid>/<P>/<localslug>" (BR_PREFIX already carries "/<P>" in product context). Outside products the two coincide.
+slug_branch() { # <board-slug> -> its git branch
+  local s="$1"
+  if [ -n "$PRODUCT" ]; then printf '%s/%s\n' "$BR_PREFIX" "${s#"${PRODUCT}__"}"; else printf '%s/%s\n' "$BR_PREFIX" "$s"; fi
+}
+branch_slug() { # <git-branch> -> its BOARD slug (returns non-zero if not a $BR_PREFIX/* worker branch)
+  local br="$1" local_slug
+  case "$br" in "$BR_PREFIX"/*) local_slug="${br#"$BR_PREFIX"/}" ;; *) return 1 ;; esac
+  [ -n "$local_slug" ] || return 1
+  if [ -n "$PRODUCT" ]; then printf '%s__%s\n' "$PRODUCT" "$local_slug"; else printf '%s\n' "$local_slug"; fi
+}
+# Is this a products coordination board? (the master coord's shared .status carries a `tasks` marker.)
+is_products_board() { [ -f "$STATUS/tasks" ]; }
+# Should a manifest/board slug be VISIBLE in the current context? PRODUCT set → only that product's workers ("<P>__*");
+# master context on a products board (PRODUCT unset + tasks marker) → only TOP-LEVEL product slugs (no "__"); ordinary
+# board (no products) → EVERY slug (unchanged — ordinary slugs never contain "__" since slugify collapses to "-").
+slug_in_scope() { # <slug>
+  local s="$1"
+  if [ -n "$PRODUCT" ]; then
+    case "$s" in "${PRODUCT}__"*) return 0 ;; *) return 1 ;; esac
+  elif is_products_board; then
+    case "$s" in *__*) return 1 ;; *) return 0 ;; esac
+  fi
+  return 0
+}
 json_str() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"; }   # JSON-encode a string
 
 has_origin() { git -C "$REPO" remote get-url origin >/dev/null 2>&1; }
@@ -726,6 +766,115 @@ Wait for the workers.
 EOF
 }
 
+# ── PRODUCTS mode (3-tier): MASTER → TASK-ORCHESTRATOR (one per product) → WORKERS ──────────────────────────────────
+# The MASTER is the Integrator pattern lifted one tier: it OWNS each repo's shared _main and is the ONLY pusher. Its
+# "workers" are whole PRODUCTS (top-level slugs, no "__"); a product is READY when its task-orchestrator runs --done.
+spawn_master_prompt() { # coord_dir
+  local coord="$1" r names="" sbr="fleet${SESSION:+/s$SESSION}" IFS=:
+  for r in $REPOS_LIST; do names="$names\n  - $(basename "$r")  ($r)  _main: $SESSIONS_DIR/$(basename "$r")-fleet${SESSION:+-$SESSION}/_main"; done
+  cat <<EOF
+You are the MASTER (admin) for a 3-tier Products-mode Claude Fleet run. The hierarchy is MASTER → one TASK-ORCHESTRATOR
+per PRODUCT → that product's WORKERS. You do NOT implement, you do NOT split products into work, and you do NOT spawn
+workers — the USER adds products, and each product's own task-orchestrator decomposes + drives itself. YOU own exactly
+one thing: conflict-checking across products, merging each READY product into every repo's shared _main, test-gating,
+and PUSHING to origin. You are the ONLY pusher in the whole run.
+
+Repos you own (each has ONE shared _main integration checkout — MASTER-owned merge target + push source):$(printf '%b' "$names")
+
+Your cwd is the coordination dir ${coord}. Each product P integrates its own workers into a per-product branch
+${sbr}/<P>/_product (NOT into _main). When product P is ready its task-orchestrator runs \`claude-fleet --done\`, which
+surfaces P to you as a ready TOP-LEVEL slug. A product behaves like a "super-worker": you land it exactly the way the
+Integrator lands a worker, but at PRODUCT granularity and by merging its _product branch.
+
+INCREMENTAL LOOP — do NOT wait for all products; land each product the moment it's green (auto-ship each product):
+1. WAIT:  export CLAUDE_FLEET_WATCH_NEEDS=1  then  claude-fleet --watch  (blocks; prints a ready product slug S, or
+   FAILED:S, or NEED:S). You see ONLY top-level product slugs (worker slugs "<P>__…" are the task-orchestrators' concern).
+2. See everything ready + the overlap radar:  claude-fleet --ready  (products ready now) then  claude-fleet --conflicts
+   (files touched by MORE THAN ONE unmerged product — paths are repo-namespaced <repo>/<path>, so this spans all repos).
+3. For each ready product S, find WHICH repos it changed:  claude-fleet --touched S  (basenames whose ${sbr}/S/_product
+   branch is ahead of that repo's _main — the ONLY repos to touch for S). If it prints NOTHING → nothing to ship, just
+   run  claude-fleet --merged S  and go back to step 1 (do NOT call --ship with no repos).
+4. NON-OVERLAPPING product (S shares no file with any other unmerged product per --conflicts) → LAND IT NOW. Per-product
+   integration is ATOMIC across the repos S touched (all land + push, or none):
+     a. RECORD each touched repo R's _main pre-merge tip:  cd <R's _main path above>  then note  git rev-parse HEAD  as R_PRE.
+     b. MERGE S into EACH touched repo:  cd <R's _main>  then  git merge --no-ff ${sbr}/S/_product
+        On conflict, read BOTH sides — git log --oneline HEAD..${sbr}/S/_product — and resolve preserving intent.
+     c. TEST-GATE every touched repo with its build/test (per R's CLAUDE.md; run any cache-bust/build step).
+     d. GREEN → PUSH the changeset ATOMICALLY, ONLY the repos S touched:  claude-fleet --ship <touched repo basenames…>
+        (dry-runs each, pushes all-or-none, resumable). Then:  claude-fleet --merged S .
+     e. RED (any touched repo fails) OR an unresolvable conflict → push NOTHING and BACK OUT S from EVERY repo whose
+        _main you advanced: for each such R,  cd <R's _main>  then  git reset --hard <that repo's R_PRE>  (the recorded
+        tip, NOT HEAD@{1}). Then DEFER S so it can't head-of-line-block:  claude-fleet --hold S , print "✗ HELD S —
+        <failure>", tell the user in THIS pane, and go back to step 1. When the user re-tasks the product, its task-
+        orchestrator re-signals --done → the hold AUTO-CLEARS and S re-arms.
+5. OVERLAPPING products (--conflicts shows S and a sibling touch the same file) → SERIALIZE just those: land ONE AT A
+   TIME with the SAME atomic discipline as step 4 (record each _main tip → merge → test-gate all → GREEN: --ship + --merged;
+   RED/unresolvable: reset every advanced _main + --hold + step 1). Merge the non-overlapping rest freely.
+6. GENUINE DOUBT about intent (a conflict you cannot confidently resolve, ambiguous overlapping requirements) → do NOT
+   guess, do NOT push: PRINT a clear, specific question in THIS pane and WAIT for the user, then resolve + ship.
+7. FAILED:S → that product's task-orchestrator gave up: do NOT merge; print "✗ FAILED:S — <reason>"; claude-fleet --hold S.
+   NEED:S → a product recorded a prerequisite/follow-up ( claude-fleet --needs ): you do NOT spawn — relay it to the user;
+   once handled  claude-fleet --need-clear S .
+8. Back to step 1.
+(OPT-OUT — CLAUDE_FLEET_HOLD_MAIN=1: do the merges + test-gates but HOLD every push; do NOT --ship per product. Ship the
+ whole set only when the user says "ship it" — then --ship each ready product's touched repos. Set this when running
+ PARALLEL sessions on these repos so origin/main moves only on one final reviewed pass.)
+
+Wait for the user to add products.
+EOF
+}
+
+# The per-product TASK-ORCHESTRATOR: essentially the multi-repo orchestrator, but PRODUCT-SCOPED (CLAUDE_FLEET_PRODUCT=<P>)
+# — its verbs only see product <P>'s workers ("<P>__*"), it integrates workers into <P>/_product (NOT _main), it NEVER
+# pushes, and instead of --ship-all it runs  claude-fleet --done  to signal the MASTER that product <P> is ready.
+spawn_task_orchestrator_prompt() { # <P> <coord>
+  local P="$1" coord="$2" r bases="" sbr="fleet${SESSION:+/s$SESSION}" IFS=:
+  for r in $REPOS_LIST; do bases="$bases${bases:+, }$(basename "$r")"; done
+  cat <<EOF
+You are the TASK-ORCHESTRATOR for product "${P}" in a 3-tier Products-mode Claude Fleet run (MASTER → you → your workers).
+You coordinate ONE product across ALL these repos and hand the finished product UP to the master. You COORDINATE, you
+NEVER implement feature code, and you NEVER push — the master owns all pushing.
+
+Repos this product spans: ${bases}. Your cwd is ${coord}/products/${P} — it holds ONE sub-dir per repo, each that repo's
+per-product INTEGRATION checkout on branch ${sbr}/${P}/_product (this is where you merge your workers' branches; the
+master later merges each ${sbr}/${P}/_product into that repo's shared _main and pushes it).
+
+Your claude-fleet verbs are PRODUCT-SCOPED (CLAUDE_FLEET_PRODUCT=${P} is exported for you): --next / --ready / --conflicts
+/ --spawn-file / --merged / --needs only ever see + act on THIS product's workers, which appear on the board as
+"${P}__<slug>". Other products + the master are invisible to you.
+
+HOW TO WORK THE PRODUCT (repeat this whole cycle for every requirement the user types into this pane):
+1. Decompose the product across the repos; map cross-repo DEPENDENCIES into PHASES (if repo B consumes a contract repo A
+   produces, A is an EARLIER phase). Every worker is cut from the LATEST ${sbr}/${P}/_product tip, so later-phase workers
+   build on earlier ones.
+2. Spawn one SPANNING worker per slice (each spans ALL repos, COMMITS + --done only, NEVER pushes):
+     write the brief to /tmp/cfleet_<slug>.txt (Write tool), then
+     claude-fleet --spawn-file "<heading>" /tmp/cfleet_<slug>.txt [--effort <low|medium|high|xhigh>]
+   The worker lands on the board as "${P}__<slug>". PLAIN literal args only — no \$(...), backticks, or pipes. Fan out all
+   independent slices in one phase; hold dependents for a later phase.
+3. DRAIN:  claude-fleet --next  (blocks; prints a ready worker slug S = "${P}__<name>", or FAILED:S). For each ready S:
+     claude-fleet --ready       → every ready worker.  claude-fleet --conflicts → files >1 worker touched (overlap radar).
+     claude-fleet --touched S   → the repos S changed (ahead of this product's _product). The worker's board slug
+                                  "${P}__<name>" maps to git branch ${sbr}/${P}/<name>.
+     For each touched repo R:  cd R  (a sub-dir of your cwd = that repo's _product checkout)  then
+       git merge --no-ff ${sbr}/${P}/<name>    (on conflict read both sides — git log --oneline HEAD..${sbr}/${P}/<name> — resolve preserving intent).
+     Verify each touched repo (its build/test per R's CLAUDE.md). Then:  claude-fleet --merged S .
+   FAILED:S → do NOT merge; re-plan;  claude-fleet --merged S  to clear.  claude-fleet --needs → schedule any prerequisite
+   a worker recorded ( claude-fleet --need-clear <slug> once handled).
+   ALL DONE (exit 3) = the current phase is integrated into ${sbr}/${P}/_product in every repo. More phases → back to step 2
+   (later workers see the integrated foundation). Otherwise → step 4.
+4. SIGNAL THE MASTER (you NEVER push): when the product is fully integrated into its _product branches, run EXACTLY:
+     claude-fleet --done
+   This tells the MASTER product "${P}" is ready; it merges each ${sbr}/${P}/_product into that repo's shared _main, test-
+   gates, and pushes — incrementally, without waiting for the other products. Do NOT run --ship / --ship-all (that's the
+   master's job).
+5. Report a per-repo summary for this product, then  export CLAUDE_FLEET_WATCH_NEEDS=1 ; claude-fleet --watch  and wait for
+   the user's next requirement for "${P}". Repeat the whole cycle with fresh workers.
+
+Wait for the user's requirement for this product.
+EOF
+}
+
 # ---------------------------------------------------------------- subcommands
 
 # emit JSON for the solo orchestrator pane; creates the _main detached worktree and detects whether to seed memory
@@ -869,7 +1018,17 @@ cmd_touched() { # <slug>
   [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--touched is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
   [ -n "$REPOS_LIST" ] || die "--touched needs CLAUDE_FLEET_REPOS"
   local slug="${1:-}"; [ -n "$slug" ] || die "--touched needs a slug"
-  local r odir head n branch="$BR_PREFIX/$slug" IFS=:
+  # Resolve the branch to compare + the baseline it must be ahead of, per context (add-only; ordinary path unchanged):
+  #   • PRODUCT set (task-orchestrator): worker slug "<P>__<x>" → branch fleet/s<sid>/<P>/<x>, baseline = this product's
+  #     _product branch (repos where the worker is ahead of _product are the ones to merge into _product).
+  #   • master on a products board (PRODUCT unset + tasks marker): product slug "<P>" → branch fleet/s<sid>/<P>/_product,
+  #     baseline = _main HEAD (repos where the product is ahead of the shared _main are the ones to merge + ship).
+  #   • ordinary (single/gyftalala/integrator): branch fleet/s<sid>/<slug>, baseline = _main HEAD (unchanged).
+  local branch baseline
+  if [ -n "$PRODUCT" ]; then branch="$(slug_branch "$slug")"; baseline="refs/heads/$BR_PREFIX/_product"
+  elif is_products_board; then branch="$BR_PREFIX/$slug/_product"; baseline="HEAD"
+  else branch="$BR_PREFIX/$slug"; baseline="HEAD"; fi
+  local r odir head n IFS=:
   for r in $REPOS_LIST; do
     [ -n "$r" ] || continue
     select_repo "$r"; odir="$FLEET/_main"
@@ -877,7 +1036,8 @@ cmd_touched() { # <slug>
     git -C "$odir" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || continue
     head="$(git -C "$odir" rev-parse --verify --quiet HEAD || true)"
     [ -n "$head" ] || continue
-    n="$(git -C "$odir" rev-list --count "HEAD..refs/heads/$branch" 2>/dev/null || echo 0)"
+    git -C "$odir" rev-parse --verify --quiet "$baseline" >/dev/null 2>&1 || continue
+    n="$(git -C "$odir" rev-list --count "$baseline..refs/heads/$branch" 2>/dev/null || echo 0)"
     if [ "${n:-0}" -gt 0 ]; then printf '%s\n' "$(basename "$REPO")"; fi
   done
 }
@@ -891,6 +1051,9 @@ _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
   [ -n "$heading" ] || die "spawn needs <heading> <task>"
   [ -n "$task" ] || die "spawn needs a non-empty <task> (worker for '$heading' has no brief)"
   [ -d "$STATUS" ] || die "no active session"
+  # PRODUCTS mode: a task-orchestrator spawns SPANNING, commit-only workers (across ALL repos) scoped to its product —
+  # different worktree shape (per-repo worktree + workspace symlink dir) than a single-repo/gyftalala worker.
+  if [ -n "$PRODUCT" ]; then _do_spawn_product "$heading" "$task" "$effort"; return; fi
   local slug base k=2 branch dir
   slug="$(slugify "$heading")"; [ -n "$slug" ] || slug="worker"; base="$slug"
   # Multi-repo: cut this worker's worktree from the requested repo's fleet (FLEET re-points to <repo>-fleet-<sid>).
@@ -924,6 +1087,68 @@ _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
     "$(json_str "$(spawn_worker_prompt "$heading" "$slug" "$dir" "$task")")" "$effort_field" "$repo_field" > "$STATUS/$slug.spawn.tmp"
   mv -f "$STATUS/$slug.spawn.tmp" "$STATUS/$slug.spawn"
   printf 'Spawned worker "%s" (%s).\n' "$heading" "$slug"
+}
+
+# PRODUCTS mode: is a candidate BOARD slug already taken? (on the manifest, or as a worktree dir in ANY member fleet).
+_product_slug_taken() { # <board-slug>
+  grep -qx "$1" "$MANIFEST" 2>/dev/null && return 0
+  local r IFS=:
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    [ -e "$SESSIONS_DIR/$(basename "${r%/}")-fleet${SESSION:+-$SESSION}/$1" ] && return 0
+  done
+  return 1
+}
+
+# PRODUCTS mode: spawn ONE spanning, commit-only worker for the current product (PRODUCT set). Mirrors ONE iteration of
+# cmd_grid_plan_integrator's worker build (a worktree per repo on fleet/s<sid>/<P>/<localslug> + a per-pane workspace dir
+# symlinking each repo, used as cwd), EXCEPT: (a) branch/board slug are product-namespaced (board "<P>__<localslug>",
+# branch fleet/s<sid>/<P>/<localslug>), (b) each worktree is cut from that repo's <P>/_product tip (so later workers in
+# the product build on earlier ones), (c) it writes a .spawn marker (async, watcher-consumed) carrying "role":"worker" +
+# "product":"<P>", and (d) the worker prompt is the integrator/commit-only worker (commit + --done, NEVER push).
+_do_spawn_product() { # <heading> <task> <effort>
+  local heading="$1" task="$2" effort="$3"
+  [ -n "$REPOS_LIST" ] || die "products worker needs CLAUDE_FLEET_REPOS"
+  local coord; coord="$(dirname "$STATUS")"
+  local prefix="${PRODUCT}__" local_slug base_local k=2 board_slug branch
+  local_slug="$(slugify "$heading")"; [ -n "$local_slug" ] || local_slug="worker"; base_local="$local_slug"
+  while _product_slug_taken "$prefix$local_slug"; do local_slug="$base_local-$k"; k=$((k + 1)); done
+  board_slug="$prefix$local_slug"; branch="$BR_PREFIX/$local_slug"   # BR_PREFIX already carries "/<P>" in product context
+  local r rbase wdir first_repo="" pbase IFS=:
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    [ -d "$r/.git" ] || die "not a git repository: $r"
+    select_repo "$r"; rbase="$(basename "$REPO")"
+    [ -n "$first_repo" ] || first_repo="$REPO"
+    wdir="$FLEET/$board_slug"
+    # cut from this repo's <P>/_product tip (later workers build on earlier); fall back to _main HEAD → origin/DBR → DBR.
+    pbase="$(git -C "$REPO" rev-parse --verify --quiet "refs/heads/$BR_PREFIX/_product" 2>/dev/null || true)"
+    [ -n "$pbase" ] || pbase="$(git -C "$FLEET/_main" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+    if [ -d "$wdir" ]; then :
+    elif git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$REPO" worktree add "$wdir" "$branch" >&2
+    elif [ -n "$pbase" ]; then
+      git -C "$REPO" worktree add -b "$branch" "$wdir" "$pbase" >/dev/null 2>&1 \
+        || git -C "$REPO" worktree add -b "$branch" "$wdir" "$DBR" >&2
+    else
+      git -C "$REPO" worktree add -b "$branch" "$wdir" "origin/$DBR" >/dev/null 2>&1 \
+        || git -C "$REPO" worktree add -b "$branch" "$wdir" "$DBR" >&2
+    fi
+    link_shared_dirs "$wdir"
+    mkdir -p "$coord/workers/$board_slug"
+    ln -sfn "$wdir" "$coord/workers/$board_slug/$rbase"   # the pane's cwd exposes this repo as ./<basename>
+  done
+  printf '%s\n' "$board_slug" >> "$MANIFEST"
+  rm -f "$STATUS/$board_slug.done" "$STATUS/$board_slug.merged" "$STATUS/$board_slug.closed" "$STATUS/$board_slug.working" "$STATUS/$board_slug.held"
+  printf '%s\n' "$first_repo" > "$STATUS/$board_slug.repo"   # sidecar → first member (any works for --handoff liveness)
+  local wsdir="$coord/workers/$board_slug"
+  local effort_field=""; [ -n "$effort" ] && effort_field=",\"effort\":$(json_str "$effort")"
+  # atomic tmp+mv so the app's fs.watch never reads a truncated marker; role/product tell handleSpawn how to launch it.
+  printf '{"slug":%s,"heading":%s,"dir":%s,"role":"worker","product":%s,"prompt":%s%s}' \
+    "$(json_str "$board_slug")" "$(json_str "$heading")" "$(json_str "$wsdir")" "$(json_str "$PRODUCT")" \
+    "$(json_str "$(integrator_worker_prompt "$heading" "$board_slug" "$wsdir" "$task")")" "$effort_field" > "$STATUS/$board_slug.spawn.tmp"
+  mv -f "$STATUS/$board_slug.spawn.tmp" "$STATUS/$board_slug.spawn"
+  printf 'Spawned product worker "%s" (%s) for product "%s".\n' "$heading" "$board_slug" "$PRODUCT"
 }
 
 # validate + capture an optional "--effort LEVEL" flag from a spawn subcommand's args, in a position-tolerant way
@@ -980,6 +1205,7 @@ cmd_handoff() { # <target-pane> <task-file>
   [ -f "$path" ] || die "task file not found: $path"
   [ -d "$STATUS" ] || die "no active fleet"
   local slug; slug="$(slugify "$target")"
+  [ -n "$PRODUCT" ] && slug="${PRODUCT}__$slug"   # PRODUCTS: sibling workers appear on the board as "<P>__<slug>"
   grep -qx "$slug" "$MANIFEST" 2>/dev/null \
     || die "no sibling pane '$target' (slug '$slug') in this fleet — handoff CANNOT deliver; spawn a FRESH worker for this brief instead. (panes: claude-fleet --statuses)"
   # If the slug was spawned into a specific repo, point FLEET at that repo's fleet so the worktree-liveness check
@@ -1004,33 +1230,72 @@ cmd_handoff() { # <target-pane> <task-file>
   # "[ALREADY HANDED OFF → <slug>]" so the orchestrator tracks without re-telling.
   local src_branch src_slug
   src_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-  case "$src_branch" in
-    "$BR_PREFIX"/*) src_slug="${src_branch#"$BR_PREFIX"/}"; printf '%s\n' "$slug" >> "$STATUS/$src_slug.handoff_to" ;;
-  esac
+  if src_slug="$(branch_slug "$src_branch" 2>/dev/null)"; then printf '%s\n' "$slug" >> "$STATUS/$src_slug.handoff_to"; fi
   printf 'Handed off to "%s" (%s) — RE-ARMED as tracked pending work; it will run this now, then re-signal --done.\n' "$target" "$slug"
+}
+
+# PRODUCTS mode: the task-orchestrator's --done signals the MASTER that product <P> is READY (a top-level slug). It runs
+# from the task-orchestrator's cwd (the coord/products/<P> dir — NOT a worker worktree), so it computes <P>.claims from
+# each repo's <P>/_product branch vs that repo's shared _main (namespaced <repo-basename>/<path>), then touches <P>.done.
+_product_done() { # <P>
+  local P="$1"
+  local slug="$P" pbranch="$BR_PREFIX/_product"   # BR_PREFIX carries "/<P>" here → fleet/s<sid>/<P>/_product (split local: same-line "slug=$P" wouldn't see P under set -u)
+  rm -f "$STATUS/$slug.merged" "$STATUS/$slug.failed" "$STATUS/$slug.handoff" "$STATUS/$slug.working" "$STATUS/$slug.held"
+  local r odir rbase mb claims_tmp="$STATUS/$slug.claims.tmp" IFS=:
+  : > "$claims_tmp"
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    select_repo "$r"; odir="$FLEET/_main"; rbase="$(basename "$REPO")"
+    [ -d "$odir" ] || continue
+    git -C "$odir" rev-parse --verify --quiet "refs/heads/$pbranch" >/dev/null 2>&1 || continue
+    mb="$(git -C "$odir" merge-base HEAD "refs/heads/$pbranch" 2>/dev/null || true)"
+    [ -n "$mb" ] || continue
+    git -C "$odir" diff --name-only "$mb" "refs/heads/$pbranch" 2>/dev/null \
+      | while IFS= read -r f; do [ -n "$f" ] && printf '%s/%s\n' "$rbase" "$f"; done >> "$claims_tmp"
+  done
+  mv -f "$claims_tmp" "$STATUS/$slug.claims"
+  touch "$STATUS/$slug.done"
+  printf 'Product "%s" READY — signalled the master (it will merge %s/_product into each repo'\''s _main, test-gate, and push).\n' "$P" "$BR_PREFIX"
 }
 
 cmd_done() {
   [ -d "$STATUS" ] || die "no active fleet"
+  # PRODUCTS mode: distinguish a task-orchestrator's product-level --done from a worker's --done. Both run with PRODUCT
+  # set; the difference is WHERE: a worker is inside its git worktree on branch fleet/s<sid>/<P>/<x>; the task-orchestrator
+  # runs from the coord/products/<P> dir (not a worker branch). Route product-level → _product_done (top-level slug <P>).
+  if [ -n "$PRODUCT" ]; then
+    local wbranch; wbranch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    case "$wbranch" in
+      "$BR_PREFIX"/_product) : ;;         # inside the _product checkout itself → product-level
+      "$BR_PREFIX"/?*) wbranch="worker" ;; # inside a worker worktree → worker-level (fall through below)
+      *) : ;;                              # coord dir / elsewhere → product-level
+    esac
+    if [ "$wbranch" != "worker" ]; then _product_done "$PRODUCT"; return; fi
+  fi
   local branch slug
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
-  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  slug="$(branch_slug "$branch")" || die "branch '$branch' is not a $BR_PREFIX/* worker"
   rm -f "$STATUS/$slug.merged" "$STATUS/$slug.failed" "$STATUS/$slug.handoff" "$STATUS/$slug.working" "$STATUS/$slug.held"   # re-arm; supersedes prior FAILED; clears any outstanding handoff; clears the app's live .working bridge; clears a Integrator .held defer (a re-tasked worker re-arms as live pending work — Fix 1)
   # P3: auto-record files this worker touched so the orchestrator/Integrator can detect cross-branch overlaps (--conflicts).
   # MULTI-REPO (Fix 3): a worker spans several repos but runs --done ONCE from a single repo sub-dir, so a plain single-repo
   # `git diff` here would see only THAT repo — missing cross-repo overlaps AND false-positiving on same-named files in
   # different repos (paths carry no repo). Instead compute claims across EVERY repo the worker's branch changed, each file
-  # NAMESPACED as <repo-basename>/<path> (union), mirroring cmd_touched's "branch ahead of that repo's _main" logic. The
-  # single-repo path (no CLAUDE_FLEET_MULTI/REPOS_LIST) is UNCHANGED.
+  # NAMESPACED as <repo-basename>/<path> (union), mirroring cmd_touched's "branch ahead of that repo's _main" logic. In
+  # PRODUCT context the baseline is that repo's <P>/_product tip (so a worker only claims what IT added atop the product,
+  # not sibling workers already merged). The single-repo path (no CLAUDE_FLEET_MULTI/REPOS_LIST) is UNCHANGED.
   if [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] && [ -n "$REPOS_LIST" ]; then
-    local r odir rbase mb claims_tmp="$STATUS/$slug.claims.tmp" IFS=:
+    local r odir rbase mb pref="refs/heads/$BR_PREFIX/_product" claims_tmp="$STATUS/$slug.claims.tmp" IFS=:
     : > "$claims_tmp"
     for r in $REPOS_LIST; do
       [ -n "$r" ] || continue
       select_repo "$r"; odir="$FLEET/_main"; rbase="$(basename "$REPO")"
       [ -d "$odir" ] || continue
       git -C "$odir" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || continue
-      mb="$(git -C "$odir" merge-base HEAD "refs/heads/$branch" 2>/dev/null || true)"
+      if [ -n "$PRODUCT" ] && git -C "$odir" rev-parse --verify --quiet "$pref" >/dev/null 2>&1; then
+        mb="$(git -C "$odir" merge-base "$pref" "refs/heads/$branch" 2>/dev/null || true)"   # product context: baseline = <P>/_product tip
+      else
+        mb="$(git -C "$odir" merge-base HEAD "refs/heads/$branch" 2>/dev/null || true)"      # ordinary multi: baseline = _main HEAD
+      fi
       [ -n "$mb" ] || continue
       git -C "$odir" diff --name-only "$mb" "refs/heads/$branch" 2>/dev/null \
         | while IFS= read -r f; do [ -n "$f" ] && printf '%s/%s\n' "$rbase" "$f"; done >> "$claims_tmp"
@@ -1054,6 +1319,7 @@ cmd_next() {
     pending=""; failed=""; all_merged=1
     while IFS= read -r s; do
       [ -n "$s" ] || continue
+      slug_in_scope "$s" || continue   # PRODUCTS: task-orch sees only its "<P>__*" workers; master sees only top-level products (no-op on ordinary boards)
       # A CLOSED pane (window closed / pty died; app dropped <slug>.closed) is DEAD — its claude can no longer signal
       # --done. Treat it like merged: skip it so it neither blocks --next nor keeps ALL DONE from firing. (Don't report
       # it as work; the orchestrator should spawn fresh if it still needs that thread.)
@@ -1096,6 +1362,7 @@ cmd_watch() {
   while true; do
     while IFS= read -r s; do
       [ -n "$s" ] || continue
+      slug_in_scope "$s" || continue   # PRODUCTS scope filter (no-op on ordinary boards)
       # A CLOSED pane is DEAD — skip it so it neither wakes the watcher (stale .done/.failed) nor blocks. (Mirrors --next.)
       [ -f "$STATUS/$s.closed" ] && continue
       # A .held worker was DEFERRED by the Integrator (un-landable) — skip it so it can't head-of-line-block the queue;
@@ -1164,6 +1431,7 @@ cmd_ready() {
   local s
   while IFS= read -r s; do
     [ -n "$s" ] || continue
+    slug_in_scope "$s" || continue   # PRODUCTS scope filter (no-op on ordinary boards)
     [ -f "$STATUS/$s.merged" ] && continue
     [ -f "$STATUS/$s.held" ] && continue   # Integrator-deferred (un-landable) — not ready to integrate; re-armed by a fresh --done (Fix 1)
     [ -f "$STATUS/$s.failed" ] && continue
@@ -1177,7 +1445,7 @@ cmd_failed() {
   [ -d "$STATUS" ] || die "no active fleet"
   local branch slug
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
-  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  slug="$(branch_slug "$branch")" || die "branch '$branch' is not a $BR_PREFIX/* worker"   # PRODUCTS: maps to board slug "<P>__<x>"
   rm -f "$STATUS/$slug.done" "$STATUS/$slug.handoff"   # a failed worker surfaces via FAILED:<slug>; no outstanding handoff left to track
   touch "$STATUS/$slug.failed"
   printf 'Marked "%s" FAILED. Orchestrator will re-plan instead of waiting.\n' "$slug"
@@ -1190,6 +1458,7 @@ cmd_conflicts() {
   local s f
   while IFS= read -r s; do
     [ -n "$s" ] || continue
+    slug_in_scope "$s" || continue   # PRODUCTS: overlap radar spans only in-scope slugs (master → across products; task-orch → across its workers)
     [ -f "$STATUS/$s.merged" ] && continue
     [ -f "$STATUS/$s.claims" ] || continue
     while IFS= read -r f; do [ -n "$f" ] && printf '%s\t%s\n' "$f" "$s"; done < "$STATUS/$s.claims"
@@ -1205,7 +1474,7 @@ cmd_need() {
   [ -n "${1:-}" ] || die "--need needs a description"
   local branch slug
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
-  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  slug="$(branch_slug "$branch")" || die "branch '$branch' is not a $BR_PREFIX/* worker"   # PRODUCTS: maps to board slug "<P>__<x>"
   printf '%s\n' "$1" > "$STATUS/$slug.need"
   printf 'Recorded need for "%s": %s\n' "$slug" "$1"
 }
@@ -1221,6 +1490,7 @@ cmd_needs() {
   local s tag hoff
   while IFS= read -r s; do
     [ -n "$s" ] || continue
+    slug_in_scope "$s" || continue   # PRODUCTS scope filter (no-op on ordinary boards)
     [ -f "$STATUS/$s.need" ] || continue
     [ -f "$STATUS/$s.merged" ] && tag=" (post-merge follow-up)" || tag=""
     hoff=""
@@ -1247,7 +1517,7 @@ cmd_unneed() {
   [ -d "$STATUS" ] || die "no active fleet"
   local branch slug
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
-  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  slug="$(branch_slug "$branch")" || die "branch '$branch' is not a $BR_PREFIX/* worker"   # PRODUCTS: maps to board slug "<P>__<x>"
   rm -f "$STATUS/$slug.need" "$STATUS/$slug.handoff_to"
   printf 'Retracted need for "%s".\n' "$slug"
 }
@@ -1258,7 +1528,7 @@ cmd_status() {
   [ -n "${1:-}" ] || die "--status needs a message"
   local branch slug
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
-  case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
+  slug="$(branch_slug "$branch")" || die "branch '$branch' is not a $BR_PREFIX/* worker"   # PRODUCTS: maps to board slug "<P>__<x>"
   printf '%s\n' "$1" > "$STATUS/$slug.status"
   printf 'Status for "%s": %s\n' "$slug" "$1"
 }
@@ -1269,6 +1539,7 @@ cmd_statuses() {
   local s st
   while IFS= read -r s; do
     [ -n "$s" ] || continue
+    slug_in_scope "$s" || continue   # PRODUCTS: task-orch shows only its workers; master shows only products (no-op on ordinary boards)
     # A CLOSED pane is DEAD (window closed / pty died) — surface it as such so the orchestrator spawns fresh instead of
     # waiting on or handing off to it. Shown even if a stale .merged lingers.
     if [ -f "$STATUS/$s.closed" ]; then printf '%s: %s\n' "$s" "(closed)"; continue; fi
@@ -1547,6 +1818,51 @@ gc_one_coord() { # <coord-dir> <sid>
   return 0
 }
 
+# gc_one_products reaps a PRODUCTS master coordination dir (products-master-fleet-<sid>, flagged by .status/tasks). Same
+# semantics as gc_one_coord (holds only .status; reaped only once every member fleet listed in .status/members is gone —
+# so a member kept by gc_one_session's G3 keeps this too), but a DIFFERENT path assertion (products-master-fleet naming).
+# Prints exactly one "REMOVED <dir>" / "SKIP <dir> (<reason>)" line. Returns 0 on remove, 1 on skip (non-fatal).
+gc_one_products() { # <coord-dir> <sid>
+  local gdir="$1" sid="$2" m left=0
+  case "$gdir" in
+    ""|"$HOME"|"$HOME"/|/|"$SESSIONS_DIR"|"$SESSIONS_DIR"/) printf 'SKIP %s (not a products coord dir)\n' "$gdir"; return 1 ;;
+  esac
+  case "$gdir" in
+    "$SESSIONS_DIR"/products-master-fleet|"$SESSIONS_DIR"/products-master-fleet-*) : ;;
+    *) printf 'SKIP %s (does not look like a products coordination dir)\n' "$gdir"; return 1 ;;
+  esac
+  [ -f "$gdir/.status/tasks" ] || { printf 'SKIP %s (no tasks marker)\n' "$gdir"; return 1; }
+  [ -f "$gdir/.status/members" ] || { printf 'SKIP %s (no members marker)\n' "$gdir"; return 1; }
+
+  case ":${CLAUDE_FLEET_GC_EXCLUDE:-}:" in *":$gdir:"*) printf 'SKIP %s (excluded by caller)\n' "$gdir"; return 1 ;; esac
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    printf 'SKIP %s (cannot verify liveness — lsof unavailable)\n' "$gdir"; return 1
+  fi
+  if gc_is_live "$gdir"; then printf 'SKIP %s (products coordination dir appears LIVE)\n' "$gdir"; return 1; fi
+
+  case "$PWD/" in "$gdir"/*) printf 'SKIP %s (cwd is INSIDE this session — refusing self-wipe)\n' "$gdir"; return 1 ;; esac
+  if [ -n "${CLAUDE_FLEET_SESSION:-}" ] && [ "${CLAUDE_FLEET_SESSION}" = "$sid" ]; then
+    printf 'SKIP %s (this is the live session you are running — refusing self-wipe)\n' "$gdir"; return 1
+  fi
+
+  # MEMBERS-GONE — reap only once every member fleet is off disk (same guarantee as gc_one_coord).
+  local seen=0
+  while IFS= read -r m || [ -n "$m" ]; do
+    [ -n "$m" ] || continue
+    seen=1
+    [ -d "$m" ] && { left=1; break; }
+  done < "$gdir/.status/members"
+  if [ "$seen" = 0 ]; then
+    printf 'SKIP %s (members marker empty/unreadable — cannot verify; refusing to reap)\n' "$gdir"; return 1
+  fi
+  [ "$left" = 0 ] || { printf 'SKIP %s (member fleet(s) still present — reaping coord only after members)\n' "$gdir"; return 1; }
+
+  rm -rf "$gdir"
+  printf 'REMOVED %s\n' "$gdir"
+  return 0
+}
+
 # Auto-hook: after a session is fully integrated, gc THIS session (same G1-G4 guards). Called from the
 # post-integration ALL DONE path. It can NEVER remove the live session (G1) or unmerged work (G3); a guard failure
 # just prints SKIP and is non-fatal. OPT-OUT with CLAUDE_FLEET_NO_AUTOGC=1.
@@ -1614,6 +1930,9 @@ cmd_gc_all() { # [root]
     # coord-specific reaper BEFORE the repo-marker check below — the coord ALSO has a .status/repo (= the coord path,
     # non-git) that would otherwise SKIP as an invalid marker. Member fleets have .status/repo (not members) and keep
     # flowing to gc_one_session. Run in a subshell + || true so a SKIP never aborts the set -e sweep.
+    # PRODUCTS master coord (products-master-fleet-<sid>): flagged by BOTH .status/tasks AND .status/members. Route to
+    # gc_one_products FIRST (its path assertion differs from gc_one_coord's *-multi-fleet shape) before the members check.
+    if [ -f "$gdir/.status/tasks" ]; then ( gc_one_products "$gdir" "$sid" ) || true; continue; fi
     if [ -f "$gdir/.status/members" ]; then ( gc_one_coord "$gdir" "$sid" ) || true; continue; fi
     # The repo is NOT beside the session dir anymore — read it from the session's .status/repo marker (written at
     # init). Without a valid marker we cannot verify merge state safely, so SKIP (never rm a folder we can't vet).
@@ -2257,6 +2576,143 @@ cmd_grid_add_shared() { # <name> <mode:integrator|shared>
     "$(json_str "$slug")" "$(json_str "$name")" "$(json_str "$coord/workers/$slug")" "$(json_str "$prompt")"
 }
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+# PRODUCTS mode (3-tier MASTER → TASK-ORCHESTRATOR → WORKERS). One super-orchestrator ("master") owns each repo's shared
+# _main and is the only pusher; each user-named PRODUCT is its own gyftalala-style orchestrator that integrates its
+# workers into a per-product branch fleet/s<sid>/<P>/_product and, when done, signals the master (like a super-worker).
+# Disk layout for a session <sid>: master coord = $SESSIONS_DIR/products-master-fleet-<sid>/ (ONE shared .status, the
+# watcher surface); shared per-repo _main = <repo>-fleet-<sid>/_main (MASTER-owned); each product P's _product checkout =
+# <repo>-fleet-<sid>/_product-<P> (on branch fleet/s<sid>/<P>/_product), symlinked into <coord>/products/<P>/<basename>
+# (the task-orchestrator's cwd); each product worker's per-repo worktree = <repo>-fleet-<sid>/<P>__<slug>, symlinked into
+# <coord>/workers/<P>__<slug>/<basename> (the worker's cwd). See spawn_master_prompt / spawn_task_orchestrator_prompt.
+
+# is a TOP-LEVEL product slug already taken? ("master" is reserved; on the manifest; or a _product-<slug> checkout in any repo)
+_product_toplevel_taken() { # <slug>
+  [ "$1" = master ] && return 0
+  grep -qx "$1" "$MANIFEST" 2>/dev/null && return 0
+  local r IFS=:
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    [ -e "$SESSIONS_DIR/$(basename "${r%/}")-fleet${SESSION:+-$SESSION}/_product-$1" ] && return 0
+  done
+  return 1
+}
+
+# Scaffold ONE product P (shared with --products-plan's per-product loop AND --add-product): create its
+# fleet/s<sid>/<P>/_product branch (from each repo's _main tip) + a _product-<P> integration worktree per repo, symlink
+# each into <coord>/products/<P>/<basename>, and register the top-level product slug on the board. Reads $pslug + $coord.
+# Assumes each repo already has its _main integration checkout (built by --products-plan step 2). Sets $first_repo.
+_scaffold_product() { # <pslug> <coord>  (uses REPOS_LIST; leaves first member repo path in $first_repo)
+  local pslug="$1" coord="$2" r rbase odir pbranch pcheckout mtip IFS=:
+  pbranch="fleet${SESSION:+/s$SESSION}/$pslug/_product"
+  first_repo=""
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    [ -d "$r/.git" ] || die "not a git repository: $r"
+    select_repo "$r"; rbase="$(basename "$REPO")"
+    [ -n "$first_repo" ] || first_repo="$REPO"
+    odir="$FLEET/_main"
+    [ -d "$odir" ] || die "products: repo $rbase has no _main integration checkout — run --products-plan first"
+    if ! git -C "$REPO" show-ref --verify --quiet "refs/heads/$pbranch"; then
+      mtip="$(git -C "$odir" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+      [ -n "$mtip" ] || mtip="origin/$DBR"
+      git -C "$REPO" branch "$pbranch" "$mtip" >/dev/null 2>&1 || git -C "$REPO" branch "$pbranch" "$DBR" >&2
+    fi
+    pcheckout="$FLEET/_product-$pslug"
+    [ -d "$pcheckout" ] || git -C "$REPO" worktree add "$pcheckout" "$pbranch" >&2
+    link_shared_dirs "$pcheckout"
+    mkdir -p "$coord/products/$pslug"
+    ln -sfn "$pcheckout" "$coord/products/$pslug/$rbase"   # the task-orchestrator's cwd exposes this repo's _product checkout as ./<basename>
+  done
+  printf '%s\n' "$pslug" >> "$MANIFEST"
+  rm -f "$STATUS/$pslug.done" "$STATUS/$pslug.merged" "$STATUS/$pslug.closed" "$STATUS/$pslug.working" "$STATUS/$pslug.held"
+  printf '%s\n' "$first_repo" > "$STATUS/$pslug.repo"   # sidecar → first member (for --handoff liveness / --merged repo resolve)
+}
+
+# --products-plan <N> <task-name…>: build the whole Products session. Creates each repo's shared _main + the master coord
+# with ONE shared .status (+ `members` and `tasks` gc markers), scaffolds each of the N products (its _product branch +
+# integration checkout per repo), and emits the pane JSON array — the MASTER pane first, then one TASK-ORCHESTRATOR pane
+# per product. Multi-repo only. Backward-compatible: nothing here runs for any existing mode.
+cmd_products_plan() { # <N> <task-name…>
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--products-plan is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--products-plan needs CLAUDE_FLEET_REPOS"
+  local n="$1"; shift || true
+  [ -n "$n" ] || die "--products-plan needs a count"
+  assert_unique_repo_basenames
+  reset_state                                    # coordination STATUS (CLAUDE_FLEET_STATUS_DIR); manifest seeded (REPO=coord)
+  local coord; coord="$(dirname "$STATUS")"      # the coordination dir (parent of .status)
+  # 1) derive the N product slugs + names (blank/absent → product-<i>); dedup; reserve "master".
+  local -a T_SLUG T_NAME
+  local idx=0 name slug base k seen=" master "
+  for name in "$@"; do
+    idx=$((idx + 1)); [ "$idx" -le "$n" ] || break
+    slug="$(slugify "$name")"; [ -n "$slug" ] || slug="product-$idx"
+    base="$slug"; k=2
+    while case "$seen" in *" $slug "*) true ;; *) false ;; esac; do slug="$base-$k"; k=$((k + 1)); done
+    seen="$seen$slug "
+    T_SLUG+=("$slug"); T_NAME+=("$name")
+  done
+  [ "${#T_SLUG[@]}" -gt 0 ] || die "--products-plan needs at least one task name"
+  # 2) for EACH repo: create the shared _main integration checkout (MASTER-owned) + its member gc marker.
+  local -a member_fleets=()
+  local r odir first_repo="" i IFS=:
+  for r in $REPOS_LIST; do
+    [ -d "$r/.git" ] || die "not a git repository: $r"
+    select_repo "$r"; fetch_origin
+    odir="$FLEET/_main"
+    if [ ! -d "$odir" ]; then
+      git -C "$REPO" worktree add --detach "$odir" "origin/$DBR" >&2 2>/dev/null \
+        || git -C "$REPO" worktree add --detach "$odir" "$DBR" >&2
+    fi
+    link_shared_dirs "$odir"
+    mkdir -p "$FLEET/.status"; printf '%s\n' "$REPO" > "$FLEET/.status/repo"   # member fleet gc marker (G0-G4)
+    member_fleets+=("$FLEET")
+  done
+  # 3) scaffold each product (its _product branch + per-repo integration checkout + workspace + board registration).
+  for i in "${!T_SLUG[@]}"; do _scaffold_product "${T_SLUG[$i]}" "$coord"; done
+  # 4) gc markers: `members` (reap coord only after members gone) + `tasks` (flags this as a Products coord for gc + the
+  #    master's products-board scope). is_products_board keys off `tasks`.
+  mkdir -p "$coord/.status"
+  printf '%s\n' "${member_fleets[@]}" > "$coord/.status/members"
+  : > "$coord/.status/tasks"
+  for i in "${!T_SLUG[@]}"; do printf '%s\n' "${T_SLUG[$i]}" >> "$coord/.status/tasks"; done
+  # 5) emit pane JSON — MASTER first (id 0), then one TASK-ORCHESTRATOR per product. Pane id == array index in the app;
+  #    routing is slug-based. The master has no product; each task-orch's slug == its product slug <P>.
+  printf '['
+  printf '{"role":"master","slug":"master","heading":"Master","dir":%s,"effort":"xhigh","prompt":%s}' \
+    "$(json_str "$coord")" "$(json_str "$(spawn_master_prompt "$coord")")"
+  for i in "${!T_SLUG[@]}"; do
+    printf ','
+    slug="${T_SLUG[$i]}"
+    printf '{"role":"orchestrator","tier":"task","product":%s,"slug":%s,"heading":%s,"dir":%s,"effort":"high","prompt":%s}' \
+      "$(json_str "$slug")" "$(json_str "$slug")" "$(json_str "${T_NAME[$i]}")" \
+      "$(json_str "$coord/products/$slug")" "$(json_str "$(spawn_task_orchestrator_prompt "$slug" "$coord")")"
+  done
+  printf ']\n'
+}
+
+# --add-product <name>: add ONE product to a RUNNING Products session (no state reset). Scaffolds it exactly like one
+# iteration of --products-plan's loop, appends it to the `tasks` marker, and emits a SINGLE task-orchestrator pane spec
+# (same shape as a plan-array element). Modeled on cmd_grid_add_shared.
+cmd_add_product() { # <name>
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--add-product is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--add-product needs CLAUDE_FLEET_REPOS"
+  local name="$1"; [ -n "$name" ] || die "--add-product needs a task name"
+  [ -d "$STATUS" ] || die "no active session"
+  [ -f "$STATUS/tasks" ] || die "--add-product: not a Products session (no tasks marker at $STATUS)"
+  local coord; coord="$(dirname "$STATUS")"
+  fetch_origin   # noop for the coord (non-git); real fetches happen per-repo in _scaffold_product via select_repo
+  local slug base k=2
+  slug="$(slugify "$name")"; [ -n "$slug" ] || slug="product"; base="$slug"
+  while _product_toplevel_taken "$slug"; do slug="$base-$k"; k=$((k + 1)); done
+  local first_repo=""
+  _scaffold_product "$slug" "$coord"                       # builds _product branch/checkout/workspace + registers on board
+  printf '%s\n' "$slug" >> "$coord/.status/tasks"          # keep the gc/scope `tasks` marker current
+  printf '{"role":"orchestrator","tier":"task","product":%s,"slug":%s,"heading":%s,"dir":%s,"effort":"high","prompt":%s}\n' \
+    "$(json_str "$slug")" "$(json_str "$slug")" "$(json_str "$name")" \
+    "$(json_str "$coord/products/$slug")" "$(json_str "$(spawn_task_orchestrator_prompt "$slug" "$coord")")"
+}
+
 # Grid mode: a worker SPAWNS a brand-new worker pane for an area NO pane owns yet, seeded with the
 # requirement (read from FILE so the command stays static). Writes a .spawn marker — the same channel the
 # dispatch orchestrator uses — which the app turns into a new pane that starts working immediately.
@@ -2295,6 +2751,8 @@ case "${1:-}" in
   --grid-plan-multi) shift; cmd_grid_plan_multi "$@" ;;
   --grid-plan-shared) shift; cmd_grid_plan_shared "$@" ;;
   --grid-plan-integrator) shift; cmd_grid_plan_integrator "$@" ;;
+  --products-plan) shift; cmd_products_plan "$@" ;;
+  --add-product)  shift; cmd_add_product "${1:-}" ;;
   --grid-add)     shift; cmd_grid_add "${1:-}" ;;
   --grid-add-shared) shift; cmd_grid_add_shared "${1:-}" "${2:-}" ;;
   --spawn)        shift; cmd_spawn "$@" ;;
