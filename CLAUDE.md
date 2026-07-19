@@ -205,6 +205,17 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   Integrator pane), `spawn_integrator_prompt` (the integrate-only loop), `--ship` (per-changeset
   push). `main.js` `runIntegratorPlan`. It's the arbiter/merge-gate the plain shared-grid mode
   lacked (whoever-pushes-second-resolves-blind). Orchestrated-multi + plain shared-grid still work.
+  **Robustness hardening (audit + sandbox, same day):** (1) `.held` defer state + `--hold <slug>`
+  (skipped by `--next`/`--watch`/`--ready` like `.merged`, cleared on a fresh `--done`) — a
+  red/failed worker no longer head-of-line-blocks the queue. (2) `cmd_done` records `.claims`
+  NAMESPACED as `<repo-basename>/<path>` across ALL repos a worker touched (was: first-repo-only,
+  un-namespaced) → `--conflicts` overlap radar is now complete + free of cross-repo false positives.
+  (3) Integrator prompt records each `_main`'s pre-merge tip and `git reset --hard <ref>` rolls back
+  EVERY touched repo on a partial test-gate failure → a per-worker cross-repo changeset lands
+  all-or-none (no half-landed `_main` drift). (4) worker cross-area escape-hatch uses `--need`/
+  `--handoff`, NOT the single-repo self-push `--spawn-grid` (which stalls under push-withholding).
+  (5) empty `--touched` (no-op worker) → just `--merged`, no `--ship` error. The engine half is
+  CLI-sandbox-verified against throwaway repos; the full pane UX is not app-launch-tested here.
 
 ## Conventions / gotchas
 
