@@ -209,6 +209,9 @@
           <span class="otxt"><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly.</span></label>
 
         <div id="gridCfg" style="display:none">
+          <label class="opt" id="integratorOpt" style="display:none; margin:0 0 13px; padding:0; border-top:none;">
+            <input type="checkbox" id="useIntegrator" checked />
+            <span class="otxt"><b>Add Integrator pane</b> — a fixed 9th pane that auto-merges every worker's result and owns ALL pushing (incrementally, per worker). Workers commit + hand off; they don't push. Uncheck for a plain shared grid where each pane pushes itself.</span></label>
           <div class="label">Panes <span class="hintnote" id="paneCountHint">— each is a worker you task directly, max 9</span></div>
           <div class="counts" id="counts"></div>
           <div class="label">Pane names <span class="hintnote" id="paneNamesHint">— each owns its area and pushes itself</span></div>
@@ -291,6 +294,8 @@
   const headsEl = document.getElementById('heads');
   const paneCountHint = document.getElementById('paneCountHint');
   const paneNamesHint = document.getElementById('paneNamesHint');
+  const integratorOptEl = document.getElementById('integratorOpt');
+  const useIntegratorEl = document.getElementById('useIntegrator');
   let repo = '', repoNWO = '', repoBranch = 'main', account = '', count = 3, newProject = false;
   let mode = 'single', gyfAll = [], gyfChecked = new Set(), gyfLoadedAccount = null;
   const gyfPaneNames = {};   // multi + orchestrator OFF: user-typed worker-pane names, keyed by repo nameWithOwner (preserved across re-renders)
@@ -487,9 +492,19 @@
     if (paneCountHint) paneCountHint.textContent = spansAllRepos ? '— each worker spans all checked repos, max 9' : '— each is a worker you task directly, max 9';
     if (paneNamesHint) paneNamesHint.textContent = spansAllRepos ? '— each spans every checked repo & pushes itself' : '— each owns its area and pushes itself';
   }
+  // multi + orchestrator OFF + Integrator checkbox on = the fixed-Integrator shape: workers are 1–8 (the 9th pane is the
+  // Integrator, added implicitly). Everywhere else the count grid is the normal 1–9.
+  function integratorActive() { return mode === 'gyftalala' && !useOrchEl.checked && !!(useIntegratorEl && useIntegratorEl.checked); }
+  function gridMax() { return integratorActive() ? 8 : 9; }
   for (let i = 1; i <= 9; i++) { const b = document.createElement('button'); b.textContent = i; b.onclick = () => { count = i; renderGrids(); }; countsEl.appendChild(b); }
   function renderGrids() {
-    [...countsEl.children].forEach((b, i) => b.classList.toggle('on', i + 1 === count));
+    const max = gridMax();
+    if (count > max) count = max;                        // Integrator caps workers at 8 (it takes the 9th pane)
+    [...countsEl.children].forEach((b, i) => {
+      b.classList.toggle('on', i + 1 === count);
+      const over = (i + 1) > max;                         // grey out counts above the max (the 9 slot when Integrator is on)
+      b.disabled = over; b.style.opacity = over ? '.3' : ''; b.style.pointerEvents = over ? 'none' : '';
+    });
     const prev = {}; [...headsEl.querySelectorAll('input')].forEach((inp) => prev[inp.dataset.i] = inp.value);
     headsEl.innerHTML = '';
     for (let i = 0; i < count; i++) {
@@ -500,8 +515,26 @@
       inp.placeholder = ['Frontend', 'Backend', 'API', 'Database', 'Auth', 'Tests', 'Docs', 'CI/CD', 'UI'][i] || ('area ' + (i + 1));
       row.appendChild(tag); row.appendChild(inp); headsEl.appendChild(row);
     }
+    if (integratorActive()) {
+      // Show the fixed Integrator as a non-editable row (its input is disabled → excluded from the collected names) so
+      // the user sees the 9th pane it implies. It auto-merges every worker + owns all pushing.
+      const row = document.createElement('div'); row.className = 'hrow';
+      const tag = document.createElement('div'); tag.className = 'tag'; tag.textContent = 'Pane ' + (count + 1) + ' · fixed';
+      const inp = document.createElement('input'); inp.value = 'Integrator'; inp.disabled = true;
+      inp.title = 'Dedicated pane — auto-merges every worker + owns all pushing';
+      row.appendChild(tag); row.appendChild(inp); headsEl.appendChild(row);
+    }
+    // multi + orch OFF: retarget the hints to reflect whether workers self-push (plain shared grid) or hand off to the
+    // Integrator (no self-push; worker count capped at 8, the 9th pane is the fixed Integrator).
+    if (mode === 'gyftalala' && !useOrchEl.checked) {
+      if (paneCountHint) paneCountHint.textContent = integratorActive() ? '— worker panes, max 8 (the Integrator is the fixed 9th)' : '— each worker spans all checked repos, max 9';
+      if (paneNamesHint) paneNamesHint.textContent = integratorActive()
+        ? '— tasked directly; commit + hand off to the Integrator (workers don’t push)'
+        : '— each spans every checked repo & pushes itself';
+    }
     fit();
   }
+  if (useIntegratorEl) useIntegratorEl.onchange = () => renderGrids();
   function syncOrch() {
     const on = useOrchEl.checked;
     if (!on && newProject) setNewProject(false);   // named-pane mode can't be a scratch new-project; clear it
@@ -510,6 +543,9 @@
       // OFF = N GENERAL worker panes, EACH spanning ALL checked repos — shown with the SAME 1–9 count + names UI as
       // Single mode (gridCfg). The repo checklist (right column) selects WHICH repos every pane spans. The button
       // label reflects the orchestrator choice.
+      // The Integrator checkbox only makes sense in multi + orchestrator OFF (it's the safety arbiter for the shared
+      // multi-repo grid). Show it there; hide + ignore it everywhere else.
+      if (integratorOptEl) integratorOptEl.style.display = on ? 'none' : '';
       if (on) { gridCfg.style.display = 'none'; }
       else { gridCfg.style.display = ''; setGridHints(true); renderGrids(); }
       goEl.textContent = on ? 'Launch multi-repo fleet' : 'Launch multi-repo panes';
@@ -517,6 +553,7 @@
       fit();
       return;
     }
+    if (integratorOptEl) integratorOptEl.style.display = 'none';   // single-project mode never shows the Integrator option
     gridCfg.style.display = on ? 'none' : '';
     goEl.textContent = on ? 'Launch fleet' : 'Launch panes';
     renderGyfPanes();   // hides #gyfPanes in single-project mode (guarded inside)
@@ -632,8 +669,11 @@
       const orch = useOrchEl.checked;
       const payload = { mode: 'gyftalala', account, repos: sel, autonomous: true, orchestrator: orch };
       if (!orch) {
+        // Worker-pane names only (:not([disabled]) drops the fixed Integrator row) — count is already clamped to ≤8 when
+        // the Integrator is on. integrator:true adds the dedicated 9th pane that integrates + pushes.
         payload.count = count;
-        payload.names = [...headsEl.querySelectorAll('input')].map((inp) => inp.value.trim() || inp.placeholder);   // blank → placeholder
+        payload.names = [...headsEl.querySelectorAll('input:not([disabled])')].map((inp) => inp.value.trim() || inp.placeholder);
+        if (integratorActive()) payload.integrator = true;
       }
       const res = await window.fleet.launch(payload);
       if (!(res && res.ok)) { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; setMode('gyftalala'); }

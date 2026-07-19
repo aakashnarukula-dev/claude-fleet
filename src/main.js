@@ -34,7 +34,7 @@ function saveState() {
       .filter(([, s]) => !s.newProject)   // don't persist throwaway scratch sessions — their dir is disposable/torn down
       .map(([sid, s]) => ({
         sid: +sid, autonomous: !!s.autonomous, repo: s.repo, title: s.title, color: s.color, mode: s.mode, bypass: !!s.bypass,
-        repos: s.repos || null, coordDir: s.coordDir || null, sharedMulti: !!s.sharedMulti,
+        repos: s.repos || null, coordDir: s.coordDir || null, sharedMulti: !!s.sharedMulti, integrator: !!s.integrator,
         account: s.account || null,   // persist the SELECTED gh account (a safe string); NEVER the raw token — it's re-resolved on restore
 
         panes: (s.panes || []).map((p, i) => (p ? { id: i, role: p.role, heading: p.heading, slug: p.slug, dir: p.dir, repo: p.repo } : null)).filter(Boolean),
@@ -528,11 +528,14 @@ function sendAddSession(sid, title, color, meta, mode, win, migrated) {
   sendToWin(target, 'add-session', payload);
 }
 
-async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, account, orchestrator, count, names, newProject, mode, repos }) {
+async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, account, orchestrator, count, names, newProject, mode, repos, integrator }) {
   if (!pty) { if (configWin) configWin.webContents.send('launch-error', 'node-pty failed to load — run `npm run rebuild`.'); return { ok: false, error: 'node-pty not loaded' }; }
   if (mode === 'gyftalala') {
     if (!Array.isArray(repos) || !repos.length) return { ok: false, error: 'Multi-repo mode needs at least one repo.' };
     const useMultiOrch = orchestrator !== false;   // default ON (super-orchestrator); OFF = N GENERAL worker panes, each spanning ALL repos
+    // Integrator mode (orchestrator OFF + integrator:true): the shared multi-repo grid PLUS one fixed "Integrator" pane
+    // that incrementally merges + tests + pushes every worker's change. Workers commit + --done only (no self-push).
+    const useIntegrator = !useMultiOrch && integrator === true;
     // no-orchestrator SHARED grid: N named panes (count + names from the config's 1–9 grid), each spanning every repo.
     let sharedNames = [];
     if (!useMultiOrch) {
@@ -555,8 +558,9 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
       // coordination .status (coordDir) so the watcher surface + GC markers match; spawnPane keys "multi" off coordDir.
       mode: useMultiOrch ? 'gyftalala' : 'grid',
       sharedMulti: !useMultiOrch,                   // shared-multi grid workers span ALL repos → get CLAUDE_FLEET_MULTI/REPOS (not just the orchestrator)
-      bypass: !useMultiOrch,                        // grid workers push themselves → broad allowlist incl. push
-      autonomous: true, newProject: false,          // both multi shapes run autonomous
+      bypass: !useMultiOrch && !useIntegrator,      // plain shared grid workers push themselves (broad allowlist incl. push); in Integrator mode they DON'T self-push
+      integrator: useIntegrator,                    // Integrator mode: workers withhold push (spawnPane), the Integrator pane owns it
+      autonomous: true, newProject: false,          // all multi shapes run autonomous
       panes: [], planReady: false, pending: {}, slugIdx: {},
       statusDir: path.join(coord, '.status'), watcher: null,
     };
@@ -575,6 +579,14 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
     if (useMultiOrch) {
       sendAddSession(sid, title, color, [{ id: 0, role: 'orchestrator', heading: 'Orchestrator' }], 'gyftalala', win);
       runMultiOrchestrator(sid, coord, cl.paths).then(onReady).catch(onErr);
+    } else if (useIntegrator) {
+      // N GENERAL worker panes (commit + --done only, NO self-push) + one FIXED "Integrator" pane that incrementally
+      // merges each worker into every repo it touched, test-gates, and pushes ONLY those repos — without waiting for
+      // the rest. The CLI also creates each repo's _main integration checkout the Integrator merges into + ships.
+      const meta = sharedNames.map((n, i) => ({ id: i, role: 'worker', heading: n }));
+      meta.push({ id: sharedNames.length, role: 'integrator', heading: 'Integrator' });
+      sendAddSession(sid, title, color, meta, 'grid', win);
+      runIntegratorPlan(sid, coord, cl.paths, sharedNames.length, sharedNames).then(onReady).catch(onErr);
     } else {
       // N GENERAL worker panes (count + names from the config grid), EACH spanning ALL selected repos. The CLI cuts a
       // worktree per (pane × repo) + a per-pane workspace dir exposing every repo, so a pane can work across the whole
@@ -677,7 +689,7 @@ async function restoreSessions(saved) {
     const s = {
       repo: ss.repo, title, color, mode: ss.mode || 'dispatch', bypass: !!ss.bypass, autonomous: !!ss.autonomous, planReady: true,
       account: ss.account || null, ghToken: ss.account ? (tokenByAccount[ss.account] || null) : null,
-      repos: ss.repos || null, coordDir: ss.coordDir || null, sharedMulti: !!ss.sharedMulti, panes: [],
+      repos: ss.repos || null, coordDir: ss.coordDir || null, sharedMulti: !!ss.sharedMulti, integrator: !!ss.integrator, panes: [],
       pending: {}, slugIdx: {}, statusDir: ss.coordDir
         ? path.join(ss.coordDir, '.status')
         : path.join(fleetDir(ss.repo, sid), '.status'), watcher: null,
@@ -765,6 +777,26 @@ function runGridPlanShared(sid, coord, repoPaths, count, names) {
       CLAUDE_FLEET_STATUS_DIR: path.join(coord, '.status'),
     });
     execFile(FLEET_CLI, ['--grid-plan-shared', String(count), ...(names || [])], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
+      if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
+      try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty plan'); resolve(p); } catch (e) { reject(e); }
+    });
+  });
+}
+
+// Multi-repo INTEGRATOR grid (no orchestrator, + a dedicated Integrator pane): like runGridPlanShared (N general worker
+// panes, each spanning every repo, workspace-dir cwd) but the CLI ALSO creates each repo's _main integration checkout
+// and emits an extra "Integrator" pane (cwd = coord dir) that merges + tests + pushes each worker's change incrementally.
+// The emitted worker prompts commit + --done only (no self-push); spawnPane withholds push from them (s.integrator).
+function runIntegratorPlan(sid, coord, repoPaths, count, names) {
+  return new Promise((resolve, reject) => {
+    const env = Object.assign({}, process.env, {
+      CLAUDE_FLEET_SESSION: String(sid),
+      CLAUDE_FLEET_REPO: coord,                 // basename → coordination fleet name; not a git repo (multi path skips that check)
+      CLAUDE_FLEET_MULTI: '1',
+      CLAUDE_FLEET_REPOS: repoPaths.join(':'),
+      CLAUDE_FLEET_STATUS_DIR: path.join(coord, '.status'),
+    });
+    execFile(FLEET_CLI, ['--grid-plan-integrator', String(count), ...(names || [])], { maxBuffer: 16 * 1024 * 1024, env }, (err, out, errOut) => {
       if (err) return reject(new Error((errOut && errOut.trim()) || err.message));
       try { const p = JSON.parse(out); if (!Array.isArray(p) || !p.length) throw new Error('empty plan'); resolve(p); } catch (e) { reject(e); }
     });
@@ -1125,7 +1157,7 @@ function setPaneState(sid, idx, state) {
   // The orchestrator just went idle → flush any re-signal nudges that were queued while it was busy (see
   // maybeNudgeOrchestrator). Without this, a worker the user re-tasked directly while the orchestrator was busy would
   // --done into a dropped fs event and never be caught.
-  if (state === 'idle' && s.panes[idx] && s.panes[idx].role === 'orchestrator') flushPendingNudges(sid, idx);
+  if (state === 'idle' && s.panes[idx] && (s.panes[idx].role === 'orchestrator' || s.panes[idx].role === 'integrator')) flushPendingNudges(sid, idx);
 }
 // A worker pane that's already been --merged/--done but picks up a NEW in-pane task goes back to running with NO engine
 // status marker until it next runs --done — so --next reports ALL DONE and --statuses shows nothing for it, and an
@@ -1275,10 +1307,19 @@ function spawnPane(sid, idx, cols, rows) {
   if (s.newProject && p.role === 'orchestrator') env.CLAUDE_FLEET_NEW_PROJECT = '1';
   // Grid workers (no-orchestrator mode) get a BROAD allowlist (incl. push + rm) — each pushes its own area, so it
   // runs with no prompts for normal work AND no --dangerously-skip-permissions accept screen. Truly unusual verbs
-  // (curl/sudo/…) still ask. Dispatch mode: scoped allowlist; only the orchestrator may push.
-  const dispatchPush = (p.role === 'orchestrator') ? ['Bash(git push:*)'] : [];
-  const allowList = s.bypass ? ALLOW.concat(['Bash(git push:*)', 'Bash(rm:*)'])
-    : (s.autonomous ? ALLOW.concat(dispatchPush) : null);
+  // (curl/sudo/…) still ask. Dispatch mode: scoped allowlist; only the orchestrator may push. Integrator mode: the
+  // Integrator pane owns ALL pushing, workers withhold it (commit + --done, hand off).
+  const mayPush = (p.role === 'orchestrator' || p.role === 'integrator');
+  let allowList;
+  if (s.bypass) {
+    allowList = ALLOW.concat(['Bash(git push:*)', 'Bash(rm:*)']);                 // plain grid worker → self-pushes its area
+  } else if (s.integrator) {
+    // Integrator mode: the Integrator pane may push (+rm); workers get the broad allowlist MINUS push (they commit +
+    // --done and hand off). All panes here are autonomous.
+    allowList = mayPush ? ALLOW.concat(['Bash(git push:*)', 'Bash(rm:*)']) : ALLOW.concat(['Bash(rm:*)']);
+  } else {
+    allowList = s.autonomous ? ALLOW.concat(mayPush ? ['Bash(git push:*)'] : []) : null;   // dispatch: only the orchestrator pushes
+  }
   const allowArgs = allowList ? ' --allowedTools ' + allowList.map((a) => shQuote(a)).join(' ') : '';
   // Start every pane in ⏵⏵ auto mode (the `auto` permission-mode: auto-apply edits AND auto-run safe commands, no
   // per-step prompt) when autonomous — pairs with the allowlist (which auto-approves the listed Bash verbs).
@@ -1289,9 +1330,9 @@ function spawnPane(sid, idx, cols, rows) {
   // restored panes resume their prior conversation in this worktree (Claude's built-in --continue); fresh panes get the prompt
   const cmd = p.resume ? 'claude --continue' : 'claude ' + shQuote(p.prompt);
   // Workers rarely need external MCP servers (playwright/canva/…); connecting them slows every
-  // launch. --strict-mcp-config + no --mcp-config => zero MCP servers. Orchestrator keeps MCP
-  // (it may use it for deploys, etc.).
-  const mcpArgs = (p.role === 'orchestrator') ? '' : ' --strict-mcp-config';
+  // launch. --strict-mcp-config + no --mcp-config => zero MCP servers. The orchestrator AND the
+  // Integrator keep MCP (they may use it for deploys/verification).
+  const mcpArgs = (p.role === 'orchestrator' || p.role === 'integrator') ? '' : ' --strict-mcp-config';
   let term;
   try {
     term = pty.spawn(shell, ['-l', '-c', `exec ${cmd}${mcpArgs}${allowArgs}${permArgs}`], {
@@ -1378,8 +1419,9 @@ function maybeNudgeOrchestrator(sid, filename) {
   const s = sessions[sid]; if (!s || !s.statusDir) return;
   const slug = filename.slice(0, -5);            // strip ".done"
   if (!s.mergedSeen || !s.mergedSeen.has(slug)) return;   // never integrated → the orchestrator's live --next loop owns this
-  const orchIdx = (s.panes || []).findIndex((p) => p && p.role === 'orchestrator');
-  if (orchIdx < 0 || !s.panes[orchIdx] || !ptys[`${sid}:${orchIdx}`]) return;   // no live orchestrator pane → nothing to nudge
+  // Route the re-signal nudge to the coordinating pane: the Orchestrator (dispatch/multi) OR the Integrator (integrator mode).
+  const orchIdx = (s.panes || []).findIndex((p) => p && (p.role === 'orchestrator' || p.role === 'integrator'));
+  if (orchIdx < 0 || !s.panes[orchIdx] || !ptys[`${sid}:${orchIdx}`]) return;   // no live coordinating pane → nothing to nudge
   let mtime = 0;
   try { mtime = fsmod.statSync(path.join(s.statusDir, filename)).mtimeMs; } catch (_) { return; }   // marker vanished (race) → nothing to nudge
   if (!s.doneNudged) s.doneNudged = {};

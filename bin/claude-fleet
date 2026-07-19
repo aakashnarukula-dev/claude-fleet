@@ -27,6 +27,10 @@
 #                          EVERY CLAUDE_FLEET_REPOS repo: cuts a worktree per (pane × repo) on fleet/s<sid>/<slug> + a
 #                          per-pane workspace dir (<coord>/workers/<slug>/) symlinking each repo's worktree, used as the
 #                          pane's cwd. Panes are NOT repo-tagged (each spans them all); self-push each repo they change.
+#   --grid-plan-integrator N [name…]  (multi-repo, no orchestrator, + a dedicated INTEGRATOR pane) like
+#                          --grid-plan-shared BUT workers COMMIT + --done only (never self-push); ALSO creates each repo's
+#                          _main integration checkout and emits a fixed "Integrator" pane (cwd = coord dir) that
+#                          INCREMENTALLY merges + test-gates + pushes each worker's change into the repos it touched.
 #   --spawn-grid N FILE    (grid mode) open a NEW worker pane N seeded with the brief in FILE (no pane owned it)
 #   --next                 block until a worker is ready; print its slug (or FAILED:<slug>); exit 3 = ALL DONE,
 #                          exit 5 = TIMEOUT (only when CLAUDE_FLEET_NEXT_TIMEOUT>0 seconds is set)
@@ -48,6 +52,10 @@
 #                          if ANY can't ff cleanly, push NOTHING. Otherwise push each in order — best-effort, not a
 #                          true cross-repo transaction: a mid-sequence failure leaves earlier repos pushed but is
 #                          RESUMABLE (re-run finishes the rest).
+#   --ship <repo…>         (multi-repo) like --ship-all but scoped to the GIVEN repos (basename or path) — the per-worker
+#                          atomic push the Integrator uses to land ONLY the repos a single worker changed (all-or-none).
+#   --touched <slug>       (multi-repo) print the repos a worker slug actually CHANGED (its fleet/s<sid>/<slug> branch is
+#                          ahead of that repo's _main). The Integrator scopes its --ship to exactly these.
 #   --gh-align             switch the gh CLI's active account to the OWNER of origin (so osxkeychain can read/push
 #                          this repo). Runs automatically at startup; this flag is the manual trigger.
 #   --clean                remove this session's worktrees + branches
@@ -646,6 +654,58 @@ Wait for the user's goal.
 EOF
 }
 
+# the INTEGRATOR: a dedicated pane (multi-repo, orchestrator OFF). The user tasks the worker panes directly; each worker
+# commits + --done (never pushes). The Integrator does NOT implement, split tasks, or spawn workers — it runs an
+# INCREMENTAL integration loop, landing each worker's change into the repos it touched as soon as it's safe.
+spawn_integrator_prompt() { # coord_dir
+  local coord="$1" r names="" IFS=:
+  for r in $REPOS_LIST; do names="$names\n  - $(basename "$r")  ($r)  _main: $SESSIONS_DIR/$(basename "$r")-fleet${SESSION:+-$SESSION}/_main"; done
+  cat <<EOF
+You are the INTEGRATOR for a multi-repo Claude Fleet run (orchestrator OFF). The USER tasks the WORKER panes directly.
+Each worker implements across whichever repos its task needs, COMMITS on its branch (${BR_PREFIX}/<slug>) in each changed
+repo, then runs  claude-fleet --done . Workers do NOT push. YOU own ALL integration + pushing. You do NOT implement
+feature code, you do NOT split tasks, and you do NOT spawn workers — you INTEGRATE what the workers hand you, one worker
+at a time, as soon as each is safe.
+
+Repos you integrate (basename, path, and its integration checkout _main):$(printf '%b' "$names")
+
+Your cwd is the coordination dir ${coord}. Each repo above has its OWN integration checkout _main (a detached checkout at
+that repo's default-branch tip) and its OWN worker branches ${BR_PREFIX}/<slug>. To land a worker in a repo you merge its
+branch into that repo's _main, TEST it, then push _main → that repo's origin default branch.
+
+INCREMENTAL LOOP — do NOT wait for all workers; land each worker the moment it's safe:
+1. WAIT for the next worker:  export CLAUDE_FLEET_WATCH_NEEDS=1  then  claude-fleet --watch  (blocks; prints a ready
+   slug S, or FAILED:S, or NEED:S).
+2. See everything ready right now:  claude-fleet --ready  (several may have landed at once). Then  claude-fleet --conflicts
+   — it lists any file touched by MORE THAN ONE unmerged worker (the overlap radar).
+3. For each ready slug S, find WHICH repos it actually changed:  claude-fleet --touched S  (prints the basenames of the
+   repos whose ${BR_PREFIX}/S branch is ahead of that repo's _main — the ONLY repos to touch for S).
+4. NON-OVERLAPPING worker (S shares no file with any other unmerged worker per --conflicts) → LAND IT NOW, don't wait:
+     For EACH repo R that  claude-fleet --touched S  printed:  cd <R's _main path above>  then  git merge --no-ff ${BR_PREFIX}/S
+       On conflict, read BOTH sides first — git log --oneline HEAD..${BR_PREFIX}/S — then resolve preserving both intents.
+     TEST-GATE every touched repo with its build/test (per R's CLAUDE.md; run any cache-bust/build step). If a repo
+       FAILS: do NOT push it — print "✗ HELD S in <R> — <failure>" in this pane, leave S UN-merged (do NOT run
+       claude-fleet --merged), and move on. NEVER push red.
+     PUSH the per-worker changeset ATOMICALLY — ONLY the repos S touched, all-or-none:
+       claude-fleet --ship <touched repo basenames…>     (dry-runs each, pushes all or none; resumable if a push fails)
+     Then:  claude-fleet --merged S
+5. OVERLAPPING workers (--conflicts shows S and a sibling touch the same file) → SERIALIZE just those: merge them into the
+   shared repo's _main ONE AT A TIME. Read BOTH sides (git log --oneline HEAD..${BR_PREFIX}/<slug> for each) and resolve
+   preserving BOTH intents. Test-gate, then  claude-fleet --ship <touched repos…>  for the group, then claude-fleet
+   --merged for EACH. Merge the non-overlapping rest freely (step 4).
+6. GENUINE DOUBT about intent (a conflict you cannot confidently resolve, or ambiguous overlapping requirements) → do NOT
+   guess and do NOT push. PRINT a clear, specific question in THIS pane and WAIT for the user to answer, then resolve + ship.
+7. FAILED:S → that worker gave up: do NOT merge it. Print "✗ FAILED:S — <the pane's reason>" and leave it for the user to
+   re-task that pane. (If you want --watch to stop counting it,  claude-fleet --merged S  clears it.)
+8. NEED:S → a worker recorded a prerequisite/follow-up ( claude-fleet --needs  shows it). You do NOT spawn workers —
+   relay it to the user (which pane, what it needs); once it's handled  claude-fleet --need-clear S  so it stops re-firing.
+9. Go back to step 1 ( claude-fleet --watch ). A worker the user RE-TASKS re-runs --done → --watch wakes again and you
+   re-integrate its new commit the same way.
+
+Wait for the workers.
+EOF
+}
+
 # ---------------------------------------------------------------- subcommands
 
 # emit JSON for the solo orchestrator pane; creates the _main detached worktree and detects whether to seed memory
@@ -712,12 +772,16 @@ cmd_orchestrator() {
 # ANCESTOR of the integrated _main HEAD (a clean fast-forward: `git merge-base --is-ancestor <tip> <head>`). Any
 # divergence (the remote moved out from under us, e.g. an external push) is a non-ff → NOT feasible → held. This
 # exit-code check is robust and needs no `merge-tree --write-tree` (and thus no git >=2.38).
-cmd_ship_all() {
-  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--ship-all is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
-  [ -n "$REPOS_LIST" ] || die "--ship-all needs CLAUDE_FLEET_REPOS"
-  local r odir head target tip blockers="" IFS=:
-  # Phase 1 — DRY RUN every repo. Block if a repo has no _main, an empty HEAD, or its HEAD can't fast-forward origin/DBR.
-  for r in $REPOS_LIST; do
+# Push a GIVEN SET of repos' integrated _main → origin/<DBR>. Hold-all: dry-run every repo first; if ANY can't ff
+# cleanly, push NOTHING. Then push each (re-confirming ff right before each). Best-effort tail (a mid-sequence failure
+# leaves earlier repos pushed) — RESUMABLE. Shared by --ship-all (all CLAUDE_FLEET_REPOS) and --ship (a subset — the
+# Integrator's per-worker atomic changeset). $1 = the label used in messages (e.g. --ship-all / --ship); rest = repo refs.
+ship_repos() { # <label> <repo-ref...>
+  local label="$1"; shift
+  [ "$#" -gt 0 ] || die "$label needs at least one repo"
+  local r odir head target tip blockers=""
+  # Phase 1 — DRY RUN each repo. Block if a repo has no _main, an empty HEAD, or its HEAD can't fast-forward origin/DBR.
+  for r in "$@"; do
     select_repo "$r"; odir="$FLEET/_main"
     if [ ! -d "$odir" ]; then blockers="$blockers\n  - $(basename "$r"): no integration checkout ($odir) — nothing integrated"; continue; fi
     fetch_origin
@@ -734,12 +798,12 @@ cmd_ship_all() {
     fi
   done
   if [ -n "$blockers" ]; then
-    printf 'claude-fleet: --ship-all HELD ALL repos — nothing pushed. Blocked:%b\n' "$blockers" >&2
+    printf 'claude-fleet: %s HELD ALL repos — nothing pushed. Blocked:%b\n' "$label" "$blockers" >&2
     exit 1
   fi
-  # Phase 2 — push every repo. Re-confirm fast-forward right before each push; report partial landings on failure.
+  # Phase 2 — push each repo. Re-confirm fast-forward right before each push; report partial landings on failure.
   local landed=""
-  for r in $REPOS_LIST; do
+  for r in "$@"; do
     select_repo "$r"; odir="$FLEET/_main"
     gh_align   # align gh's active account to THIS repo's origin owner (e.g. gyftalala) so osxkeychain can push it
     has_origin || { printf 'claude-fleet: %s has no origin — skipped push (integrated locally on _main).\n' "$(basename "$r")" >&2; continue; }
@@ -747,16 +811,55 @@ cmd_ship_all() {
     head="$(git -C "$odir" rev-parse --verify --quiet HEAD || true)"
     tip="$(git -C "$odir" rev-parse --verify --quiet "origin/$DBR" || true)"
     if [ -n "$tip" ] && ! git -C "$odir" merge-base --is-ancestor "$tip" "$head" 2>/dev/null; then
-      printf 'claude-fleet: --ship-all aborted before pushing %s — origin/%s moved since the dry run (non-ff). Already pushed: %s. Re-run --ship-all.\n' "$(basename "$r")" "$DBR" "${landed:-none}" >&2
+      printf 'claude-fleet: %s aborted before pushing %s — origin/%s moved since the dry run (non-ff). Already pushed: %s. Re-run %s.\n' "$label" "$(basename "$r")" "$DBR" "${landed:-none}" "$label" >&2
       exit 1
     fi
     if ! git -C "$odir" push origin "HEAD:$DBR" >&2; then
-      printf 'claude-fleet: --ship-all push FAILED on %s after pushing: %s. State is PARTIAL — re-run --ship-all to finish the rest.\n' "$(basename "$r")" "${landed:-none}" >&2
+      printf 'claude-fleet: %s push FAILED on %s after pushing: %s. State is PARTIAL — re-run %s to finish the rest.\n' "$label" "$(basename "$r")" "${landed:-none}" "$label" >&2
       exit 1
     fi
     landed="$landed $(basename "$r")"
   done
-  printf 'claude-fleet: --ship-all pushed all repos to their default branch:%s\n' "${landed}"
+  printf 'claude-fleet: %s pushed to their default branch:%s\n' "$label" "${landed}"
+}
+
+cmd_ship_all() {
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--ship-all is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--ship-all needs CLAUDE_FLEET_REPOS"
+  local IFS=:
+  # shellcheck disable=SC2086 — deliberate colon word-split of REPOS_LIST into positional repo refs
+  set -- $REPOS_LIST
+  ship_repos "--ship-all" "$@"
+}
+
+# --ship: like --ship-all but only the GIVEN repos (basename or path). The Integrator uses this to push exactly the
+# repos ONE worker changed — a per-worker atomic changeset that lands WITHOUT waiting for the other workers.
+cmd_ship() { # <repo-ref...>
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--ship is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--ship needs CLAUDE_FLEET_REPOS"
+  [ "$#" -gt 0 ] || die "--ship needs at least one repo (basename or path)"
+  ship_repos "--ship" "$@"
+}
+
+# Multi-repo: print the repos a worker slug actually CHANGED — those whose fleet/s<sid>/<slug> branch has commit(s)
+# ahead of that repo's integrated _main HEAD. One basename per line (empty if it touched nothing). The Integrator scopes
+# its per-worker atomic push (--ship) to exactly these. Idempotent: after the Integrator merges S into a repo's _main,
+# that repo drops out (branch no longer ahead), so a re-run reflects only what's still unlanded.
+cmd_touched() { # <slug>
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--touched is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--touched needs CLAUDE_FLEET_REPOS"
+  local slug="${1:-}"; [ -n "$slug" ] || die "--touched needs a slug"
+  local r odir head n branch="$BR_PREFIX/$slug" IFS=:
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    select_repo "$r"; odir="$FLEET/_main"
+    [ -d "$odir" ] || continue
+    git -C "$odir" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || continue
+    head="$(git -C "$odir" rev-parse --verify --quiet HEAD || true)"
+    [ -n "$head" ] || continue
+    n="$(git -C "$odir" rev-list --count "HEAD..refs/heads/$branch" 2>/dev/null || echo 0)"
+    if [ "${n:-0}" -gt 0 ]; then printf '%s\n' "$(basename "$REPO")"; fi
+  done
 }
 
 # spawn a worker for a subtask; writes a .spawn marker the app turns into a pane.
@@ -1658,6 +1761,86 @@ ${closing}
 EOF
 }
 
+# Integrator mode: the SHARED multi-repo worker protocol MINUS all pushing. Workers implement across whichever repo
+# sub-dirs the task needs, commit on their branch in each changed repo, then self-signal --done — the Integrator pane
+# merges + tests + pushes each worker's change incrementally. Workers NEVER push, merge origin, or touch any main.
+ensure_integrator_worker_protocol() {
+  mkdir -p "$STATUS"; printf '%s\n' "$REPO" > "$STATUS/repo"
+  local repolist="" r base first_base="" IFS=:
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    base="$(basename "${r%/}")"
+    repolist="$repolist${repolist:+, }$base"
+    [ -n "$first_base" ] || first_base="$base"
+  done
+  cat > "$STATUS/integrator-worker-protocol.md" <<EOF
+# Autonomous worker operating manual (claude-fleet, multi-repo, Integrator mode)
+
+You autonomously OWN one area and implement it ACROSS SEVERAL REPOS, then HAND OFF to the Integrator — you do NOT push.
+Your working directory contains ONE sub-dir per repository you can work in: ${repolist}. Each sub-dir is that repo's OWN
+git worktree on YOUR branch (${BR_PREFIX}/<your-slug>, cut from that repo's default branch). Edit whichever repos the
+requirement needs. Wherever this file says <your-slug>, use the last segment of your branch.
+
+- FIRST read each repo's CLAUDE.md (repo-root of each sub-dir) + your auto-memory and FOLLOW its rules (build/test/
+  deploy commands, conventions, "don't touch X"). Don't re-derive what's documented.
+- EVERY requirement I send is a persistent TODO — track them with TodoWrite, NEVER drop one. Several may arrive before
+  you finish the first; add each, keep what's in flight, work the list IN ORDER, run the loop for each. PARALLELIZE BY
+  DEPENDENCY: split a requirement into TodoWrite items; run items with NO unmet dependency AND NO shared file AT ONCE as
+  parallel inline subagents (Task tool, several in ONE message); an item that depends on another or edits the SAME file
+  WAITS (each repo sub-dir is ONE worktree → same-file parallelism clobbers).
+- STAY IN YOUR LANE — your area, across these repos, stays in THIS pane (inline subagents; never split your area across
+  panes). Work that belongs to a DIFFERENT pane's area: do NOT edit it, do NOT print paste-text — write the full
+  requirement to /tmp/cfleet_handoff_<your-slug>.txt, then hand off / spawn:
+    a sibling pane already owns it (claude-fleet --statuses) → claude-fleet --handoff "<that pane>" /tmp/cfleet_handoff_<your-slug>.txt
+    no pane owns it yet → claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff_<your-slug>.txt
+- THE LOOP — run end-to-end for each requirement:
+  1. MAKE the changes for the requirement — edit freely across whichever repo sub-dirs it needs; never pause to ask.
+  2. VERIFY it works: run each touched repo's build/test per its CLAUDE.md (run any cache-bust/build step + commit its result too).
+  3. REPORT: met → print "✓ REQUIREMENT MET — <what you verified>. Handing to the Integrator."; not met/broken → "✗ NOT MET — <reason>" and keep fixing. NEVER hand off unmet/broken work.
+  4. For EACH repo you changed, from INSIDE that repo's sub-dir (\`cd <repo-basename>\`):
+     a. COMMIT on your branch — SEPARATE plain commands: \`git add <files>\` then \`git commit -m "<what + why>"\`. Write a CLEAR message — the Integrator reads it to resolve any merge conflict.
+     b. Do NOT push, do NOT \`git merge origin/<default branch>\`, do NOT checkout or touch any other branch. The Integrator merges your commit into that repo's integration checkout, tests, and pushes — you just commit.
+  5. SELF-SIGNAL DONE: your cwd (the workspace root) is NOT a git repo, so run this from inside ANY repo sub-dir (they're all on your branch):  cd ${first_base} && claude-fleet --done  . The Integrator picks it up, merges each repo you changed into that repo's _main, test-gates, and pushes — incrementally, without waiting for the other panes. Re-run --done after EACH requirement; the pane stays alive for more. Progress pings:  cd ${first_base} && claude-fleet --status "<note>" .
+  6. If your change DEPENDS on another pane's output, or you need a follow-up another pane must do, record it:  cd ${first_base} && claude-fleet --need "<what + why + which repos/files>"  (the Integrator surfaces it to the user; retract a mistake with  cd ${first_base} && claude-fleet --unneed ).
+  7. UPDATE MEMORY: a concise durable note of what you built for your area (what, why, gotchas) per repo. Only touch a repo's CLAUDE.md for project-wide rules (shared — don't churn it).
+EOF
+}
+
+# Integrator-mode worker prompt: one general pane spanning EVERY repo, but it COMMITS + --done ONLY (never pushes) — the
+# Integrator pane owns integration + pushing. wsdir = the per-pane workspace dir (its cwd); sub-dirs are the repos.
+integrator_worker_prompt() { # heading slug workspace_dir [initial_requirement]
+  local heading="$1" slug="$2" wsdir="$3" req="${4:-}"
+  local repolist="" r base first_base="" IFS=:
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    base="$(basename "${r%/}")"
+    repolist="$repolist${repolist:+, }$base"
+    [ -n "$first_base" ] || first_base="$base"
+  done
+  local intro closing
+  if [ -n "$req" ]; then
+    intro="YOUR FIRST REQUIREMENT. START the loop on it NOW, without asking:
+
+${req}"
+    closing="Once you've committed + run --done across every repo it touches, wait for my next requirement for \"${heading}\" and run the loop again for each."
+  else
+    intro="Wait for my requirement for \"${heading}\", then run the loop end-to-end WITHOUT asking permission."
+    closing="Run the loop again for each follow-up requirement for \"${heading}\". Acknowledge and ask me what the requirement is."
+  fi
+  ensure_integrator_worker_protocol
+  cat <<EOF
+You are an AUTONOMOUS worker in a Claude Fleet MULTI-REPO run (Integrator mode) — pane "${heading}" (slug "${slug}"). Your working directory is ${wsdir}, which holds ONE sub-directory per repository you can work across: ${repolist}. Each sub-dir is that repo's own git worktree on branch ${BR_PREFIX}/${slug} (cut from that repo's default branch). You may edit ANY of them. This pane OWNS the "${heading}" area across the whole repo set.
+
+You COMMIT your work and hand it to the INTEGRATOR pane — you do NOT push, merge origin, or touch any main. The Integrator merges each repo you changed into its integration checkout, tests, and pushes, incrementally as soon as it's safe.
+
+READ ${STATUS}/integrator-worker-protocol.md NOW and follow it exactly — it is your operating manual: TodoWrite tracking, per-repo verify→commit (NO push), self-signal (cd into a repo sub-dir first), and stay-in-lane handoff/spawn routing. Wherever it says <your-slug>, use "${slug}". To self-signal use e.g.  cd ${first_base} && claude-fleet --done .
+
+${intro}
+
+${closing}
+EOF
+}
+
 # Grid mode: N named, autonomous worker panes for the selected repo; each verifies + pushes to its default branch
 cmd_grid_plan() { # <N> <name1> <name2> ...
   local n="$1"; shift
@@ -1823,6 +2006,90 @@ cmd_grid_plan_shared() { # <N> [name1 name2 ...]
   printf ']\n'
 }
 
+# Multi-repo INTEGRATOR mode (no orchestrator, + a dedicated Integrator pane). Like cmd_grid_plan_shared (N GENERAL
+# worker panes, each spanning EVERY repo: a worktree per (pane × repo) on fleet/s<sid>/<slug> + a per-pane workspace dir
+# symlinking each repo's worktree, used as the pane's cwd) but ALSO: (a) create each repo's _main integration checkout
+# (the Integrator merges worker branches into it + pushes it), (b) workers commit + --done only — integrator_worker_prompt,
+# NO self-push, and (c) emit an EXTRA fixed "Integrator" pane (cwd = coord dir) whose prompt is the integrate-only loop.
+# STATUS stays the shared coordination dir; writes the same coord `members` + member `.status/repo` gc markers as the
+# orchestrated multi path. Reserves the "integrator" slug so no worker can collide with the Integrator pane's slug.
+cmd_grid_plan_integrator() { # <N> [name1 name2 ...]
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--grid-plan-integrator is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--grid-plan-integrator needs CLAUDE_FLEET_REPOS"
+  local n="$1"; shift || true
+  [ -n "$n" ] || die "--grid-plan-integrator needs a count"
+  assert_unique_repo_basenames                   # fail loud on duplicate basenames (would collide onto one fleet)
+  reset_state                                    # coordination STATUS (CLAUDE_FLEET_STATUS_DIR); manifest seeded (REPO=coord)
+  local coord; coord="$(dirname "$STATUS")"      # the coordination dir (parent of .status)
+  # 1) derive the N worker slugs + headings from names (blank/absent → pane-<i>); dedup slugs. Seed `seen` with
+  #    "integrator" so a worker can never take that slug (it's reserved for the Integrator pane). bash-3.2: spaced string.
+  local -a P_SLUG P_HEAD
+  local idx=0 name slug base k seen=" integrator "
+  for name in "$@"; do
+    idx=$((idx + 1)); [ "$idx" -le "$n" ] || break
+    slug="$(slugify "$name")"; [ -n "$slug" ] || slug="pane-$idx"
+    base="$slug"; k=2
+    while case "$seen" in *" $slug "*) true ;; *) false ;; esac; do slug="$base-$k"; k=$((k + 1)); done
+    seen="$seen$slug "
+    P_SLUG+=("$slug"); P_HEAD+=("$name")
+  done
+  [ "${#P_SLUG[@]}" -gt 0 ] || die "--grid-plan-integrator needs at least one pane name"
+  # 2) for EACH repo: create its _main integration checkout + every worker pane's worktree + wire the workspace symlinks.
+  local -a member_fleets=()
+  local r rbase wslug wdir branch odir first_repo="" i
+  local IFS=:
+  for r in $REPOS_LIST; do
+    [ -d "$r/.git" ] || die "not a git repository: $r"
+    select_repo "$r"; fetch_origin              # re-points REPO/FLEET/DBR to this repo (STATUS stays the coord dir)
+    [ -n "$first_repo" ] || first_repo="$REPO"
+    rbase="$(basename "$REPO")"
+    odir="$FLEET/_main"                          # the Integrator's integration checkout for this repo (detached at DBR tip)
+    if [ ! -d "$odir" ]; then
+      git -C "$REPO" worktree add --detach "$odir" "origin/$DBR" >&2 2>/dev/null \
+        || git -C "$REPO" worktree add --detach "$odir" "$DBR" >&2
+    fi
+    link_shared_dirs "$odir"
+    mkdir -p "$FLEET/.status"; printf '%s\n' "$REPO" > "$FLEET/.status/repo"   # member fleet gc marker (G0-G4)
+    member_fleets+=("$FLEET")
+    for i in "${!P_SLUG[@]}"; do
+      wslug="${P_SLUG[$i]}"; branch="$BR_PREFIX/$wslug"; wdir="$FLEET/$wslug"
+      if [ -d "$wdir" ]; then :
+      elif git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$REPO" worktree add "$wdir" "$branch" >&2
+      else
+        git -C "$REPO" worktree add -b "$branch" "$wdir" "origin/$DBR" >/dev/null 2>&1 \
+          || git -C "$REPO" worktree add -b "$branch" "$wdir" "$DBR" >&2
+      fi
+      link_shared_dirs "$wdir"
+      mkdir -p "$coord/workers/$wslug"
+      ln -sfn "$wdir" "$coord/workers/$wslug/$rbase"   # the pane's cwd exposes this repo as ./<basename> (-n: replace an existing symlink-to-dir)
+    done
+  done
+  # 3) per-slug board state on the shared coord (slug-keyed, once per pane): manifest + reset markers + .repo sidecar.
+  for i in "${!P_SLUG[@]}"; do
+    wslug="${P_SLUG[$i]}"
+    printf '%s\n' "$wslug" >> "$MANIFEST"
+    rm -f "$STATUS/$wslug.done" "$STATUS/$wslug.merged" "$STATUS/$wslug.closed" "$STATUS/$wslug.working"
+    printf '%s\n' "$first_repo" > "$STATUS/$wslug.repo"   # sidecar → first member (any works for --handoff liveness)
+  done
+  mkdir -p "$coord/.status"
+  printf '%s\n' "${member_fleets[@]}" > "$coord/.status/members"   # gc: reap coord only once every member fleet is gone
+  # 4) emit pane JSON — N worker panes (workspace cwd, no "repo" tag, commit + --done only) + the fixed Integrator pane
+  #    (cwd = coord dir, integrate-only prompt, xhigh effort → max reasoning for conflict resolution / coordination).
+  printf '['
+  local firstj=1
+  for i in "${!P_SLUG[@]}"; do
+    [ "$firstj" = 1 ] && firstj=0 || printf ','
+    wslug="${P_SLUG[$i]}"
+    printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}' \
+      "$(json_str "$wslug")" "$(json_str "${P_HEAD[$i]}")" "$(json_str "$coord/workers/$wslug")" \
+      "$(json_str "$(integrator_worker_prompt "${P_HEAD[$i]}" "$wslug" "$coord/workers/$wslug")")"
+  done
+  printf ',{"role":"integrator","slug":"integrator","heading":"Integrator","dir":%s,"effort":"xhigh","prompt":%s}' \
+    "$(json_str "$coord")" "$(json_str "$(spawn_integrator_prompt "$coord")")"
+  printf ']\n'
+}
+
 # Grid mode: add ONE more named worker to an ALREADY-RUNNING fleet (no state reset). Emits a single
 # JSON object the app turns into a new pane — same shape as one element of --grid-plan's array.
 cmd_grid_add() { # <name>
@@ -1883,6 +2150,7 @@ case "${1:-}" in
   --grid-plan)    shift; cmd_grid_plan "$@" ;;
   --grid-plan-multi) shift; cmd_grid_plan_multi "$@" ;;
   --grid-plan-shared) shift; cmd_grid_plan_shared "$@" ;;
+  --grid-plan-integrator) shift; cmd_grid_plan_integrator "$@" ;;
   --grid-add)     shift; cmd_grid_add "${1:-}" ;;
   --spawn)        shift; cmd_spawn "$@" ;;
   --spawn-file)   shift; cmd_spawn_file "$@" ;;
@@ -1903,6 +2171,8 @@ case "${1:-}" in
   --statuses)     cmd_statuses ;;
   --rebuild)      cmd_rebuild ;;
   --ship-all)     cmd_ship_all ;;
+  --ship)         shift; cmd_ship "$@" ;;
+  --touched)      shift; cmd_touched "${1:-}" ;;
   --new-project)  shift; cmd_new_project "${1:-}" "${2:-}" ;;
   --clean)        cmd_clean ;;
   --gc)           cmd_gc ;;
