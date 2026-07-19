@@ -224,8 +224,9 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   renderers; keep the contextBridge surface minimal.
 - PTYs spawn with a login shell: `zsh -l -c 'exec claude <prompt> [--allowedTools …]'`,
   `cwd` = the pane's worktree dir. PATH is augmented with `~/.local/bin` + homebrew.
-- Reasoning effort is TASK-AWARE (spawnPane): the orchestrator pane runs `xhigh`;
-  worker panes use `p.effort || 'high'`. The orchestrator sets a worker's effort with
+- Reasoning effort is TASK-AWARE (spawnPane): the orchestrator pane runs `high` (was
+  `xhigh`; dropped to `high` for a faster first dispatch — the dedicated Integrator pane
+  still gets `xhigh`); worker panes use `p.effort || 'high'`. The orchestrator sets a worker's effort with
   `claude-fleet --spawn[-file] … --effort <low|medium|high|xhigh>`, which the CLI writes
   into the `.spawn` marker (`"effort"` field) → `handleSpawn` → `spawnPane`. Default
   worker = `high` (xhigh forced-everywhere was the old cause of slow "thinking" startups).

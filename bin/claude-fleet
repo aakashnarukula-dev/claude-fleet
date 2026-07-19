@@ -889,6 +889,7 @@ cmd_touched() { # <slug>
 _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
   local heading="$1" task="$2" effort="${EFFORT:-}"
   [ -n "$heading" ] || die "spawn needs <heading> <task>"
+  [ -n "$task" ] || die "spawn needs a non-empty <task> (worker for '$heading' has no brief)"
   [ -d "$STATUS" ] || die "no active session"
   local slug base k=2 branch dir
   slug="$(slugify "$heading")"; [ -n "$slug" ] || slug="worker"; base="$slug"
@@ -897,7 +898,7 @@ _do_spawn() { # <heading> <task>   (reads EFFORT from the environment/caller)
   # (no --repo) leaves FLEET/REPO exactly as-is → original behavior. Re-point BEFORE the uniqueness loop so the
   # directory half ([ -d "$FLEET/$slug" ]) inspects the correct fleet dir, not the orchestrator's ambient one.
   local target_repo=""
-  if [ -n "${SPAWN_REPO:-}" ]; then select_repo "$SPAWN_REPO"; target_repo="$REPO"; fi
+  if [ -n "${SPAWN_REPO:-}" ]; then select_repo "$SPAWN_REPO"; target_repo="$REPO"; else set_default_branch; fi
   while [ -d "$FLEET/$slug" ] || grep -qx "$slug" "$MANIFEST" 2>/dev/null; do slug="$base-$k"; k=$((k + 1)); done
   branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
   # cut from the orchestrator's LATEST INTEGRATED STATE (_main HEAD) so dependency-phased workers build on the
@@ -1325,7 +1326,7 @@ cmd_clean() {
               || unreachable="$unreachable  $wt (HEAD ${head:0:12})\n"
             ;;
         esac
-      done < <(git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}')
+      done < <(git -C "$REPO" worktree list --porcelain | awk 'BEGIN{RS="";FS="\n"} {for(i=1;i<=NF;i++) if($i ~ /^worktree /){print substr($i,10); break}}')
       # fleet/* branch tips (a worker may have committed but never been integrated)
       while IFS= read -r br; do
         [ -n "$br" ] || continue
@@ -1348,7 +1349,7 @@ cmd_clean() {
     read -r ans || ans=""   # non-interactive/EOF: don't let set -e abort on read's non-zero before the prompt resolves
     [ "$ans" = y ] || [ "$ans" = Y ] || { echo "aborted"; exit 0; }
   fi
-  git -C "$REPO" worktree list --porcelain | awk '/^worktree /{print $2}' | while IFS= read -r wt; do
+  git -C "$REPO" worktree list --porcelain | awk 'BEGIN{RS="";FS="\n"} {for(i=1;i<=NF;i++) if($i ~ /^worktree /){print substr($i,10); break}}' | while IFS= read -r wt; do
     case "$wt" in "$FLEET"/*) git -C "$REPO" worktree remove --force "$wt" || true ;; esac
   done
   git -C "$REPO" worktree prune
@@ -1464,7 +1465,7 @@ gc_one_session() { # <fleet-dir> <sid>
           || { printf 'SKIP %s (worktree %s HEAD %s not reachable from %s — integrate/advance first; refusing to strand commits)\n' "$gdir" "$rwt" "${rhead:0:12}" "$DBR"; return 1; }
         ;;
     esac
-  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk 'BEGIN{RS="";FS="\n"} {for(i=1;i<=NF;i++) if($i ~ /^worktree /){print substr($i,10); break}}')
 
   # G4 — no registered worktree UNDER this session dir may have uncommitted changes (real git status, not filtered:
   # for gc we want a strict empty tree). Enumerate worktrees the same way cmd_clean does, scoped to this session dir.
@@ -1478,14 +1479,14 @@ gc_one_session() { # <fleet-dir> <sid>
         fi
         ;;
     esac
-  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk 'BEGIN{RS="";FS="\n"} {for(i=1;i<=NF;i++) if($i ~ /^worktree /){print substr($i,10); break}}')
 
   # All guards passed — folder-only-safe teardown. Remove each registered worktree under this session dir, rm the
   # dir, prune. (Branches are fully merged so they may remain; removing folders is the goal.)
   while IFS= read -r wt; do
     [ -n "$wt" ] || continue
     case "$wt" in "$gdir"/*) git -C "$REPO" worktree remove --force "$wt" >/dev/null 2>&1 || true ;; esac
-  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+  done < <(git -C "$REPO" worktree list --porcelain 2>/dev/null | awk 'BEGIN{RS="";FS="\n"} {for(i=1;i<=NF;i++) if($i ~ /^worktree /){print substr($i,10); break}}')
   rm -rf "$gdir"
   git -C "$REPO" worktree prune >/dev/null 2>&1 || true
   printf 'REMOVED %s\n' "$gdir"
@@ -1778,7 +1779,11 @@ this file says <your-slug>, use the last segment of your branch.
   panes). Work that belongs to a DIFFERENT pane's area: do NOT edit it, do NOT print paste-text — write the full
   requirement to /tmp/cfleet_handoff_<your-slug>.txt, then hand off / spawn:
     a sibling pane already owns it (claude-fleet --statuses) → claude-fleet --handoff "<that pane>" /tmp/cfleet_handoff_<your-slug>.txt
-    no pane owns it yet → claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff_<your-slug>.txt
+    no pane owns it yet → do NOT --spawn-grid: it cuts a SINGLE-repo pane in only the FIRST repo (not the whole repo
+      set), so cross-repo work would silently span just one repo — and it self-pushes outside this grid. Instead RECORD
+      it for the user, from inside a repo sub-dir:  cd ${first_base} && claude-fleet --need "<what + why + which repos/
+      files> — needs a NEW worker pane" . The user opens another pane (retract a mistake with  cd ${first_base} &&
+      claude-fleet --unneed ).
 - THE LOOP — run end-to-end for each requirement:
   1. MAKE the changes for the requirement — edit freely across whichever repo sub-dirs it needs; never pause to ask.
   2. VERIFY it works: run each touched repo's build/test per its CLAUDE.md (run any cache-bust/build step + commit its result too).
@@ -1918,10 +1923,13 @@ cmd_grid_plan() { # <N> <name1> <name2> ...
   set_default_branch
   reset_state
   local -a W_SLUG W_HEAD W_DIR
-  local idx=0 name slug branch dir
+  local idx=0 name slug base k branch dir seen=" "
   for name in "$@"; do
     idx=$((idx + 1)); [ "$idx" -le "$n" ] || break
     slug="$(slugify "$name")"; [ -n "$slug" ] || slug="grid-$idx"
+    base="$slug"; k=2
+    while case "$seen" in *" $slug "*) true ;; *) false ;; esac; do slug="$base-$k"; k=$((k + 1)); done
+    seen="$seen$slug "
     branch="$BR_PREFIX/$slug"; dir="$FLEET/$slug"
     if [ -d "$dir" ]; then :
     elif git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then

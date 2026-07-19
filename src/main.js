@@ -860,13 +860,18 @@ ipcMain.handle('gh-connect', async () => {
   // Single-flight: ghPollAbort is one global. A second concurrent device flow would orphan the first poll loop
   // (it'd keep hitting GitHub until expiry, and cancel would only stop the latest). Reject overlap instead.
   if (ghPollAbort) return { ok: false, error: 'a GitHub sign-in is already in progress' };
+  // Claim the single-flight guard BEFORE the first await, or two rapid callers both pass the null-check above (the
+  // assignment used to sit after `await ghApiPost`) and the first poll loop gets orphaned. The abort fn closes over
+  // `aborted`, which is set true by cancel/timeout; cleared to null on every exit path (incl. errors) so a failed
+  // connect can't wedge the guard.
+  let aborted = false;
+  ghPollAbort = () => { aborted = true; };
   try {
     const dev = await ghApiPost('/login/device/code', { client_id: GH_CLIENT_ID, scope: 'repo read:org gist workflow' });
-    if (!dev || !dev.device_code) return { ok: false, error: (dev && (dev.error_description || dev.error)) || 'could not start device flow' };
+    if (!dev || !dev.device_code) { ghPollAbort = null; return { ok: false, error: (dev && (dev.error_description || dev.error)) || 'could not start device flow' }; }
     if (configWin) configWin.webContents.send('gh-device-code', dev.user_code);
     let interval = ((dev.interval || 5) + 1) * 1000;
     const expiry = Date.now() + (dev.expires_in || 900) * 1000;
-    let aborted = false; ghPollAbort = () => { aborted = true; };
     while (!aborted && Date.now() < expiry) {
       await new Promise((r) => setTimeout(r, interval));
       if (aborted) break;
@@ -979,7 +984,14 @@ ipcMain.on('close-session', (_e, sid) => closeSession(sid));
 ipcMain.on('close-pane', (_e, { sid, id }) => {
   const t = ptys[`${sid}:${id}`];
   if (t) { try { t.kill(); } catch (_) {} delete ptys[`${sid}:${id}`]; delete ptyBuf[`${sid}:${id}`]; }
-  const s = sessions[sid]; if (s && s.panes && s.panes[id]) s.panes[id] = null;  // null -> spawnPane won't respawn on a stray term-ready
+  const s = sessions[sid];
+  if (s && s.panes && s.panes[id]) {
+    const slug = s.panes[id].slug;
+    s.panes[id] = null;  // null -> spawnPane won't respawn on a stray term-ready
+    // Drop the slugIdx entry (only if it still maps to THIS pane) so a later re-spawn of the same slug isn't rejected
+    // by handleSpawn's already-tracked guard.
+    if (slug != null && s.slugIdx && s.slugIdx[slug] === id) delete s.slugIdx[slug];
+  }
   clearPaneState(sid, id);   // keep the dock badge + tray accurate
   saveState();
 });
@@ -1301,7 +1313,15 @@ function spawnPane(sid, idx, cols, rows) {
     if (p.role === 'orchestrator' || s.sharedMulti) {
       env.CLAUDE_FLEET_MULTI = '1';
       env.CLAUDE_FLEET_REPOS = (s.repos || []).join(':');
+    } else {
+      // repo-pinned multi worker: shares the coordination .status but owns exactly one repo — must NOT inherit stale
+      // multi flags the app process may carry (e.g. it was launched from inside a fleet pane).
+      delete env.CLAUDE_FLEET_MULTI; delete env.CLAUDE_FLEET_REPOS;
     }
+  } else {
+    // single-repo pane: never inherit multi coordination vars the app process may have inherited (launched from inside
+    // a fleet pane) — they'd route this pane's self-signals to the wrong .status or flip the CLI into bogus multi mode.
+    delete env.CLAUDE_FLEET_STATUS_DIR; delete env.CLAUDE_FLEET_MULTI; delete env.CLAUDE_FLEET_REPOS;
   }
   // new-project scratch session: the CLI emits the new-project brief (name → retarget) when this is set.
   if (s.newProject && p.role === 'orchestrator') env.CLAUDE_FLEET_NEW_PROJECT = '1';
@@ -1558,9 +1578,12 @@ function handleRetarget(sid, filename) {
   const s = sessions[sid]; if (!s) return;
   const full = path.join(s.statusDir, filename);
   fsmod.readFile(full, 'utf8', (err, data) => {
-    fsmod.unlink(full, () => {});                       // consume the marker regardless of parse outcome
     if (err) return;
+    // Parse BEFORE unlinking (mirror handleSpawn): the CLI writes this marker non-atomically, so the watch event can
+    // fire on a partial read → JSON.parse throws. Unlinking first would destroy the marker on that transient and lose
+    // the retarget. Leave it on parse failure so the startWatcher rescan retries it later.
     let info; try { info = JSON.parse(data); } catch (_) { return; }
+    fsmod.unlink(full, () => {});
     const slug = slugifyProjectName(info && info.name);
     if (!slug) return;                                  // unusable name — leave the scratch session running
     const goal = (info && info.goal) || '';
@@ -1655,10 +1678,16 @@ function updatePowerBlocker() {
 ipcMain.handle('clipboard-read', () => {
   try {
     const img = clipboard.readImage();
-    if (img && !img.isEmpty()) { const p = path.join(os.tmpdir(), `cfleet-paste-${Date.now()}.png`); fsmod.writeFileSync(p, img.toPNG()); return { image: p }; }
+    if (img && !img.isEmpty()) { const p = path.join(os.tmpdir(), `cfleet-paste-${Date.now()}.png`); fsmod.writeFileSync(p, img.toPNG()); scheduleTmpCleanup(p); return { image: p }; }
   } catch (_) {}
   return { text: clipboard.readText() || '' };
 });
 ipcMain.handle('save-image-bytes', (_e, bytes) => {
-  try { const p = path.join(os.tmpdir(), `cfleet-drop-${Date.now()}.png`); fsmod.writeFileSync(p, Buffer.from(bytes)); return p; } catch (_) { return null; }
+  try { const p = path.join(os.tmpdir(), `cfleet-drop-${Date.now()}.png`); fsmod.writeFileSync(p, Buffer.from(bytes)); scheduleTmpCleanup(p); return p; } catch (_) { return null; }
 });
+// The path above is handed straight to the renderer/PTY (paste/drop flow), so we can't delete it now. Schedule a
+// best-effort unlink a few minutes out — long enough to be consumed, but bounded so temp PNGs don't accumulate.
+function scheduleTmpCleanup(p) {
+  const t = setTimeout(() => fsmod.unlink(p, () => {}), 5 * 60 * 1000);
+  if (t && t.unref) t.unref();   // don't keep the process alive just for this cleanup
+}

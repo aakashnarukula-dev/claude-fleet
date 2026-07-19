@@ -140,8 +140,14 @@
   // Re-fitting a terminal to a NEW width reflows xterm's buffer, which mangles Claude's background-colored
   // output into grey/black "zebra" rows. So when the sidebar/editor/divider changes a pane's width, we DON'T
   // re-fit — the terminal keeps its columns and just clips (the clipped area is empty). Window resize still fits.
-  let SUPPRESS_FIT = false;
-  function withNoFit(fn) { SUPPRESS_FIT = true; try { fn(); } finally { setTimeout(() => { SUPPRESS_FIT = false; }, 350); } }
+  // Reference-counted so overlapping suppress windows don't clear each other early: each begin bumps the depth,
+  // each (paired) end drops it, and fit stays suppressed while ANY suppression is outstanding. A lone boolean+timer
+  // let the FIRST reset clear the flag while a later interaction still needed it → mid-resize reflow "zebra".
+  let SUPPRESS_FIT_DEPTH = 0;
+  function suppressFitBegin() { SUPPRESS_FIT_DEPTH++; }
+  function suppressFitEnd() { setTimeout(() => { if (SUPPRESS_FIT_DEPTH > 0) SUPPRESS_FIT_DEPTH--; }, 350); }
+  function isFitSuppressed() { return SUPPRESS_FIT_DEPTH > 0; }
+  function withNoFit(fn) { suppressFitBegin(); try { fn(); } finally { suppressFitEnd(); } }
   let sidebarDefaulted = false;   // open the Files sidebar by default on the first session
   const tabsEl = document.getElementById('tabs');
   const sessEl = document.getElementById('sessions');
@@ -339,7 +345,7 @@
 
     const term = new Terminal({ theme: THEME, fontFamily: 'SF Mono, Menlo, monospace', fontSize: 12, cursorBlink: true, allowProposedApi: true, macOptionIsMeta: false, altClickMovesCursor: true, scrollback: 5000 });
     const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(termEl); fit.fit();
-    const ro = new ResizeObserver(() => { if (SUPPRESS_FIT) return; try { fit.fit(); window.fleet.termResize({ sid, id: p.id, cols: term.cols, rows: term.rows }); } catch (_) {} });
+    const ro = new ResizeObserver(() => { if (isFitSuppressed()) return; try { fit.fit(); window.fleet.termResize({ sid, id: p.id, cols: term.cols, rows: term.rows }); } catch (_) {} });
     ro.observe(termEl);
     sess.terms[p.id] = { term, fit, ro, started: false, paneEl: pane, heading: p.heading, role: p.role };   // PTY spawned later, in layout(), at full size; ro disconnected on teardown (disposeTerm)
     term.write('\x1b[90m  Starting Claude…\x1b[0m');
@@ -529,8 +535,9 @@
   function jumpToPane(sid, id) {
     const s = sessions[sid]; if (!s) return;
     if (activeSid !== sid) activate(sid);
+    const t = s.terms[id]; if (!t) return;   // pane was closed since the overlay referenced it — don't repoint activePaneId at a dead id (a later Cmd+V would route paste to a nonexistent pane)
     s.activePaneId = id;
-    const t = s.terms[id]; if (t) requestAnimationFrame(() => { try { t.term.focus(); } catch (_) {} });
+    requestAnimationFrame(() => { try { t.term.focus(); } catch (_) {} });
   }
   window.fleet.onFocusPane(({ sid, id }) => jumpToPane(sid, id));
   // (in-app permission queue removed — prompts surface only through the system-wide overlay; the overlay answers
@@ -604,9 +611,9 @@
 
   // draggable divider between the editor (left) and the terminals (right) — suppress fit while dragging
   edSplit.addEventListener('mousedown', (e) => {
-    e.preventDefault(); SUPPRESS_FIT = true;
+    e.preventDefault(); suppressFitBegin();
     const onMove = (ev) => { const x = Math.max(540, Math.min(window.innerWidth - 300, ev.clientX)); document.documentElement.style.setProperty('--edsplit', (x / window.innerWidth * 100).toFixed(2) + '%'); };
-    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); document.body.style.cursor = ''; setTimeout(() => { SUPPRESS_FIT = false; }, 350); if (mEditor) mEditor.layout(); };
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); document.body.style.cursor = ''; suppressFitEnd(); if (mEditor) mEditor.layout(); };
     document.body.style.cursor = 'col-resize'; window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
   });
 

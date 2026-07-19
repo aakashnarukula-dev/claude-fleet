@@ -45,7 +45,7 @@
     "node-pty": "^1.0.0"
   },
   "allowScripts": {
-    "electron@33.4.11": true,
-    "node-pty@1.1.0": true
+    "electron": true,
+    "node-pty": true
   }
 }

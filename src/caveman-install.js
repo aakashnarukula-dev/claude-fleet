@@ -32,6 +32,62 @@ function copyDirSync(src, dst) {
   }
 }
 
+// True iff a hook ENTRY references one of caveman's own managed scripts (exact
+// basename match on each shell-ish command token — mirrors the vendored
+// referencesManagedScript, which isn't exported). Anything that does NOT is a
+// USER-authored entry we must preserve verbatim; a user hook whose command
+// merely mentions "caveman" in some other path is therefore treated as a USER
+// entry, never as ours.
+function entryReferencesManaged(entry) {
+  if (!entry || !Array.isArray(entry.hooks)) return false;
+  const managed = SETTINGS.MANAGED_HOOK_BASENAMES;
+  return entry.hooks.some(h => {
+    if (!h || typeof h.command !== 'string') return false;
+    const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+    let m;
+    while ((m = re.exec(h.command)) !== null) {
+      const tok = m[1] ?? m[2] ?? m[3];
+      try {
+        if (tok && managed.has(path.win32.basename(tok))) return true;
+      } catch (_) { /* malformed token — not ours */ }
+    }
+    return false;
+  });
+}
+
+// Snapshot every USER-authored (non-managed) hook entry, deep-cloned so nothing
+// downstream can mutate it by reference. Returned shape: { [event]: entry[] }
+// containing ONLY the user entries (caveman's own managed entries are omitted —
+// those are (re)wired by the installer). Returns null when there are none.
+function snapshotUserHooks(settings) {
+  if (!settings || !settings.hooks || typeof settings.hooks !== 'object') return null;
+  const snap = {};
+  for (const ev of Object.keys(settings.hooks)) {
+    const arr = settings.hooks[ev];
+    if (!Array.isArray(arr)) continue;
+    const userEntries = arr.filter(e => !entryReferencesManaged(e));
+    if (userEntries.length) snap[ev] = JSON.parse(JSON.stringify(userEntries));
+  }
+  return Object.keys(snap).length ? snap : null;
+}
+
+// Re-insert the snapshotted user hook entries verbatim, undoing any collateral
+// deletion that the vendored validateHookFields (run inside pruneOrphanedManaged-
+// Hooks and, historically, before write) may have inflicted on hook shapes it
+// doesn't recognize. For each event we keep caveman's freshly-computed managed
+// entries and prepend the user entries exactly as they were read. This never
+// resurrects a pruned ORPHAN (snapshots exclude managed entries) and never
+// double-wires caveman (its entries come from the computed tree). Idempotent.
+function restoreUserHooks(settings, snap) {
+  if (!snap) return;
+  if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
+  for (const ev of Object.keys(snap)) {
+    const computed = Array.isArray(settings.hooks[ev]) ? settings.hooks[ev] : [];
+    const managed = computed.filter(entryReferencesManaged);
+    settings.hooks[ev] = snap[ev].concat(managed);
+  }
+}
+
 // opts: { vendorDir, homeDir = os.homedir() }
 //   vendorDir = absolute path to the on-disk (unpacked) src/vendor/caveman dir.
 //   homeDir   = override for testing (so a temp HOME can be used).
@@ -46,8 +102,34 @@ function ensureCaveman(opts = {}) {
 
     // Read settings up front — the fast-path health check, the orphan prune,
     // and the pre-existing detection all need it.
-    let settings = SETTINGS.readSettings(settingsPath);
-    if (settings === null) settings = {}; // unreadable/corrupt -> start clean, don't crash
+    //
+    // CRITICAL: readSettings returns `null` ONLY when settings.json EXISTS but
+    // could not be parsed even by the JSONC-tolerant path (or it exists but
+    // can't be read) — a deliberate "DO NOT overwrite this file" signal. A
+    // MISSING file returns `{}` (a fresh install, where starting clean is
+    // correct), so `null` never means "absent". If we coerced null -> {} and
+    // proceeded, writeSettings would rewrite the user's global settings.json
+    // down to ONLY the caveman hooks, destroying their permissions, env, model,
+    // statusLine, MCP config and every other hook. So: bail out of the
+    // settings-wiring entirely, don't write, and DON'T write the success marker
+    // (so a later launch retries once the file is valid again).
+    const settings = SETTINGS.readSettings(settingsPath);
+    if (settings === null) {
+      process.stderr.write(
+        'caveman: ~/.claude/settings.json exists but could not be parsed; ' +
+        'skipped caveman hook wiring to avoid clobbering it. ' +
+        'Fix the file and relaunch to retry.\n'
+      );
+      return { skipped: 'settings-unparseable' };
+    }
+
+    // Snapshot the user's own (non-caveman) hook entries verbatim BEFORE any of
+    // the vendored helpers below can mutate the tree. pruneOrphanedManagedHooks
+    // runs validateHookFields internally, which deletes any inner hook whose
+    // `type` isn't exactly 'command'/'agent' — so an unrecognized-but-valid user
+    // hook would otherwise silently vanish on write. We restore these verbatim
+    // before every write (see restoreUserHooks calls).
+    const userHooksSnapshot = snapshotUserHooks(settings);
 
     // The two vendored hook scripts we manage + a full health read of the
     // install. Healthy = BOTH hooks wired (SessionStart activate + UserPromptSubmit
@@ -79,7 +161,12 @@ function ensureCaveman(opts = {}) {
     //     instead of leaving/duplicating a broken one. A managed hook whose
     //     script still EXISTS is left untouched, so this is safe on a healthy
     //     user install and on our own healthy install alike.
-    if (SETTINGS.pruneOrphanedManagedHooks(settings, claudeDir) > 0) {
+    const prunedOrphans = SETTINGS.pruneOrphanedManagedHooks(settings, claudeDir);
+    // prune runs validateHookFields internally, which can strip user hooks it
+    // doesn't recognize — undo that collateral damage before ANY write (this
+    // guards both the write just below and the pre-existing early-return path).
+    restoreUserHooks(settings, userHooksSnapshot);
+    if (prunedOrphans > 0) {
       SETTINGS.writeSettings(settingsPath, settings);
     }
 
@@ -107,7 +194,16 @@ function ensureCaveman(opts = {}) {
     copyDirSync(path.join(vendorDir, 'commands'), path.join(claudeDir, 'commands')); // idempotent overwrite
 
     // 4) Wire the two hooks into settings.json (idempotent via basename markers).
-    SETTINGS.validateHookFields(settings);
+    //    NOTE: we intentionally do NOT call SETTINGS.validateHookFields(settings)
+    //    here. That helper mutates the ENTIRE user hook tree in place, deleting
+    //    any inner hook whose `type` is not exactly 'command' or 'agent' — so if
+    //    Claude Code ever accepts a hook shape that predicate rejects, the user's
+    //    hook would silently vanish on our write. The caveman entries we add
+    //    below are well-formed by construction (`{ type:'command', command }`),
+    //    and addCommandHook guards its own accesses (it creates hooks/event
+    //    arrays as needed and hasCavemanHook tolerates non-array shapes), so no
+    //    whole-tree normalization is needed. Pre-existing user hooks are written
+    //    back verbatim.
     const activate = path.join(dest, 'hooks', 'caveman-activate.js');
     const tracker = path.join(dest, 'hooks', 'caveman-mode-tracker.js');
     SETTINGS.addCommandHook(settings, 'SessionStart', {
