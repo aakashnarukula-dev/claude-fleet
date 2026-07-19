@@ -139,6 +139,21 @@
   .gyfpane-row input:focus { border-color:var(--accent); }
   .gyfpane-hint { padding:6px 2px; color:var(--faint); font-size:12px; }
 
+  /* products mode: a dynamic list of product/task-name rows (numbered badge + text input + × delete) */
+  #productList { display:flex; flex-direction:column; gap:7px; }
+  .prod-row { display:flex; align-items:center; gap:9px; }
+  .prod-badge { flex:none; width:22px; height:22px; border-radius:7px; display:flex; align-items:center; justify-content:center;
+    background:var(--card-2); border:1px solid var(--line); color:var(--muted); font-size:11px; font-weight:700; }
+  .prod-row input { -webkit-app-region:no-drag; -webkit-user-select:text; flex:1; min-width:0; padding:8px 10px; border-radius:8px; border:1px solid var(--line);
+    background:var(--card-2); color:var(--fg); font-size:12.5px; outline:none; transition:.14s; }
+  .prod-row input:focus { border-color:var(--accent); }
+  .prod-del { -webkit-app-region:no-drag; cursor:pointer; flex:none; width:26px; height:26px; border-radius:7px; border:1px solid var(--line);
+    background:transparent; color:var(--faint); font-size:15px; line-height:1; transition:.14s; }
+  .prod-del:hover { color:var(--danger); border-color:var(--danger); }
+  .prod-add { -webkit-app-region:no-drag; cursor:pointer; margin-top:11px; width:100%; padding:9px; border-radius:9px; border:1px dashed var(--line-2);
+    background:var(--card-2); color:var(--muted); font-size:12px; font-weight:600; transition:.14s; }
+  .prod-add:hover { color:var(--fg); border-color:var(--accent); }
+
   /* CTA */
   .go { -webkit-app-region:no-drag; margin-top:16px; width:100%; padding:13px; border:none; border-radius:12px; cursor:pointer;
     background:linear-gradient(180deg, #e08763, var(--accent)); color:var(--accent-ink); font-size:14px; font-weight:700; letter-spacing:.01em;
@@ -201,9 +216,10 @@
 
       <section class="card">
         <div class="label">Mode</div>
-        <div class="counts" id="modeSel" style="grid-template-columns:repeat(2,1fr); margin-bottom:13px;">
+        <div class="counts" id="modeSel" style="grid-template-columns:repeat(3,1fr); margin-bottom:13px;">
           <button id="modeSingle" class="on">Single project</button>
           <button id="modeGyf">Multi project</button>
+          <button id="modeProducts">Products</button>
         </div>
         <label class="opt"><input type="checkbox" id="useOrch" checked />
           <span class="otxt"><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly.</span></label>
@@ -240,6 +256,12 @@
       <section class="card" id="gyfPanes" style="display:none;">
         <div class="label">Worker panes <span class="hintnote">— each checked repo opens one pane you task directly</span></div>
         <div class="gyfpane-list" id="gyfPaneList"></div>
+      </section>
+
+      <section class="card" id="productsCfg" style="display:none;">
+        <div class="label">Products <span class="hintnote">— one task-orchestrator per product, each spanning every checked repo</span></div>
+        <div id="productList"></div>
+        <button class="prod-add" id="prodAdd">+ Add product</button>
       </section>
     </div>
   </div>
@@ -319,6 +341,7 @@
   // the height is measured while the right column is still crushed at the old width → dead space below the button.
   window.addEventListener('resize', fit);
   function refreshGo() {
+    if (mode === 'products') { goEl.disabled = !(account && gyfChecked.size && productNames.some((n) => n.trim())); return; }
     if (mode === 'gyftalala') { goEl.disabled = !(account && gyfChecked.size); return; }
     goEl.disabled = !(repo || repoNWO || newProject);
   }
@@ -538,6 +561,19 @@
   function syncOrch() {
     const on = useOrchEl.checked;
     if (!on && newProject) setNewProject(false);   // named-pane mode can't be a scratch new-project; clear it
+    if (mode === 'products') {
+      // Products: always autonomous, no orchestrator toggle / Integrator / pane-count. Show the repo checklist
+      // (right column) + the product-name list; hide the single-mode grid config + Integrator option.
+      if (integratorOptEl) integratorOptEl.style.display = 'none';
+      gridCfg.style.display = 'none';
+      if (productsCfgEl) productsCfgEl.style.display = '';
+      goEl.textContent = 'Launch products fleet';
+      renderGyfPanes();   // no-op hide of the retired per-repo #gyfPanes section
+      renderProducts();
+      fit();
+      return;
+    }
+    if (productsCfgEl) productsCfgEl.style.display = 'none';   // products list only shows in products mode
     if (mode === 'gyftalala') {
       // Multi-repo: orchestrator ON (default) = super-orchestrator that derives its own workers across the repos.
       // OFF = N GENERAL worker panes, EACH spanning ALL checked repos — shown with the SAME 1–9 count + names UI as
@@ -569,20 +605,52 @@
   const repoTotalEl = document.getElementById('repoTotal');
   const gyfPanesEl = document.getElementById('gyfPanes');
   const gyfPaneListEl = document.getElementById('gyfPaneList');
+
+  // --- products mode: dynamic list of product/task names (each → one task-orchestrator spanning all checked repos) ---
+  const productsCfgEl = document.getElementById('productsCfg');
+  const productListEl = document.getElementById('productList');
+  let productNames = ['Storefront', 'Checkout'];   // sensible starter rows; user edits/adds/removes
+  function renderProducts(focusLast) {
+    // sync the array from live inputs first so re-render preserves in-flight edits
+    const live = [...productListEl.querySelectorAll('input')].map((inp) => inp.value);
+    if (live.length) productNames = live;
+    productListEl.innerHTML = '';
+    productNames.forEach((name, i) => {
+      const row = document.createElement('div'); row.className = 'prod-row';
+      const badge = document.createElement('div'); badge.className = 'prod-badge'; badge.textContent = i + 1;
+      const inp = document.createElement('input'); inp.value = name;
+      inp.placeholder = ['Storefront', 'Checkout', 'Search', 'Dashboard', 'Payments'][i] || ('Product ' + (i + 1));
+      inp.oninput = () => { productNames[i] = inp.value; refreshGo(); };
+      const del = document.createElement('button'); del.className = 'prod-del'; del.textContent = '×'; del.title = 'Remove product';
+      del.onclick = () => { productNames.splice(i, 1); if (!productNames.length) productNames = ['']; renderProducts(); refreshGo(); };
+      row.appendChild(badge); row.appendChild(inp); row.appendChild(del);
+      productListEl.appendChild(row);
+    });
+    if (focusLast) { const inps = productListEl.querySelectorAll('input'); if (inps.length) inps[inps.length - 1].focus(); }
+    refreshGo(); fit();
+  }
+  function collectProducts() {
+    return [...productListEl.querySelectorAll('input')].map((inp) => inp.value.trim()).filter(Boolean);
+  }
+  document.getElementById('prodAdd').onclick = () => { productNames.push(''); renderProducts(true); };
   function setMode(m) {
     mode = m;
     document.getElementById('modeSingle').classList.toggle('on', m === 'single');
     document.getElementById('modeGyf').classList.toggle('on', m === 'gyftalala');
-    document.body.classList.toggle('wide', m === 'gyftalala');   // multi-repo → wide 2-col layout (repo picker in right column)
-    document.querySelector('.opt').style.display = '';   // orchestrator toggle now shows in BOTH modes (multi: default on = current behavior)
-    document.getElementById('repoPickRow').style.display = (m === 'gyftalala' || !account) ? 'none' : '';   // single dropdown only in Single mode (checklist owns multi)
-    // Local-folder / new-project pickers are single-repo only: in multi-repo mode they'd call clearGithub() and
+    document.getElementById('modeProducts').classList.toggle('on', m === 'products');
+    // multi-repo AND products → wide 2-col layout (repo picker + extra panel live in the right column)
+    const wide = (m === 'gyftalala' || m === 'products');
+    document.body.classList.toggle('wide', wide);
+    // orchestrator toggle shows in single + multi; products mode is always autonomous with no toggle → hide it there
+    document.querySelector('.opt').style.display = (m === 'products') ? 'none' : '';
+    document.getElementById('repoPickRow').style.display = (wide || !account) ? 'none' : '';   // single dropdown only in Single mode (checklist owns multi + products)
+    // Local-folder / new-project pickers are single-repo only: in multi-repo/products mode they'd call clearGithub() and
     // orphan the account (→ Launch silently disables). Hide the "or" separator + the .proj row there; restore on Single.
-    const showFolderPick = (m !== 'gyftalala');
+    const showFolderPick = !wide;
     const orSepEl = document.querySelector('.or-sep'); if (orSepEl) orSepEl.style.display = showFolderPick ? '' : 'none';
     const projRowEl = document.querySelector('.proj'); if (projRowEl) projRowEl.style.display = showFolderPick ? '' : 'none';
-    syncOrch();                                          // mode-aware: sets the button label + gridCfg visibility for single AND multi
-    if (m === 'gyftalala') loadGyfRepos();
+    syncOrch();                                          // mode-aware: sets the button label + gridCfg/products visibility
+    if (wide) loadGyfRepos();
     refreshGo(); fit();
   }
   function emptyRepoMsg(text) { gyfReposEl.innerHTML = ''; const d = document.createElement('div'); d.className = 'repo-empty'; d.textContent = text; gyfReposEl.appendChild(d); }
@@ -657,9 +725,19 @@
   document.getElementById('repoNone').onclick = () => { visibleRepos().forEach((r) => gyfChecked.delete(r.nameWithOwner)); renderGyfRepos(); };
   document.getElementById('modeSingle').onclick = () => setMode('single');
   document.getElementById('modeGyf').onclick = () => setMode('gyftalala');
+  document.getElementById('modeProducts').onclick = () => setMode('products');
 
   goEl.onclick = async () => {
     errEl.textContent = '';
+    if (mode === 'products') {
+      const payload = { mode: 'products', account, repos: checkedGyfRepos(), tasks: collectProducts(), autonomous: true };
+      if (!payload.repos.length) { errEl.textContent = 'Check at least one repo.'; return; }
+      if (!payload.tasks.length) { errEl.textContent = 'Name at least one product.'; return; }
+      goEl.disabled = true; goEl.textContent = 'Setting up…';
+      const res = await window.fleet.launch(payload);
+      if (!(res && res.ok)) { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; setMode('products'); }
+      return;
+    }
     if (mode === 'gyftalala') {
       const sel = checkedGyfRepos();
       if (!sel.length) { errEl.textContent = 'Check at least one repo.'; return; }
