@@ -23,6 +23,10 @@
 #   --grid-plan-multi [n…] (multi-repo, no orchestrator) emit JSON for ONE named worker pane PER CLAUDE_FLEET_REPOS
 #                          (optional positional headings parallel to CLAUDE_FLEET_REPOS order; blank/absent → basename)
 #                          repo — each cut into its own <repo>-fleet-<sid>/<slug>, self-pushing; STATUS = shared coord
+#   --grid-plan-shared N [name…]  (multi-repo, no orchestrator) emit JSON for N GENERAL worker panes, EACH spanning
+#                          EVERY CLAUDE_FLEET_REPOS repo: cuts a worktree per (pane × repo) on fleet/s<sid>/<slug> + a
+#                          per-pane workspace dir (<coord>/workers/<slug>/) symlinking each repo's worktree, used as the
+#                          pane's cwd. Panes are NOT repo-tagged (each spans them all); self-push each repo they change.
 #   --spawn-grid N FILE    (grid mode) open a NEW worker pane N seeded with the brief in FILE (no pane owned it)
 #   --next                 block until a worker is ready; print its slug (or FAILED:<slug>); exit 3 = ALL DONE,
 #                          exit 5 = TIMEOUT (only when CLAUDE_FLEET_NEXT_TIMEOUT>0 seconds is set)
@@ -1576,6 +1580,84 @@ EOF
 # the autonomous grid worker prompt for any repo
 grid_worker_prompt() { generic_worker_prompt "$@"; }
 
+# Write the (full) SHARED-multi grid-worker operating manual ONCE to the coordination .status dir. Unlike the per-repo
+# grid worker, a shared worker's cwd is a WORKSPACE dir with one sub-dir per repo (each a git worktree on the worker's
+# branch), so the "ship" + "self-signal" steps are per-repo and it must cd into a repo sub-dir before any git/self-signal.
+ensure_shared_grid_protocol() {
+  mkdir -p "$STATUS"; printf '%s\n' "$REPO" > "$STATUS/repo"
+  local repolist="" r base first_base="" IFS=:
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    base="$(basename "${r%/}")"
+    repolist="$repolist${repolist:+, }$base"
+    [ -n "$first_base" ] || first_base="$base"
+  done
+  cat > "$STATUS/shared-grid-protocol.md" <<EOF
+# Autonomous SHARED grid-worker operating manual (claude-fleet, multi-repo)
+
+You autonomously OWN one area and ship it yourself, ACROSS SEVERAL REPOS. Your working directory contains ONE sub-dir
+per repository you can work in: ${repolist}. Each sub-dir is that repo's OWN git worktree on YOUR branch
+(${BR_PREFIX}/<your-slug>, cut from that repo's default branch). Edit whichever repos the requirement needs. Wherever
+this file says <your-slug>, use the last segment of your branch.
+
+- FIRST read each repo's CLAUDE.md (repo-root of each sub-dir) + your auto-memory and FOLLOW its rules (build/test/
+  deploy commands, conventions, "don't touch X"). Don't re-derive what's documented.
+- EVERY requirement I send is a persistent TODO — track them with TodoWrite, NEVER drop one. Several may arrive before
+  you finish the first; add each, keep what's in flight, work the list IN ORDER, run the loop for each. PARALLELIZE BY
+  DEPENDENCY: split a requirement into TodoWrite items; run items with NO unmet dependency AND NO shared file AT ONCE as
+  parallel inline subagents (Task tool, several in ONE message); an item that depends on another or edits the SAME file
+  WAITS (each repo sub-dir is ONE worktree → same-file parallelism clobbers).
+- STAY IN YOUR LANE — your area, across these repos, stays in THIS pane (inline subagents; never split your area across
+  panes). Work that belongs to a DIFFERENT pane's area: do NOT edit it, do NOT print paste-text — write the full
+  requirement to /tmp/cfleet_handoff_<your-slug>.txt, then hand off / spawn:
+    a sibling pane already owns it (claude-fleet --statuses) → claude-fleet --handoff "<that pane>" /tmp/cfleet_handoff_<your-slug>.txt
+    no pane owns it yet → claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff_<your-slug>.txt
+- THE LOOP — run end-to-end for each requirement:
+  1. MAKE the changes for the requirement — edit freely across whichever repo sub-dirs it needs; never pause to ask.
+  2. VERIFY it works: run each touched repo's build/test per its CLAUDE.md (run any cache-bust/build step + commit its result too).
+  3. REPORT: met → print "✓ REQUIREMENT MET — <what you verified>. Ready to push."; not met/broken → "✗ NOT MET — <reason>" and keep fixing. NEVER push unmet/broken work.
+  4. For EACH repo you changed, from INSIDE that repo's sub-dir (\`cd <repo-basename>\`):
+     a. COMMIT on your branch — SEPARATE plain commands: \`git add <files>\` then \`git commit -m "..."\`.
+     b. CHECK SIBLING BRANCHES first (shared .git, no fetch): git branch --list '${BR_PREFIX}/*'. If a sibling touched files you also touched, merge their branch in and resolve so you don't clobber them.
+     c. SHIP to that repo's default branch:  git fetch origin  →  git merge origin/<its default branch> (resolve, preserve both intents)  →  git push origin HEAD:<its default branch> (if rejected non-fast-forward, fetch+merge again, re-push). Report the pushed commit. (Auto-deploys on push if the repo is set up that way.) Most repos here use \`main\`; confirm per repo with \`git symbolic-ref --short refs/remotes/origin/HEAD\` (strip the \`origin/\`).
+  5. SELF-SIGNAL DONE: your cwd (the workspace root) is NOT a git repo, so run this from inside ANY repo sub-dir (they're all on your branch):  cd ${first_base} && claude-fleet --done  . Same for progress pings:  cd ${first_base} && claude-fleet --status "<note>" . Re-run --done after EACH requirement; the pane stays alive for more.
+  6. UPDATE MEMORY: a concise durable note of what shipped for your area (what, why, gotchas) per repo. Only touch a repo's CLAUDE.md for project-wide rules (shared — don't churn it).
+EOF
+}
+
+# SHARED-multi grid worker prompt: one general pane spanning EVERY repo in CLAUDE_FLEET_REPOS. wsdir = the per-pane
+# workspace dir (its cwd) whose sub-dirs (one per repo, named by basename) are that repo's worktree on the worker's branch.
+grid_shared_worker_prompt() { # heading slug workspace_dir [initial_requirement]
+  local heading="$1" slug="$2" wsdir="$3" req="${4:-}"
+  local repolist="" r base first_base="" IFS=:
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    base="$(basename "${r%/}")"
+    repolist="$repolist${repolist:+, }$base"
+    [ -n "$first_base" ] || first_base="$base"
+  done
+  local intro closing
+  if [ -n "$req" ]; then
+    intro="YOUR FIRST REQUIREMENT. START the loop on it NOW, without asking:
+
+${req}"
+    closing="Once it ships across every repo it touches, wait for my next requirement for \"${heading}\" and run the loop again for each."
+  else
+    intro="Wait for my requirement for \"${heading}\", then run the loop end-to-end WITHOUT asking permission."
+    closing="Run the loop again for each follow-up requirement for \"${heading}\". Acknowledge and ask me what the requirement is."
+  fi
+  ensure_shared_grid_protocol
+  cat <<EOF
+You are an AUTONOMOUS worker in a Claude Fleet MULTI-REPO run — pane "${heading}" (slug "${slug}"). Your working directory is ${wsdir}, which holds ONE sub-directory per repository you can work across: ${repolist}. Each sub-dir is that repo's own git worktree on branch ${BR_PREFIX}/${slug} (cut from that repo's default branch). You may edit ANY of them. This pane OWNS the "${heading}" area across the whole repo set.
+
+READ ${STATUS}/shared-grid-protocol.md NOW and follow it exactly — it is your operating manual: TodoWrite tracking, per-repo verify→commit→ship, self-signal (cd into a repo sub-dir first), and stay-in-lane handoff/spawn routing. Wherever it says <your-slug>, use "${slug}". To self-signal use e.g.  cd ${first_base} && claude-fleet --done .
+
+${intro}
+
+${closing}
+EOF
+}
+
 # Grid mode: N named, autonomous worker panes for the selected repo; each verifies + pushes to its default branch
 cmd_grid_plan() { # <N> <name1> <name2> ...
   local n="$1"; shift
@@ -1666,6 +1748,81 @@ cmd_grid_plan_multi() { # [heading1 heading2 ...]  optional per-repo pane names,
   printf ']\n'
 }
 
+# Multi-repo SHARED GRID (no orchestrator): N GENERAL worker panes, each spanning EVERY repo in CLAUDE_FLEET_REPOS.
+# Unlike cmd_grid_plan_multi (one pane pinned per repo), here EACH of the N pane slugs gets a worktree in EVERY repo on
+# branch fleet/s<sid>/<slug>, plus a per-pane WORKSPACE dir (<coord>/workers/<slug>/) holding one symlink per repo
+# (named by basename) into that repo's <repo>-fleet-<sid>/<slug> worktree — so the pane's ONE cwd exposes all repos.
+# STATUS stays the shared coordination dir. Writes the coord `members` gc marker + each member fleet's `.status/repo`
+# marker + a per-slug `.repo` sidecar (first member, for --handoff liveness), matching the orchestrated multi path so
+# GC + --handoff resolve. Emits pane JSON WITHOUT a "repo" tag (each pane spans them all).
+cmd_grid_plan_shared() { # <N> [name1 name2 ...]
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--grid-plan-shared is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--grid-plan-shared needs CLAUDE_FLEET_REPOS"
+  local n="$1"; shift || true
+  [ -n "$n" ] || die "--grid-plan-shared needs a count"
+  assert_unique_repo_basenames                   # fail loud on duplicate basenames (would collide onto one fleet)
+  reset_state                                    # coordination STATUS (CLAUDE_FLEET_STATUS_DIR); manifest seeded (REPO=coord)
+  local coord; coord="$(dirname "$STATUS")"      # the coordination dir (parent of .status)
+  # 1) derive the N pane slugs + headings from names (blank/absent → pane-<i>); dedup slugs (each maps to a worktree
+  #    in EVERY repo, so two panes on one slug would collide onto the same branch/dir). bash-3.2: seen = spaced string.
+  local -a P_SLUG P_HEAD
+  local idx=0 name slug base k seen=" "
+  for name in "$@"; do
+    idx=$((idx + 1)); [ "$idx" -le "$n" ] || break
+    slug="$(slugify "$name")"; [ -n "$slug" ] || slug="pane-$idx"
+    base="$slug"; k=2
+    while case "$seen" in *" $slug "*) true ;; *) false ;; esac; do slug="$base-$k"; k=$((k + 1)); done
+    seen="$seen$slug "
+    P_SLUG+=("$slug"); P_HEAD+=("$name")
+  done
+  [ "${#P_SLUG[@]}" -gt 0 ] || die "--grid-plan-shared needs at least one pane name"
+  # 2) for EACH repo: create every pane's worktree in it + wire the workspace symlinks; collect member fleets for gc.
+  local -a member_fleets=()
+  local r rbase wslug wdir branch first_repo="" i
+  local IFS=:
+  for r in $REPOS_LIST; do
+    [ -d "$r/.git" ] || die "not a git repository: $r"
+    select_repo "$r"; fetch_origin              # re-points REPO/FLEET/DBR to this repo (STATUS stays the coord dir)
+    [ -n "$first_repo" ] || first_repo="$REPO"
+    rbase="$(basename "$REPO")"
+    mkdir -p "$FLEET/.status"; printf '%s\n' "$REPO" > "$FLEET/.status/repo"   # member fleet gc marker (G0-G4)
+    member_fleets+=("$FLEET")
+    for i in "${!P_SLUG[@]}"; do
+      wslug="${P_SLUG[$i]}"; branch="$BR_PREFIX/$wslug"; wdir="$FLEET/$wslug"
+      if [ -d "$wdir" ]; then :
+      elif git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$REPO" worktree add "$wdir" "$branch" >&2
+      else
+        git -C "$REPO" worktree add -b "$branch" "$wdir" "origin/$DBR" >/dev/null 2>&1 \
+          || git -C "$REPO" worktree add -b "$branch" "$wdir" "$DBR" >&2
+      fi
+      link_shared_dirs "$wdir"
+      mkdir -p "$coord/workers/$wslug"
+      ln -sfn "$wdir" "$coord/workers/$wslug/$rbase"   # the pane's cwd exposes this repo as ./<basename> (-n: replace an existing symlink-to-dir)
+    done
+  done
+  # 3) per-slug board state on the shared coord (slug-keyed, once per pane): manifest + reset markers + .repo sidecar.
+  for i in "${!P_SLUG[@]}"; do
+    wslug="${P_SLUG[$i]}"
+    printf '%s\n' "$wslug" >> "$MANIFEST"
+    rm -f "$STATUS/$wslug.done" "$STATUS/$wslug.merged" "$STATUS/$wslug.closed" "$STATUS/$wslug.working"
+    printf '%s\n' "$first_repo" > "$STATUS/$wslug.repo"   # sidecar → first member (any works for --handoff liveness)
+  done
+  mkdir -p "$coord/.status"
+  printf '%s\n' "${member_fleets[@]}" > "$coord/.status/members"   # gc: reap coord only once every member fleet is gone
+  # 4) emit pane JSON — cwd = the per-pane workspace dir; NO "repo" tag (each pane spans every repo).
+  printf '['
+  local firstj=1
+  for i in "${!P_SLUG[@]}"; do
+    [ "$firstj" = 1 ] && firstj=0 || printf ','
+    wslug="${P_SLUG[$i]}"
+    printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}' \
+      "$(json_str "$wslug")" "$(json_str "${P_HEAD[$i]}")" "$(json_str "$coord/workers/$wslug")" \
+      "$(json_str "$(grid_shared_worker_prompt "${P_HEAD[$i]}" "$wslug" "$coord/workers/$wslug")")"
+  done
+  printf ']\n'
+}
+
 # Grid mode: add ONE more named worker to an ALREADY-RUNNING fleet (no state reset). Emits a single
 # JSON object the app turns into a new pane — same shape as one element of --grid-plan's array.
 cmd_grid_add() { # <name>
@@ -1725,6 +1882,7 @@ case "${1:-}" in
   --orchestrator) cmd_orchestrator ;;
   --grid-plan)    shift; cmd_grid_plan "$@" ;;
   --grid-plan-multi) shift; cmd_grid_plan_multi "$@" ;;
+  --grid-plan-shared) shift; cmd_grid_plan_shared "$@" ;;
   --grid-add)     shift; cmd_grid_add "${1:-}" ;;
   --spawn)        shift; cmd_spawn "$@" ;;
   --spawn-file)   shift; cmd_spawn_file "$@" ;;

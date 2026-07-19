@@ -209,9 +209,9 @@
           <span class="otxt"><b>Use orchestrator</b> — one lead splits your goal across worker terminals, integrates, and pushes. Uncheck to open named worker panes you task directly.</span></label>
 
         <div id="gridCfg" style="display:none">
-          <div class="label">Panes <span class="hintnote">— each is a worker you task directly, max 9</span></div>
+          <div class="label">Panes <span class="hintnote" id="paneCountHint">— each is a worker you task directly, max 9</span></div>
           <div class="counts" id="counts"></div>
-          <div class="label">Pane names <span class="hintnote">— each owns its area and pushes itself</span></div>
+          <div class="label">Pane names <span class="hintnote" id="paneNamesHint">— each owns its area and pushes itself</span></div>
           <div class="heads" id="heads"></div>
         </div>
       </section>
@@ -289,6 +289,8 @@
   const gridCfg = document.getElementById('gridCfg');
   const countsEl = document.getElementById('counts');
   const headsEl = document.getElementById('heads');
+  const paneCountHint = document.getElementById('paneCountHint');
+  const paneNamesHint = document.getElementById('paneNamesHint');
   let repo = '', repoNWO = '', repoBranch = 'main', account = '', count = 3, newProject = false;
   let mode = 'single', gyfAll = [], gyfChecked = new Set(), gyfLoadedAccount = null;
   const gyfPaneNames = {};   // multi + orchestrator OFF: user-typed worker-pane names, keyed by repo nameWithOwner (preserved across re-renders)
@@ -479,6 +481,12 @@
   repoSel.onchange = selectRepo;
 
   // --- orchestrator toggle + (when off) named worker panes: count + names ---
+  // gridCfg (the 1–9 count + names UI) is SHARED by Single mode (each pane owns one area of the one repo) and Multi
+  // mode + orchestrator OFF (each pane is a GENERAL worker spanning ALL checked repos). Retarget the hint copy per mode.
+  function setGridHints(spansAllRepos) {
+    if (paneCountHint) paneCountHint.textContent = spansAllRepos ? '— each worker spans all checked repos, max 9' : '— each is a worker you task directly, max 9';
+    if (paneNamesHint) paneNamesHint.textContent = spansAllRepos ? '— each spans every checked repo & pushes itself' : '— each owns its area and pushes itself';
+  }
   for (let i = 1; i <= 9; i++) { const b = document.createElement('button'); b.textContent = i; b.onclick = () => { count = i; renderGrids(); }; countsEl.appendChild(b); }
   function renderGrids() {
     [...countsEl.children].forEach((b, i) => b.classList.toggle('on', i + 1 === count));
@@ -498,19 +506,21 @@
     const on = useOrchEl.checked;
     if (!on && newProject) setNewProject(false);   // named-pane mode can't be a scratch new-project; clear it
     if (mode === 'gyftalala') {
-      // Multi-repo: the workers are DERIVED from the checked repos (one pane per repo), so the single-project grid
-      // count/names UI never shows here. When the orchestrator is OFF we show a per-repo worker-pane naming section
-      // (#gyfPanes) so the mode isn't a blank void; ON hides it. The button label reflects the orchestrator choice.
-      gridCfg.style.display = 'none';
+      // Multi-repo: orchestrator ON (default) = super-orchestrator that derives its own workers across the repos.
+      // OFF = N GENERAL worker panes, EACH spanning ALL checked repos — shown with the SAME 1–9 count + names UI as
+      // Single mode (gridCfg). The repo checklist (right column) selects WHICH repos every pane spans. The button
+      // label reflects the orchestrator choice.
+      if (on) { gridCfg.style.display = 'none'; }
+      else { gridCfg.style.display = ''; setGridHints(true); renderGrids(); }
       goEl.textContent = on ? 'Launch multi-repo fleet' : 'Launch multi-repo panes';
-      renderGyfPanes();
+      renderGyfPanes();   // no-op hide of the retired per-repo #gyfPanes section
       fit();
       return;
     }
     gridCfg.style.display = on ? 'none' : '';
     goEl.textContent = on ? 'Launch fleet' : 'Launch panes';
     renderGyfPanes();   // hides #gyfPanes in single-project mode (guarded inside)
-    if (!on) renderGrids(); else fit();
+    if (!on) { setGridHints(false); renderGrids(); } else fit();
   }
   useOrchEl.onchange = syncOrch;
 
@@ -587,30 +597,11 @@
     });
     updateRepoCount(); refreshGo(); renderGyfPanes(); fit();
   }
-  // Multi + orchestrator OFF: one editable name row per CHECKED repo (checklist order). The pane defaults to the repo
-  // basename; a typed name overrides only the human heading (the worktree/slug is still basename-keyed by the CLI).
-  // User-typed values persist across re-renders (keyed by nameWithOwner) so re/un-checking siblings never loses them.
+  // The old "one worker pane per checked repo" naming UI (#gyfPanes) is RETIRED: in multi + orchestrator OFF the panes
+  // now come from the shared Single-mode count(1–9)+names grid (#gridCfg), and each pane spans ALL checked repos. Kept
+  // as a no-op hide so any lingering caller (renderGyfRepos fires it on every repo toggle) can't resurrect the section.
   function renderGyfPanes() {
-    if (!gyfPanesEl) return;
-    if (!(mode === 'gyftalala' && !useOrchEl.checked)) { gyfPanesEl.style.display = 'none'; return; }
-    gyfPanesEl.style.display = '';
-    [...gyfPaneListEl.querySelectorAll('input')].forEach((inp) => { gyfPaneNames[inp.dataset.nwo] = inp.value; });   // snapshot current edits before rebuild
-    gyfPaneListEl.innerHTML = '';
-    const sel = checkedGyfRepos();
-    if (!sel.length) {
-      const d = document.createElement('div'); d.className = 'gyfpane-hint';
-      d.textContent = 'Check repos above — each becomes a worker pane.';
-      gyfPaneListEl.appendChild(d); return;
-    }
-    sel.forEach((r) => {
-      const base = r.nameWithOwner.split('/').pop() || r.nameWithOwner;
-      const row = document.createElement('div'); row.className = 'gyfpane-row';
-      const tag = document.createElement('div'); tag.className = 'gyfpane-repo'; tag.textContent = base; tag.title = r.nameWithOwner;
-      const inp = document.createElement('input'); inp.dataset.nwo = r.nameWithOwner; inp.placeholder = base;
-      inp.value = gyfPaneNames[r.nameWithOwner] !== undefined ? gyfPaneNames[r.nameWithOwner] : '';
-      inp.oninput = () => { gyfPaneNames[r.nameWithOwner] = inp.value; };
-      row.appendChild(tag); row.appendChild(inp); gyfPaneListEl.appendChild(row);
-    });
+    if (gyfPanesEl) gyfPanesEl.style.display = 'none';
   }
   function updateRepoCount() {
     if (repoCountEl) repoCountEl.innerHTML = '<b>' + gyfChecked.size + '</b> selected';
@@ -636,9 +627,15 @@
       const sel = checkedGyfRepos();
       if (!sel.length) { errEl.textContent = 'Check at least one repo.'; return; }
       goEl.disabled = true; goEl.textContent = 'Setting up…';
-      // orchestrator ON (default) = super-orchestrator across the repos; OFF = one named worker pane per repo, each
-      // self-pushing its own repo (still autonomous — grid workers push themselves).
-      const res = await window.fleet.launch({ mode: 'gyftalala', account, repos: sel, autonomous: true, orchestrator: useOrchEl.checked });
+      // orchestrator ON (default) = super-orchestrator across the repos; OFF = N GENERAL worker panes, EACH spanning
+      // ALL checked repos (count + names from the shared grid UI), each self-pushing every repo it changes.
+      const orch = useOrchEl.checked;
+      const payload = { mode: 'gyftalala', account, repos: sel, autonomous: true, orchestrator: orch };
+      if (!orch) {
+        payload.count = count;
+        payload.names = [...headsEl.querySelectorAll('input')].map((inp) => inp.value.trim() || inp.placeholder);   // blank → placeholder
+      }
+      const res = await window.fleet.launch(payload);
       if (!(res && res.ok)) { errEl.textContent = (res && res.error) || 'Launch failed.'; goEl.disabled = false; setMode('gyftalala'); }
       return;
     }
