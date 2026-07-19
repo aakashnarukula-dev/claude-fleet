@@ -920,9 +920,9 @@ ipcMain.handle('list-account-repos', async (_e, account) => {
 function addGridWorker(sid, name) {
   const s = sessions[sid];
   if (!s || s.mode !== 'grid') return Promise.resolve({ ok: false, error: 'not a grid session' });
-  // Multi-repo grid: panes are ONE-per-repo (derived from the checked repos), and --grid-add has no repo to target
-  // (s.repo is the coordination dir, not a git repo). +Pane isn't supported here — add another repo at launch instead.
-  if (s.coordDir) return Promise.resolve({ ok: false, error: 'multi-repo grid: one pane per repo — +Pane not supported' });
+  // Multi-repo grid: the pane set is FIXED at launch (shared workers each span all repos, plus an optional Integrator
+  // pane), and +Pane has no single repo to target (s.repo is the coordination dir, not a git repo). Add more panes at launch.
+  if (s.coordDir) return Promise.resolve({ ok: false, error: 'multi-repo grid: panes are fixed at launch — +Pane not supported' });
   if (!s.planReady) return Promise.resolve({ ok: false, error: 'session is still starting — try again in a moment' });
   const nm = String(name || '').trim();
   if (!nm) return Promise.resolve({ ok: false, error: 'name required' });

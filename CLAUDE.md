@@ -191,7 +191,6 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   every repo; `paneRepo` falls back to `s.repos[0]` for the repo-less pane. Each worker
   commits + self-pushes its own branch in each repo it changed, then `--done`. `main.js`
   `runGridPlanShared` shells the verb; orchestrated-multi + single-grid paths are UNCHANGED.
-  (Stale: `main.js` +Pane guard still says "one pane per repo" — +Pane unsupported in shared mode.)
 - **Integrator mode (added 2026-07-19):** ADDITIVE option on the shared N-pane multi-repo grid
   (multi + orchestrator OFF). A FIXED dedicated 9th pane named **Integrator** owns ALL pushing;
   worker count caps at 1–8. The 8 workers commit + `--done` and DO NOT push (spawnPane withholds
