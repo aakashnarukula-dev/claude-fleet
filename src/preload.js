@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('fleet', {
   onAddPane: (cb) => ipcRenderer.on('add-pane', (_e, d) => cb(d)),
   newSession: () => ipcRenderer.send('new-session'),
   addGridWorker: ({ sid, name }) => ipcRenderer.invoke('add-grid-worker', { sid, name }),
+  addProduct: ({ sid, name }) => ipcRenderer.invoke('add-product', { sid, name }),   // PRODUCTS mode: add one product (task-orchestrator pane) to a running session
 
   // GitHub accounts (gh multi-account)
   ghAccounts: () => ipcRenderer.invoke('gh-accounts'),
