@@ -50,7 +50,8 @@
   .pane { display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; background:var(--bg); }
   .pbar { -webkit-app-region:no-drag; display:flex; align-items:center; gap:8px; padding:6px 8px 6px 12px; border-bottom:1px solid var(--line); font-size:12px; font-weight:600; flex:none; color:#fff; background:var(--bar); }
   .pbar .ptitle { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .pbar.orchestrator .ptitle { color:#e8915f; }   /* role shown by TEXT colour now, not a filled bar */
+  .pbar.orchestrator .ptitle, .pbar.integrator .ptitle { color:#e8915f; font-weight:700; }   /* coordinator panes: role shown by TEXT colour (not a filled bar) — the Integrator reads like the Orchestrator */
+  .pbar.orchestrator, .pbar.integrator { box-shadow:inset 3px 0 0 #e8915f; }                  /* + a left accent stripe so the special pane stands out from plain workers */
   .pbar.worker .ptitle { color:#7aa2e3; }
   /* per-pane status dot: a dot means "wants your attention"; working = no dot (clean) */
   .pbar .pdot { display:none; width:8px; height:8px; border-radius:50%; flex:none; }
@@ -338,7 +339,9 @@
     const pane = document.createElement('div'); pane.className = 'pane';
     const bar = document.createElement('div'); bar.className = 'pbar ' + p.role;
     bar.innerHTML = `<span class="pdot"></span><span class="ptitle">${escapeHtml(p.heading)}</span><span class="pclose" title="Close pane">×</span>`;
-    bar.querySelector('.ptitle').style.color = TITLE_COLORS[p.id % TITLE_COLORS.length];   // unique per-pane identity colour, overrides role-based .ptitle CSS
+    // unique per-pane identity colour, overrides role-based .ptitle CSS — but NOT for coordinator panes (orchestrator /
+    // integrator): they keep their role accent (#e8915f) so a special pane reads distinctly from the plain workers.
+    if (p.role !== 'orchestrator' && p.role !== 'integrator') bar.querySelector('.ptitle').style.color = TITLE_COLORS[p.id % TITLE_COLORS.length];
     bar.querySelector('.pclose').addEventListener('click', (e) => { e.stopPropagation(); closePane(sid, p.id); });
     const termEl = document.createElement('div'); termEl.className = 'term';
     pane.appendChild(bar); pane.appendChild(termEl); grid.appendChild(pane);

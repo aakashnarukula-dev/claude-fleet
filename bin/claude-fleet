@@ -2150,19 +2150,20 @@ cmd_grid_plan_integrator() { # <N> [name1 name2 ...]
   done
   mkdir -p "$coord/.status"
   printf '%s\n' "${member_fleets[@]}" > "$coord/.status/members"   # gc: reap coord only once every member fleet is gone
-  # 4) emit pane JSON — N worker panes (workspace cwd, no "repo" tag, commit + --done only) + the fixed Integrator pane
-  #    (cwd = coord dir, integrate-only prompt, xhigh effort → max reasoning for conflict resolution / coordination).
+  # 4) emit pane JSON — the fixed Integrator pane FIRST (so it renders top-left as pane 0), then N worker panes.
+  #    Integrator: cwd = coord dir, integrate-only prompt, xhigh effort → max reasoning for conflict resolution /
+  #    coordination. Workers: workspace cwd, no "repo" tag, commit + --done only. The app keys pane id = array index,
+  #    so integrator-first here makes it id 0 → first grid slot; workers shift to ids 1..N (routing is slug-based).
   printf '['
-  local firstj=1
+  printf '{"role":"integrator","slug":"integrator","heading":"Integrator","dir":%s,"effort":"xhigh","prompt":%s}' \
+    "$(json_str "$coord")" "$(json_str "$(spawn_integrator_prompt "$coord")")"
   for i in "${!P_SLUG[@]}"; do
-    [ "$firstj" = 1 ] && firstj=0 || printf ','
+    printf ','
     wslug="${P_SLUG[$i]}"
     printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}' \
       "$(json_str "$wslug")" "$(json_str "${P_HEAD[$i]}")" "$(json_str "$coord/workers/$wslug")" \
       "$(json_str "$(integrator_worker_prompt "${P_HEAD[$i]}" "$wslug" "$coord/workers/$wslug")")"
   done
-  printf ',{"role":"integrator","slug":"integrator","heading":"Integrator","dir":%s,"effort":"xhigh","prompt":%s}' \
-    "$(json_str "$coord")" "$(json_str "$(spawn_integrator_prompt "$coord")")"
   printf ']\n'
 }
 
@@ -2187,6 +2188,73 @@ cmd_grid_add() { # <name>
   printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}\n' \
     "$(json_str "$slug")" "$(json_str "$name")" "$(json_str "$dir")" \
     "$(json_str "$(grid_worker_prompt "$name" "$slug" "$dir")")"
+}
+
+# Multi-repo SHARED / INTEGRATOR grid: add ONE more named worker to an ALREADY-RUNNING multi-repo session (no
+# reset). Mirrors ONE iteration of cmd_grid_plan_shared/cmd_grid_plan_integrator but append-only: it cuts a worktree
+# in EVERY repo on fleet/s<sid>/<slug>, builds the per-pane workspace dir (<coord>/workers/<slug>/ with one symlink
+# per repo, used as the pane's cwd), appends the slug's board state, and emits a SINGLE pane JSON object (same shape
+# as one element of the plan array). It does NOT touch each repo's _main (the integration checkouts already exist
+# from launch) and does NOT rewrite the coord `members` marker (the member fleet set is unchanged). <mode> selects
+# the worker prompt: "integrator" → integrator_worker_prompt (commit + --done only; the Integrator pane pushes),
+# anything else → grid_shared_worker_prompt (worker self-pushes). The "integrator" slug is RESERVED (never handed out).
+cmd_grid_add_shared() { # <name> <mode:integrator|shared>
+  [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] || die "--grid-add-shared is multi-repo only (set CLAUDE_FLEET_MULTI=1 + CLAUDE_FLEET_REPOS)"
+  [ -n "$REPOS_LIST" ] || die "--grid-add-shared needs CLAUDE_FLEET_REPOS"
+  local name="$1" mode="${2:-shared}"
+  [ -n "$name" ] || die "--grid-add-shared needs a worker name"
+  [ -d "$STATUS" ] || die "no active grid session"
+  local coord; coord="$(dirname "$STATUS")"      # the coordination dir (parent of .status)
+  local IFS=:                                     # colon-split REPOS_LIST for the whole function (existing idiom)
+  # 1) derive a UNIQUE slug: slugify (blank → "pane"); "integrator" is RESERVED; bump -2/-3/... while the slug is
+  #    already present in the MANIFEST or as a worktree dir in ANY member fleet (a slug maps to a branch/dir per repo).
+  local slug base k=2 r taken
+  slug="$(slugify "$name")"; [ -n "$slug" ] || slug="pane"; base="$slug"
+  while :; do
+    taken=0
+    if [ "$slug" = integrator ] || grep -qx "$slug" "$MANIFEST" 2>/dev/null; then taken=1; fi
+    if [ "$taken" = 0 ]; then
+      for r in $REPOS_LIST; do
+        [ -n "$r" ] || continue
+        if [ -e "$SESSIONS_DIR/$(basename "${r%/}")-fleet${SESSION:+-$SESSION}/$slug" ]; then taken=1; break; fi
+      done
+    fi
+    if [ "$taken" = 0 ]; then break; fi
+    slug="$base-$k"; k=$((k + 1))
+  done
+  # 2) for EACH repo: cut (or reuse) the worktree on fleet/s<sid>/<slug> + wire the workspace symlink. NO _main touch.
+  local rbase wdir branch first_repo=""
+  for r in $REPOS_LIST; do
+    [ -n "$r" ] || continue
+    [ -d "$r/.git" ] || die "not a git repository: $r"
+    select_repo "$r"; fetch_origin              # re-points REPO/FLEET/DBR to this repo (STATUS stays the coord dir)
+    [ -n "$first_repo" ] || first_repo="$REPO"
+    rbase="$(basename "$REPO")"
+    branch="$BR_PREFIX/$slug"; wdir="$FLEET/$slug"
+    if [ -d "$wdir" ]; then :
+    elif git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$REPO" worktree add "$wdir" "$branch" >&2
+    else
+      git -C "$REPO" worktree add -b "$branch" "$wdir" "origin/$DBR" >/dev/null 2>&1 \
+        || git -C "$REPO" worktree add -b "$branch" "$wdir" "$DBR" >&2
+    fi
+    link_shared_dirs "$wdir"
+    mkdir -p "$coord/workers/$slug"
+    ln -sfn "$wdir" "$coord/workers/$slug/$rbase"   # the pane's cwd exposes this repo as ./<basename>
+  done
+  # 3) per-slug board state on the shared coord (once): manifest + reset markers + .repo sidecar (→ first member).
+  printf '%s\n' "$slug" >> "$MANIFEST"
+  rm -f "$STATUS/$slug.done" "$STATUS/$slug.merged" "$STATUS/$slug.closed" "$STATUS/$slug.working"
+  printf '%s\n' "$first_repo" > "$STATUS/$slug.repo"
+  # 4) emit ONE pane JSON object — cwd = the per-pane workspace dir; NO "repo" tag (the pane spans every repo).
+  local prompt
+  if [ "$mode" = integrator ]; then
+    prompt="$(integrator_worker_prompt "$name" "$slug" "$coord/workers/$slug")"
+  else
+    prompt="$(grid_shared_worker_prompt "$name" "$slug" "$coord/workers/$slug")"
+  fi
+  printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}\n' \
+    "$(json_str "$slug")" "$(json_str "$name")" "$(json_str "$coord/workers/$slug")" "$(json_str "$prompt")"
 }
 
 # Grid mode: a worker SPAWNS a brand-new worker pane for an area NO pane owns yet, seeded with the
@@ -2228,6 +2296,7 @@ case "${1:-}" in
   --grid-plan-shared) shift; cmd_grid_plan_shared "$@" ;;
   --grid-plan-integrator) shift; cmd_grid_plan_integrator "$@" ;;
   --grid-add)     shift; cmd_grid_add "${1:-}" ;;
+  --grid-add-shared) shift; cmd_grid_add_shared "${1:-}" "${2:-}" ;;
   --spawn)        shift; cmd_spawn "$@" ;;
   --spawn-file)   shift; cmd_spawn_file "$@" ;;
   --handoff)      shift; cmd_handoff "${1:-}" "${2:-}" ;;
