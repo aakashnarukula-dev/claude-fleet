@@ -38,6 +38,10 @@
 #   --watch                like --next but never exits on ALL DONE (waits for follow-up changes); a recorded
 #                          need must persist >=CLAUDE_FLEET_NEED_GRACE sec (default 8) before it wakes the orchestrator
 #   --merged S             mark slug S integrated (also clears a FAILED slug once the orchestrator has handled it)
+#   --hold S               (orchestrator/integrator-side) DEFER slug S out of the ready queue: --next/--watch/--ready SKIP
+#                          it like --merged, so an un-landable worker (red test-gate / FAILED / backed-out partial merge)
+#                          can't head-of-line-block the ready workers behind it. A fresh --done from that worker CLEARS the
+#                          hold (cmd_done re-arm) and re-arms it as live pending work.
 #   --done                 (inside a worker worktree) signal finished; re-arms if it was already merged
 #   --failed               (inside a worker worktree) signal it could NOT finish — orchestrator re-plans, doesn't hang
 #   --conflicts            list files touched by >1 unmerged worker (pre-merge collision radar)
@@ -680,23 +684,39 @@ INCREMENTAL LOOP — do NOT wait for all workers; land each worker the moment it
    — it lists any file touched by MORE THAN ONE unmerged worker (the overlap radar).
 3. For each ready slug S, find WHICH repos it actually changed:  claude-fleet --touched S  (prints the basenames of the
    repos whose ${BR_PREFIX}/S branch is ahead of that repo's _main — the ONLY repos to touch for S).
-4. NON-OVERLAPPING worker (S shares no file with any other unmerged worker per --conflicts) → LAND IT NOW, don't wait:
-     For EACH repo R that  claude-fleet --touched S  printed:  cd <R's _main path above>  then  git merge --no-ff ${BR_PREFIX}/S
-       On conflict, read BOTH sides first — git log --oneline HEAD..${BR_PREFIX}/S — then resolve preserving both intents.
-     TEST-GATE every touched repo with its build/test (per R's CLAUDE.md; run any cache-bust/build step). If a repo
-       FAILS: do NOT push it — print "✗ HELD S in <R> — <failure>" in this pane, leave S UN-merged (do NOT run
-       claude-fleet --merged), and move on. NEVER push red.
-     PUSH the per-worker changeset ATOMICALLY — ONLY the repos S touched, all-or-none:
-       claude-fleet --ship <touched repo basenames…>     (dry-runs each, pushes all or none; resumable if a push fails)
-     Then:  claude-fleet --merged S
-5. OVERLAPPING workers (--conflicts shows S and a sibling touch the same file) → SERIALIZE just those: merge them into the
-   shared repo's _main ONE AT A TIME. Read BOTH sides (git log --oneline HEAD..${BR_PREFIX}/<slug> for each) and resolve
-   preserving BOTH intents. Test-gate, then  claude-fleet --ship <touched repos…>  for the group, then claude-fleet
-   --merged for EACH. Merge the non-overlapping rest freely (step 4).
+4. NON-OVERLAPPING worker (S shares no file with any other unmerged worker per --conflicts) → LAND IT NOW, don't wait.
+   Per-worker integration is ATOMIC across the repos S touched: either the WHOLE changeset lands (every touched repo's
+   _main advanced + pushed), or NONE of it stays — no repo is left carrying HALF a cross-repo change.
+     a. FIND the touched repos:  claude-fleet --touched S  (prints the basenames whose ${BR_PREFIX}/S branch is ahead of
+        that repo's _main — the ONLY repos to touch for S). If it prints NOTHING — the worker committed no changes, or its
+        commits are already integrated — there is nothing to ship: just run  claude-fleet --merged S  and go back to step 1.
+        Do NOT call --ship with no repos (it errors "needs at least one repo").
+     b. RECORD each touched repo's pre-merge tip so you can back S out precisely on failure: for EACH touched repo R,
+        cd <R's _main path above>  and note  git rev-parse HEAD  as R_PRE. Keep this R_PRE list for S.
+     c. MERGE S into EACH touched repo:  cd <R's _main>  then  git merge --no-ff ${BR_PREFIX}/S
+        On conflict, read BOTH sides first — git log --oneline HEAD..${BR_PREFIX}/S — then resolve preserving both intents.
+     d. TEST-GATE every touched repo with its build/test (per R's CLAUDE.md; run any cache-bust/build step).
+     e. If EVERY touched repo PASSES → PUSH the changeset ATOMICALLY, ONLY the repos S touched, all-or-none:
+          claude-fleet --ship <touched repo basenames…>     (dry-runs each, pushes all or none; resumable if a push fails)
+        Then:  claude-fleet --merged S .
+     f. If ANY touched repo FAILS the gate (red build/test) OR a conflict you cannot resolve → do NOT push anything, and
+        BACK OUT S from EVERY touched repo whose _main you already advanced: for each such R,  cd <R's _main>  then
+        git reset --hard <that repo's R_PRE>  (use the recorded pre-merge ref, NOT HEAD@{1}, so any resolve commits you made
+        are undone too). This leaves NO _main carrying S. Then DEFER S so it does NOT head-of-line-block the workers behind
+        it:  claude-fleet --hold S  , print "✗ HELD S — <failure>", and go back to step 1. A re-tasked worker (its next
+        --done) AUTO-CLEARS the hold and re-arms S as live work. NEVER push red, NEVER leave a partial cross-repo merge.
+5. OVERLAPPING workers (--conflicts shows S and a sibling touch the same file — paths are repo-namespaced <repo>/<path>, so
+   this reflects ALL repos, not just the first) → SERIALIZE just those: land them ONE AT A TIME, each with the SAME atomic
+   discipline as step 4 (find touched → record each _main's pre-merge tip → merge every touched repo → test-gate all → on
+   GREEN: --ship all-or-none + --merged; on RED/unresolvable: reset every advanced _main to its recorded tip + claude-fleet
+   --hold S + step 1). Read BOTH sides (git log --oneline HEAD..${BR_PREFIX}/<slug> for each) and resolve preserving BOTH
+   intents. Merge the non-overlapping rest freely (step 4).
 6. GENUINE DOUBT about intent (a conflict you cannot confidently resolve, or ambiguous overlapping requirements) → do NOT
    guess and do NOT push. PRINT a clear, specific question in THIS pane and WAIT for the user to answer, then resolve + ship.
-7. FAILED:S → that worker gave up: do NOT merge it. Print "✗ FAILED:S — <the pane's reason>" and leave it for the user to
-   re-task that pane. (If you want --watch to stop counting it,  claude-fleet --merged S  clears it.)
+7. FAILED:S → that worker gave up: do NOT merge it. Print "✗ FAILED:S — <the pane's reason>", then DEFER it so it can't
+   head-of-line-block the ready queue:  claude-fleet --hold S . Leave the pane for the user to re-task — its next --done
+   AUTO-CLEARS the hold and re-arms S as live work. (--hold, like --merged, drops S from --next/--watch/--ready without
+   losing it — but unlike --merged it records no integration.)
 8. NEED:S → a worker recorded a prerequisite/follow-up ( claude-fleet --needs  shows it). You do NOT spawn workers —
    relay it to the user (which pane, what it needs); once it's handled  claude-fleet --need-clear S  so it stops re-firing.
 9. Go back to step 1 ( claude-fleet --watch ). A worker the user RE-TASKS re-runs --done → --watch wakes again and you
@@ -994,12 +1014,33 @@ cmd_done() {
   local branch slug
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
   case "$branch" in "$BR_PREFIX"/*) slug="${branch#"$BR_PREFIX"/}" ;; *) die "branch '$branch' is not a $BR_PREFIX/* worker" ;; esac
-  rm -f "$STATUS/$slug.merged" "$STATUS/$slug.failed" "$STATUS/$slug.handoff" "$STATUS/$slug.working"   # re-arm; supersedes prior FAILED; clears any outstanding handoff; clears the app's live .working bridge (explicit --done supersedes it)
-  # P3: auto-record files this worker touched so the orchestrator can detect cross-branch overlaps (--conflicts)
-  set_default_branch
-  local cbase
-  cbase="$(git merge-base HEAD "origin/$DBR" 2>/dev/null || git merge-base HEAD "$DBR" 2>/dev/null || true)"
-  [ -n "$cbase" ] && git diff --name-only "$cbase" HEAD > "$STATUS/$slug.claims" 2>/dev/null || true
+  rm -f "$STATUS/$slug.merged" "$STATUS/$slug.failed" "$STATUS/$slug.handoff" "$STATUS/$slug.working" "$STATUS/$slug.held"   # re-arm; supersedes prior FAILED; clears any outstanding handoff; clears the app's live .working bridge; clears a Integrator .held defer (a re-tasked worker re-arms as live pending work — Fix 1)
+  # P3: auto-record files this worker touched so the orchestrator/Integrator can detect cross-branch overlaps (--conflicts).
+  # MULTI-REPO (Fix 3): a worker spans several repos but runs --done ONCE from a single repo sub-dir, so a plain single-repo
+  # `git diff` here would see only THAT repo — missing cross-repo overlaps AND false-positiving on same-named files in
+  # different repos (paths carry no repo). Instead compute claims across EVERY repo the worker's branch changed, each file
+  # NAMESPACED as <repo-basename>/<path> (union), mirroring cmd_touched's "branch ahead of that repo's _main" logic. The
+  # single-repo path (no CLAUDE_FLEET_MULTI/REPOS_LIST) is UNCHANGED.
+  if [ "${CLAUDE_FLEET_MULTI:-}" = 1 ] && [ -n "$REPOS_LIST" ]; then
+    local r odir rbase mb claims_tmp="$STATUS/$slug.claims.tmp" IFS=:
+    : > "$claims_tmp"
+    for r in $REPOS_LIST; do
+      [ -n "$r" ] || continue
+      select_repo "$r"; odir="$FLEET/_main"; rbase="$(basename "$REPO")"
+      [ -d "$odir" ] || continue
+      git -C "$odir" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null 2>&1 || continue
+      mb="$(git -C "$odir" merge-base HEAD "refs/heads/$branch" 2>/dev/null || true)"
+      [ -n "$mb" ] || continue
+      git -C "$odir" diff --name-only "$mb" "refs/heads/$branch" 2>/dev/null \
+        | while IFS= read -r f; do [ -n "$f" ] && printf '%s/%s\n' "$rbase" "$f"; done >> "$claims_tmp"
+    done
+    mv -f "$claims_tmp" "$STATUS/$slug.claims"
+  else
+    set_default_branch
+    local cbase
+    cbase="$(git merge-base HEAD "origin/$DBR" 2>/dev/null || git merge-base HEAD "$DBR" 2>/dev/null || true)"
+    [ -n "$cbase" ] && git diff --name-only "$cbase" HEAD > "$STATUS/$slug.claims" 2>/dev/null || true
+  fi
   touch "$STATUS/$slug.done"
   printf 'Marked "%s" done. Orchestrator will integrate it.\n' "$slug"
 }
@@ -1016,6 +1057,10 @@ cmd_next() {
       # --done. Treat it like merged: skip it so it neither blocks --next nor keeps ALL DONE from firing. (Don't report
       # it as work; the orchestrator should spawn fresh if it still needs that thread.)
       [ -f "$STATUS/$s.closed" ] && continue
+      # A .held worker was DEFERRED by the Integrator (un-landable: red test-gate / FAILED / backed-out partial merge).
+      # Treat it like merged for the queue: skip it so it neither head-of-line-blocks the ready workers behind it nor keeps
+      # ALL DONE from firing. A fresh --done clears .held (cmd_done) and re-arms it as live pending work. (Fix 1)
+      [ -f "$STATUS/$s.held" ] && continue
       # An outstanding .handoff keeps a worker tracked as ACTIVE even if a .merged marker lingers — never report
       # ALL DONE while handed-off work hasn't re-signalled --done. (A re-armed handoff has .merged removed anyway;
       # this is belt-and-suspenders so ALL DONE can never fire over a pending handoff.)
@@ -1052,6 +1097,9 @@ cmd_watch() {
       [ -n "$s" ] || continue
       # A CLOSED pane is DEAD — skip it so it neither wakes the watcher (stale .done/.failed) nor blocks. (Mirrors --next.)
       [ -f "$STATUS/$s.closed" ] && continue
+      # A .held worker was DEFERRED by the Integrator (un-landable) — skip it so it can't head-of-line-block the queue;
+      # a fresh --done clears .held and re-arms it. (Mirrors --next; Fix 1.)
+      [ -f "$STATUS/$s.held" ] && continue
       # A recorded need wakes the watcher even from an already-integrated worker
       # (a post-merge follow-up request). OPT-IN via CLAUDE_FLEET_WATCH_NEEDS=1 so
       # it doesn't change the legacy contract for orchestrators that only parse
@@ -1096,6 +1144,18 @@ cmd_merged() {
   advance_canonical_branch || die "could not advance canonical $DBR to the integrated state (see REFUSED line above) — resolve before continuing; do NOT --clean or the integrated commits will be lost."
 }
 
+# Fix 1: DEFER an un-landable worker out of the ready queue (Integrator-side). The Integrator couldn't land slug S
+# (red test-gate, FAILED, or a backed-out partial cross-repo merge) and does NOT want it to head-of-line-block the
+# ready workers behind it. Writes <slug>.held so --next/--watch/--ready SKIP it (like .merged) — it no longer blocks
+# or reports as pending, and ALL DONE can still fire once every non-held slug is merged. A fresh --done from the worker
+# (the user re-tasks the pane) CLEARS .held (see cmd_done) and re-arms it as live pending work. Worker-agnostic (any
+# slug), unlike --merged it does NOT record integration — a held slug is deferred, not done.
+cmd_hold() {
+  [ -n "${1:-}" ] || die "--hold needs a slug"; [ -d "$STATUS" ] || die "no active fleet"
+  touch "$STATUS/$1.held"
+  printf 'Held "%s" — deferred out of the ready queue; a fresh --done from that worker re-arms it.\n' "$1"
+}
+
 # print every slug ready to integrate right now (.done, not yet merged, not failed). The orchestrator drains the
 # whole batch in ONE merge+verify+push instead of one deploy per worker. Read-only; never blocks.
 cmd_ready() {
@@ -1104,6 +1164,7 @@ cmd_ready() {
   while IFS= read -r s; do
     [ -n "$s" ] || continue
     [ -f "$STATUS/$s.merged" ] && continue
+    [ -f "$STATUS/$s.held" ] && continue   # Integrator-deferred (un-landable) — not ready to integrate; re-armed by a fresh --done (Fix 1)
     [ -f "$STATUS/$s.failed" ] && continue
     [ -f "$STATUS/$s.done" ] && printf '%s\n' "$s"
   done < "$MANIFEST"
@@ -1210,6 +1271,9 @@ cmd_statuses() {
     # A CLOSED pane is DEAD (window closed / pty died) — surface it as such so the orchestrator spawns fresh instead of
     # waiting on or handing off to it. Shown even if a stale .merged lingers.
     if [ -f "$STATUS/$s.closed" ]; then printf '%s: %s\n' "$s" "(closed)"; continue; fi
+    # A .held worker is DEFERRED by the Integrator (un-landable) — surface it so the user knows to re-task the pane
+    # (its next --done clears the hold + re-arms it); it neither blocks the queue nor reports as pending. (Fix 1)
+    if [ -f "$STATUS/$s.held" ]; then printf '%s: %s\n' "$s" "(held — deferred; re-task the pane to re-arm)"; continue; fi
     # show a re-armed handoff target as active even if a stale .merged lingers (see --next)
     # a re-activated worker (live .working from the app, no fresh --done) is also active even if a stale .merged lingers
     [ -f "$STATUS/$s.merged" ] && [ ! -f "$STATUS/$s.handoff" ] && [ ! -f "$STATUS/$s.working" ] && continue
@@ -1792,7 +1856,11 @@ requirement needs. Wherever this file says <your-slug>, use the last segment of 
   panes). Work that belongs to a DIFFERENT pane's area: do NOT edit it, do NOT print paste-text — write the full
   requirement to /tmp/cfleet_handoff_<your-slug>.txt, then hand off / spawn:
     a sibling pane already owns it (claude-fleet --statuses) → claude-fleet --handoff "<that pane>" /tmp/cfleet_handoff_<your-slug>.txt
-    no pane owns it yet → claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff_<your-slug>.txt
+    NO pane owns it yet → do NOT --spawn-grid (Fix 4): it cuts a SINGLE-repo self-PUSH pane, but the Integrator withholds
+      git-push from every pane, so the new pane would stall on push prompts and never land — and it wouldn't span the repo
+      set either. Instead RECORD it for the user, from inside a repo sub-dir:  cd ${first_base} && claude-fleet --need
+      "<what + why + which repos/files> — needs a NEW worker pane" . The Integrator surfaces the --need to the user, who
+      opens another pane (retract a mistake with  cd ${first_base} && claude-fleet --unneed ).
 - THE LOOP — run end-to-end for each requirement:
   1. MAKE the changes for the requirement — edit freely across whichever repo sub-dirs it needs; never pause to ask.
   2. VERIFY it works: run each touched repo's build/test per its CLAUDE.md (run any cache-bust/build step + commit its result too).
@@ -2160,6 +2228,7 @@ case "${1:-}" in
   --next)         cmd_next ;;
   --watch)        cmd_watch ;;
   --merged)       shift; cmd_merged "${1:-}" ;;
+  --hold)         shift; cmd_hold "${1:-}" ;;
   --ready)        cmd_ready ;;
   --failed)       cmd_failed ;;
   --conflicts)    cmd_conflicts ;;
