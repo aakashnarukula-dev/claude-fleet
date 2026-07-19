@@ -2142,19 +2142,20 @@ cmd_grid_plan_integrator() { # <N> [name1 name2 ...]
   done
   mkdir -p "$coord/.status"
   printf '%s\n' "${member_fleets[@]}" > "$coord/.status/members"   # gc: reap coord only once every member fleet is gone
-  # 4) emit pane JSON — N worker panes (workspace cwd, no "repo" tag, commit + --done only) + the fixed Integrator pane
-  #    (cwd = coord dir, integrate-only prompt, xhigh effort → max reasoning for conflict resolution / coordination).
+  # 4) emit pane JSON — the fixed Integrator pane FIRST (so it renders top-left as pane 0), then N worker panes.
+  #    Integrator: cwd = coord dir, integrate-only prompt, xhigh effort → max reasoning for conflict resolution /
+  #    coordination. Workers: workspace cwd, no "repo" tag, commit + --done only. The app keys pane id = array index,
+  #    so integrator-first here makes it id 0 → first grid slot; workers shift to ids 1..N (routing is slug-based).
   printf '['
-  local firstj=1
+  printf '{"role":"integrator","slug":"integrator","heading":"Integrator","dir":%s,"effort":"xhigh","prompt":%s}' \
+    "$(json_str "$coord")" "$(json_str "$(spawn_integrator_prompt "$coord")")"
   for i in "${!P_SLUG[@]}"; do
-    [ "$firstj" = 1 ] && firstj=0 || printf ','
+    printf ','
     wslug="${P_SLUG[$i]}"
     printf '{"role":"worker","slug":%s,"heading":%s,"dir":%s,"prompt":%s}' \
       "$(json_str "$wslug")" "$(json_str "${P_HEAD[$i]}")" "$(json_str "$coord/workers/$wslug")" \
       "$(json_str "$(integrator_worker_prompt "${P_HEAD[$i]}" "$wslug" "$coord/workers/$wslug")")"
   done
-  printf ',{"role":"integrator","slug":"integrator","heading":"Integrator","dir":%s,"effort":"xhigh","prompt":%s}' \
-    "$(json_str "$coord")" "$(json_str "$(spawn_integrator_prompt "$coord")")"
   printf ']\n'
 }
 

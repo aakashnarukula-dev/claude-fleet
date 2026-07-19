@@ -583,8 +583,11 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
       // N GENERAL worker panes (commit + --done only, NO self-push) + one FIXED "Integrator" pane that incrementally
       // merges each worker into every repo it touched, test-gates, and pushes ONLY those repos — without waiting for
       // the rest. The CLI also creates each repo's _main integration checkout the Integrator merges into + ships.
-      const meta = sharedNames.map((n, i) => ({ id: i, role: 'worker', heading: n }));
-      meta.push({ id: sharedNames.length, role: 'integrator', heading: 'Integrator' });
+      // Integrator pane FIRST (id 0 → renders top-left; grid order is by pane id), then the N worker panes (ids 1..N).
+      // This MUST match the CLI's pane-array order (cmd_grid_plan_integrator emits the Integrator first) — pane id ==
+      // array index in s.panes, and worker routing is slug-based so shifting worker ids is safe.
+      const meta = [{ id: 0, role: 'integrator', heading: 'Integrator' }]
+        .concat(sharedNames.map((n, i) => ({ id: i + 1, role: 'worker', heading: n })));
       sendAddSession(sid, title, color, meta, 'grid', win);
       runIntegratorPlan(sid, coord, cl.paths, sharedNames.length, sharedNames).then(onReady).catch(onErr);
     } else {
@@ -1283,6 +1286,9 @@ function spawnPane(sid, idx, cols, rows) {
     TERM: 'xterm-256color', COLORTERM: 'truecolor',
     CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: paneRepo,
     CLAUDE_CODE_EFFORT_LEVEL: effort,
+    // suppress the "Update available! Run: brew upgrade claude-code" banner in every pane — the fleet
+    // grid has no room for it and the user updates claude-code out-of-band, not per-pane.
+    DISABLE_AUTOUPDATER: '1',
     // share ONE Rust build cache across this session's worktrees (Tauri/cargo) instead of a multi-GB target/ per
     // pane. Lives inside the fleet dir, so it's reclaimed when the session closes. cargo locks it for concurrency.
     CARGO_TARGET_DIR: path.join(fleetDir(paneRepo, sid), '.cargo-target'),
