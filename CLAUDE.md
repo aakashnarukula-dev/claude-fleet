@@ -179,6 +179,19 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   fleet's `.status/repo` marker (reaped by the normal G0–G4 `gc_one_session`) + a coord `.status/members`
   marker; `gc_one_coord` reaps the coord only when non-live + not-self + ALL members gone (fail-safe-holds
   on an empty/partial marker). `--gc-all` routes `members`-flagged dirs to it. See [[gyftalala-multi-repo-mode]].
+- **Multi-repo + orchestrator OFF = SHARED N-pane grid (added 2026-07-19):** the old
+  one-worker-pane-PER-repo shape is REPLACED. Multi project mode with "Use orchestrator"
+  unchecked now shows the same 1–9 pane-COUNT selector + pane names as Single mode, and each
+  named worker pane spans ALL selected repos. CLI verb `--grid-plan-shared <N> [name…]`
+  (multi-only): for each of N pane slugs it cuts a worktree in EVERY `CLAUDE_FLEET_REPOS`
+  repo on `fleet/s<sid>/<slug>`, then builds a per-pane WORKSPACE dir `<coord>/workers/<slug>/`
+  holding one symlink per repo (named by basename) — that dir is the pane's cwd, so the worker
+  reaches every repo as `./<basename>`. `spawnPane` gives shared workers (`s.sharedMulti`)
+  `CLAUDE_FLEET_MULTI=1` + `CLAUDE_FLEET_REPOS` (not just the orchestrator) so self-push knows
+  every repo; `paneRepo` falls back to `s.repos[0]` for the repo-less pane. Each worker
+  commits + self-pushes its own branch in each repo it changed, then `--done`. `main.js`
+  `runGridPlanShared` shells the verb; orchestrated-multi + single-grid paths are UNCHANGED.
+  (Stale: `main.js` +Pane guard still says "one pane per repo" — +Pane unsupported in shared mode.)
 
 ## Conventions / gotchas
 
