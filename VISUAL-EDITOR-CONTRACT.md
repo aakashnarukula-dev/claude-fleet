@@ -47,21 +47,25 @@ The custom inspector panel + floating toolbar from the earlier mock are DROPPED.
 
 ## Shared identifiers (do NOT drift)
 - **oid attribute:** `data-cfleet-oid` (value = opaque stable id; a build-time map resolves it to `{file,line,col,component}`).
-- **IPC channels (preload `window.fleet`, main handlers):**
-  - `previewStart({sid, product, repo})` → `invoke('preview-start')` → `{ok, url, port} | {ok:false, error}`
-  - `previewStop({sid, product})` → `invoke('preview-stop')` → `{ok}`
-  - `previewStatus({sid, product})` → `invoke('preview-status')` → `{running, url, port, ready}`
-  - `submitVisualEdits({sid, brief})` → `invoke('submit-visual-edits')` → `{ok, slug} | {ok:false, error}`
-  - overlay→host in the webview uses `ipcRenderer.sendToHost('cfleet:edit', action)` and `'cfleet:select'`.
-- **webview→host events** consumed in grid.html via `webview.addEventListener('ipc-message', e => …)` on channel
-  `cfleet:edit` / `cfleet:select`.
+- **IPC channels (preload `window.fleet`, main handlers) — ACTUAL, as implemented:**
+  - `previewStart(sid, product, repo)` → `invoke('preview-start')` → `{ok, url, port, repo, commitBase} | {ok:false, error}`
+  - `previewStop(sid, product)` → `invoke('preview-stop')` → `{ok}`
+  - `previewStatus(sid, product)` → `invoke('preview-status')` → `{running, url, port, ready, commitBase}`
+  - `previewOpenDevtools` / `previewCloseDevtools` → `invoke('preview-open-devtools'|'preview-close-devtools')`
+  - `previewCdpStart` / `previewCollectChanges` / `previewCdpStop` → `invoke('preview-cdp-start'|'preview-collect-changes'|'preview-cdp-stop')`
+  - `submitVisualEdits(sid, brief)` → `invoke('submit-visual-edits')` → `{ok, slug} | {ok:false, error}`
+  - Args are POSITIONAL (`(sid, product, …)`), not a single object.
+- **overlay↔host channels (ACTUAL):** overlay→host `ipcRenderer.sendToHost('cfleet:change', record)` + `'cfleet:ready'`;
+  host→overlay `webview.send('cfleet:capture'|'cfleet:collect'|'cfleet:reset')`. (There is NO `cfleet:edit`/`cfleet:select`.)
+  Host consumes overlay messages via `webview.addEventListener('ipc-message', e => …)`.
 
 ## Visual-edit brief schema (`cfleet.visual-edit/1`)
 ```jsonc
 {
   "schema":"cfleet.visual-edit/1", "briefId":"ve-…", "sid":3, "repo":"front-server",
-  "route":"/pricing", "viewport":{"w":1280,"h":800,"dpr":2,"theme":"light"},
-  "commitBase":"<sha>",                    // preview's source SHA (drift detection)
+  "product":"storefront",                  // present in products mode (routing); null otherwise
+  "route":"/pricing", "viewport":{"w":1280,"h":800,"dpr":2,"theme":"light"},  // theme = the PREVIEWED page's theme
+  "commitBase":"<sha>",                    // previewed repo worktree HEAD (drift detection) — from previewStart
   "intent":"<optional one-line NL goal>",
   "edits":[{
     "editId":"e1",
