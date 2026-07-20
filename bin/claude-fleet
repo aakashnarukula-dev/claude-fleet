@@ -1260,17 +1260,34 @@ _product_done() { # <P>
 
 cmd_done() {
   [ -d "$STATUS" ] || die "no active fleet"
-  # PRODUCTS mode: distinguish a task-orchestrator's product-level --done from a worker's --done. Both run with PRODUCT
-  # set; the difference is WHERE: a worker is inside its git worktree on branch fleet/s<sid>/<P>/<x>; the task-orchestrator
-  # runs from the coord/products/<P> dir (not a worker branch). Route product-level → _product_done (top-level slug <P>).
+  # PRODUCTS mode: distinguish a task-orchestrator's product-level --done from a product WORKER's --done, and FAIL CLOSED
+  # for a worker. Both run with PRODUCT set; the difference is WHERE. The OLD code discriminated on git branch ALONE and
+  # fell OPEN: a worker's DEFAULT cwd is its non-git workspace ROOT (<coord>/workers/<P>__<slug>), so a --done fired there
+  # (no `cd` into a repo sub-dir first) got wbranch="" → treated as "product P ready" → the master shipped P missing that
+  # worker's still-unmerged work, the worker's own .done was never written, and the task-orch's --next blocked forever.
+  # Now discriminate by BRANCH first, then (only when NOT in a git repo) by CWD relative to the coord dir:
+  #   - on branch <BR_PREFIX>/_product  → task-orch inside a _product checkout            → product-level.
+  #   - on branch <BR_PREFIX>/<local>   → worker on its own branch                        → worker-level (fall through).
+  #   - NOT in a git repo:
+  #       * cwd at/under <coord>/products/ → the task-orchestrator's coord cwd            → product-level.
+  #       * cwd at/under <coord>/workers/  (or anywhere else) → a worker fired from its non-git workspace ROOT → DIE
+  #         loudly (like the non-products "not in a git repo" path) so the model cd's into a repo sub-dir and retries —
+  #         NEVER silently product-signal. This is the fail-CLOSED guard for workers.
+  # Inert unless CLAUDE_FLEET_PRODUCT is set — the ordinary/non-products path below is byte-for-byte unchanged.
   if [ -n "$PRODUCT" ]; then
-    local wbranch; wbranch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    local wbranch coord pcwd
+    wbranch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     case "$wbranch" in
-      "$BR_PREFIX"/_product) : ;;         # inside the _product checkout itself → product-level
-      "$BR_PREFIX"/?*) wbranch="worker" ;; # inside a worker worktree → worker-level (fall through below)
-      *) : ;;                              # coord dir / elsewhere → product-level
+      "$BR_PREFIX"/_product) _product_done "$PRODUCT"; return ;;   # task-orch's _product checkout → product-level
+      "$BR_PREFIX"/?*) : ;;                                        # worker on its own branch → worker-level (fall through)
+      *)                                                           # not on a fleet worker branch → decide by CWD, fail-closed
+        coord="$(cd "$(dirname "$STATUS")" 2>/dev/null && pwd -P)" || coord="$(dirname "$STATUS")"
+        pcwd="$(pwd -P 2>/dev/null)" || pcwd="$PWD"
+        case "$pcwd/" in
+          "$coord"/products/*) _product_done "$PRODUCT"; return ;; # task-orchestrator's coord cwd → product-level
+          *) die "products: 'claude-fleet --done' ran from '$pcwd', which is not a git worktree — a product worker must self-signal from INSIDE one of its repo sub-dirs (each is a git worktree on $BR_PREFIX/<slug>). cd into a repo sub-dir and re-run 'claude-fleet --done'." ;;
+        esac ;;
     esac
-    if [ "$wbranch" != "worker" ]; then _product_done "$PRODUCT"; return; fi
   fi
   local branch slug
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || die "not in a git repo"
@@ -2166,8 +2183,9 @@ ensure_integrator_worker_protocol() {
 
 You autonomously OWN one area and implement it ACROSS SEVERAL REPOS, then HAND OFF to the Integrator — you do NOT push.
 Your working directory contains ONE sub-dir per repository you can work in: ${repolist}. Each sub-dir is that repo's OWN
-git worktree on YOUR branch (${BR_PREFIX}/<your-slug>, cut from that repo's default branch). Edit whichever repos the
-requirement needs. Wherever this file says <your-slug>, use the last segment of your branch.
+git worktree on YOUR branch (under ${BR_PREFIX}/, cut from that repo's default branch). Edit whichever repos the
+requirement needs. Wherever this file says <your-slug>, use the slug your launch prompt gave you (your pane slug) — it is
+globally unique, so use it verbatim in every scratch filename (e.g. /tmp/cfleet_handoff_<your-slug>.txt) to avoid collisions.
 
 - FIRST read each repo's CLAUDE.md (repo-root of each sub-dir) + your auto-memory and FOLLOW its rules (build/test/
   deploy commands, conventions, "don't touch X"). Don't re-derive what's documented.
@@ -2219,9 +2237,10 @@ ${req}"
     intro="Wait for my requirement for \"${heading}\", then run the loop end-to-end WITHOUT asking permission."
     closing="Run the loop again for each follow-up requirement for \"${heading}\". Acknowledge and ask me what the requirement is."
   fi
+  local wbranch; wbranch="$(slug_branch "$slug")"   # the REAL branch the worktree is on. Non-products: BR_PREFIX/<slug> (unchanged). Products: BR_PREFIX/<local> — NOT BR_PREFIX/<board-slug> (board slug <P>__<local> would double-prefix the "/<P>" already in BR_PREFIX).
   ensure_integrator_worker_protocol
   cat <<EOF
-You are an AUTONOMOUS worker in a Claude Fleet MULTI-REPO run (Integrator mode) — pane "${heading}" (slug "${slug}"). Your working directory is ${wsdir}, which holds ONE sub-directory per repository you can work across: ${repolist}. Each sub-dir is that repo's own git worktree on branch ${BR_PREFIX}/${slug} (cut from that repo's default branch). You may edit ANY of them. This pane OWNS the "${heading}" area across the whole repo set.
+You are an AUTONOMOUS worker in a Claude Fleet MULTI-REPO run (Integrator mode) — pane "${heading}" (slug "${slug}"). Your working directory is ${wsdir}, which holds ONE sub-directory per repository you can work across: ${repolist}. Each sub-dir is that repo's own git worktree on branch ${wbranch} (cut from that repo's default branch). You may edit ANY of them. This pane OWNS the "${heading}" area across the whole repo set.
 
 You COMMIT your work and hand it to the INTEGRATOR pane — you do NOT push, merge origin, or touch any main. The Integrator merges each repo you changed into its integration checkout, tests, and pushes, incrementally as soon as it's safe.
 
