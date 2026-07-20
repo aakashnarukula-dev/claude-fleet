@@ -50,8 +50,8 @@
   .pane { display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; background:var(--bg); }
   .pbar { -webkit-app-region:no-drag; display:flex; align-items:center; gap:8px; padding:6px 8px 6px 12px; border-bottom:1px solid var(--line); font-size:12px; font-weight:600; flex:none; color:#fff; background:var(--bar); }
   .pbar .ptitle { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .pbar.orchestrator .ptitle, .pbar.integrator .ptitle { color:#e8915f; font-weight:700; }   /* coordinator panes: role shown by TEXT colour (not a filled bar) — the Integrator reads like the Orchestrator */
-  .pbar.orchestrator, .pbar.integrator { box-shadow:inset 3px 0 0 #e8915f; }                  /* + a left accent stripe so the special pane stands out from plain workers */
+  .pbar.orchestrator .ptitle, .pbar.integrator .ptitle, .pbar.master .ptitle { color:#e8915f; font-weight:700; }   /* coordinator panes: role shown by TEXT colour (not a filled bar) — the Integrator/Master read like the Orchestrator */
+  .pbar.orchestrator, .pbar.integrator, .pbar.master { box-shadow:inset 3px 0 0 #e8915f; }                  /* + a left accent stripe so the special pane stands out from plain workers */
   .pbar.worker .ptitle { color:#7aa2e3; }
   /* per-pane status dot: a dot means "wants your attention"; working = no dot (clean) */
   .pbar .pdot { display:none; width:8px; height:8px; border-radius:50%; flex:none; }
@@ -63,6 +63,37 @@
   .pbar .pclose:hover { background:rgba(255,255,255,0.22); color:#fff; }
   .term { flex:1; min-height:0; padding:6px 8px; overflow:hidden; }   /* clip the terminal when its pane shrinks (no reflow) */
   .xterm { height:100%; }
+  /* Products / Master mode ONLY: a left sidebar + a pane STAGE replace the plain single-grid. The panes themselves
+     (.pane/.pbar/.term/grid tiling) are byte-for-byte the existing ones — only the CONTAINER + which panes are
+     visible at once change. Every other mode keeps the plain absolute-inset grid, untouched. */
+  .pwrap { position:absolute; inset:0; display:flex; flex-direction:row; }
+  .pstage { position:relative; flex:1; min-width:0; }   /* the grid (absolute inset:0) tiles the selected group here */
+  .psidebar { flex:none; width:210px; background:#0c0d10; border-right:1px solid var(--line); display:flex; flex-direction:column; overflow:hidden; }
+  .psb-master { -webkit-app-region:no-drag; margin:8px; padding:9px 11px; border-radius:8px; background:#241712; color:var(--accent); font-weight:700; font-size:12.5px; cursor:pointer; display:flex; align-items:center; gap:8px; box-shadow:inset 3px 0 0 #e8915f; }
+  .psb-master:hover { background:#2b1913; }
+  .psb-master.sel { background:#2e1c14; }
+  .psb-sechead { color:var(--muted); font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; padding:8px 10px 4px; }
+  .psb-products { flex:1; overflow:auto; padding:0 6px 6px; }
+  .pgroup { margin-bottom:1px; }
+  .pgrow { -webkit-app-region:no-drag; display:flex; align-items:center; gap:7px; padding:6px 8px; border-radius:7px; cursor:pointer; color:var(--fg); font-size:12.5px; font-weight:600; }
+  .pgrow:hover { background:#16181c; }
+  .pgrow.sel { background:#1f2937; }
+  .pgrow .tw { width:12px; flex:none; text-align:center; color:var(--muted); font-size:10px; cursor:pointer; }
+  .pgrow .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pgkids { margin-left:19px; }
+  .pgkids .pk { -webkit-app-region:no-drag; padding:4px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pgkids .pk:hover { background:#16181c; color:#fff; }
+  .pgkids .pk.orch { color:#e8915f; font-weight:600; }
+  .paddprod { -webkit-app-region:no-drag; flex:none; margin:8px; padding:8px 11px; border:1px dashed #3a3e48; border-radius:8px; background:transparent; color:var(--muted); font-size:12px; font-weight:600; cursor:pointer; text-align:left; }
+  .paddprod:hover { border-color:var(--accent); color:var(--accent); }
+  .paddprod:disabled { opacity:.5; cursor:default; }
+  .psb-err { color:#ff6b61; font-size:11px; padding:2px 10px 6px; }
+  /* sidebar status dots: reuse the pane state ranking (permission > failed > idle; working = no dot) */
+  .psb-master .pdot, .pgrow .pdot { width:8px; height:8px; border-radius:50%; flex:none; display:none; }
+  .psb-master .pdot { margin-left:auto; }
+  .psb-master.st-idle .pdot, .pgrow.st-idle .pdot { display:block; background:#e0a86b; }
+  .psb-master.st-failed .pdot, .pgrow.st-failed .pdot { display:block; background:#ff5c57; }
+  .psb-master.st-permission .pdot, .pgrow.st-permission .pdot { display:block; background:var(--accent); animation:permpulse 1.2s ease-in-out infinite; }
   /* dividers: thin line + a wider invisible hit area (::after). Vertical dividers live INSIDE a row, so each
      row resizes its own panes; horizontal dividers sit between rows. No divider spans the whole grid. */
   .vgutter, .hgutter { flex:none; position:relative; background:var(--line); z-index:6; }
@@ -224,8 +255,21 @@
     tabsEl.appendChild(tab); sess.tabEl = tab;
     const sEl = document.createElement('div'); sEl.className = 'session';
     const grid = document.createElement('div'); grid.className = 'grid';
-    sEl.appendChild(grid); sessEl.appendChild(sEl); sess.sessEl = sEl; sess.gridEl = grid;
+    if (sess.mode === 'products') {
+      // Products / Master mode: a left sidebar + a right pane-stage replace the plain grid. The grid element itself
+      // is unchanged (layout() still tiles into it) — it just lives inside the stage and shows only the selected group.
+      sess.expanded = {}; sess.activeGroup = 'master';
+      const wrap = document.createElement('div'); wrap.className = 'pwrap';
+      const sb = document.createElement('div'); sb.className = 'psidebar';
+      const stage = document.createElement('div'); stage.className = 'pstage';
+      stage.appendChild(grid); wrap.appendChild(sb); wrap.appendChild(stage); sEl.appendChild(wrap);
+      sess.sidebarEl = sb; sess.stageEl = stage;
+    } else {
+      sEl.appendChild(grid);
+    }
+    sessEl.appendChild(sEl); sess.sessEl = sEl; sess.gridEl = grid;
     panes.forEach((p) => buildPane(sid, sess, grid, p));
+    if (sess.mode === 'products') { rebuildGroups(sess); renderProductsSidebar(sid); }
     if (!sidebarDefaulted) {       // sidebar open by default — set before layout so terminals size to the pushed width
       sidebarDefaulted = true;
       document.getElementById('filepanel').classList.add('open');
@@ -240,6 +284,13 @@
     const s = sessions[sid]; if (!s) return;
     s.paneCount = Math.max(s.paneCount, pane.id + 1);
     buildPane(sid, s, s.gridEl, pane);
+    if (s.mode === 'products') {
+      rebuildGroups(s); renderProductsSidebar(sid);
+      // buildPane appended the new pane to the grid; if it belongs to a HIDDEN group, detach it now (layout()'s
+      // shape-unchanged fast path won't rebuild the grid, so it'd otherwise linger as an orphan on the stage).
+      // The term stays alive — it re-attaches when its group is selected.
+      if (visiblePaneIds(s).indexOf(pane.id) === -1) { const pe = s.terms[pane.id] && s.terms[pane.id].paneEl; if (pe && pe.parentNode) pe.parentNode.removeChild(pe); }
+    }
     layout(sid);
   });
 
@@ -256,11 +307,123 @@
     return Array.from({ length: rows }, (_, r) => base + (r < extra ? 1 : 0));   // earlier rows take the extra
   }
 
+  // ---------------------------------------------------------------- Products / Master mode (mode==='products' only)
+  // Derive the sidebar grouping from each pane's meta: the master pane (role 'master', no product) is pinned; every
+  // other pane groups under its `product`. Re-run on every add-pane / close so late workers + added products land.
+  function rebuildGroups(s) {
+    s.masterPaneId = null; const map = {}, order = [];
+    Object.keys(s.terms).map(Number).sort((a, b) => a - b).forEach((id) => {
+      const t = s.terms[id];
+      if (t.role === 'master') { s.masterPaneId = id; return; }
+      const prod = t.product; if (prod == null || prod === '') return;   // ungrouped non-master (shouldn't happen)
+      if (!map[prod]) { map[prod] = { key: prod, name: prod, orchPaneId: null, workerPaneIds: [] }; order.push(prod); }
+      if (t.role === 'orchestrator') { map[prod].orchPaneId = id; map[prod].name = t.heading || prod; }   // task-orchestrator heading is the product's display name
+      else map[prod].workerPaneIds.push(id);
+    });
+    s.groupOrder = order; s.groupMap = map;
+  }
+
+  // pane ids to tile in the stage right now: everything for non-products; the selected group only for products.
+  function visiblePaneIds(s) {
+    if (s.mode !== 'products') return Object.keys(s.terms).map(Number);
+    const all = Object.keys(s.terms).map(Number);
+    const g = s.activeGroup || 'master';
+    if (g === 'master') return s.masterPaneId != null ? [s.masterPaneId] : all;
+    const grp = s.groupMap && s.groupMap[g];
+    if (!grp) return s.masterPaneId != null ? [s.masterPaneId] : all;   // group vanished (product closed) → fall back
+    const ids = [];
+    if (grp.orchPaneId != null && s.terms[grp.orchPaneId]) ids.push(grp.orchPaneId);
+    grp.workerPaneIds.forEach((id) => { if (s.terms[id]) ids.push(id); });
+    return ids.length ? ids : (s.masterPaneId != null ? [s.masterPaneId] : all);
+  }
+
+  // most-urgent live state across a set of panes (drives the sidebar dot); mirrors refreshTabState's ranking
+  function groupStatus(s, ids) {
+    let top = 'working';
+    ids.forEach((id) => { const st = s.paneStates && s.paneStates[id]; if (st && (STATE_RANK[st] || 0) > (STATE_RANK[top] || 0)) top = st; });
+    return top;
+  }
+
+  // switch the visible group and re-tile the stage (hidden panes' terminals stay alive — layout() only detaches them)
+  function selectGroup(sid, g) {
+    const s = sessions[sid]; if (!s || s.mode !== 'products') return;
+    s.activeGroup = g;
+    renderProductsSidebar(sid);
+    layout(sid);
+    const vis = visiblePaneIds(s);
+    if (vis.length) s.activePaneId = vis[0];
+    focusActive(sid);
+  }
+
+  function showSidebarErr(sb, msg) {
+    let e = sb.querySelector('.psb-err'); if (!e) { e = document.createElement('div'); e.className = 'psb-err'; sb.appendChild(e); }
+    e.textContent = msg;
+  }
+
+  // rebuild the whole sidebar (Master pinned at top → Products list → "+ Add product"). Cheap: N is small, and the
+  // expand/selection state lives on the session, so a re-render never loses the user's place.
+  function renderProductsSidebar(sid) {
+    const s = sessions[sid]; if (!s || s.mode !== 'products' || !s.sidebarEl) return;
+    const sb = s.sidebarEl; sb.innerHTML = ''; if (!s.expanded) s.expanded = {};
+
+    const m = document.createElement('div'); m.className = 'psb-master' + (s.activeGroup === 'master' ? ' sel' : '');
+    m.innerHTML = '<span>Master</span><span class="pdot"></span>';
+    if (s.masterPaneId != null) applyStateClass(m, groupStatus(s, [s.masterPaneId]));
+    m.onclick = () => selectGroup(sid, 'master');
+    sb.appendChild(m);
+
+    const list = document.createElement('div'); list.className = 'psb-products';
+    const head = document.createElement('div'); head.className = 'psb-sechead'; head.textContent = 'Products';
+    list.appendChild(head);
+    (s.groupOrder || []).forEach((prod) => {
+      const grp = s.groupMap[prod]; if (!grp) return;
+      const gids = [grp.orchPaneId, ...grp.workerPaneIds].filter((id) => id != null && s.terms[id]);
+      const exp = !!s.expanded[prod];
+      const wrapG = document.createElement('div'); wrapG.className = 'pgroup';
+      const row = document.createElement('div'); row.className = 'pgrow' + (s.activeGroup === prod ? ' sel' : '');
+      row.innerHTML = '<span class="tw">' + (exp ? '▾' : '▸') + '</span><span class="nm"></span><span class="pdot"></span>';
+      row.querySelector('.nm').textContent = grp.name;
+      applyStateClass(row, groupStatus(s, gids));
+      row.querySelector('.tw').onclick = (e) => { e.stopPropagation(); s.expanded[prod] = !s.expanded[prod]; renderProductsSidebar(sid); };
+      row.onclick = () => { s.expanded[prod] = true; selectGroup(sid, prod); };
+      wrapG.appendChild(row);
+      if (exp) {
+        const kids = document.createElement('div'); kids.className = 'pgkids';
+        gids.forEach((id) => {
+          const t = s.terms[id];
+          const k = document.createElement('div'); k.className = 'pk' + (t.role === 'orchestrator' ? ' orch' : '');
+          k.textContent = t.heading;
+          k.onclick = (e) => { e.stopPropagation(); if (s.activeGroup !== prod) selectGroup(sid, prod); s.activePaneId = id; focusActive(sid); };
+          kids.appendChild(k);
+        });
+        wrapG.appendChild(kids);
+      }
+      list.appendChild(wrapG);
+    });
+    sb.appendChild(list);
+
+    const add = document.createElement('button'); add.className = 'paddprod'; add.textContent = '+ Add product';
+    add.onclick = async () => {
+      const name = await askName('New product', 'e.g. Billing');
+      if (!name) return;
+      add.disabled = true;
+      try {
+        const r = await window.fleet.addProduct({ sid, name });   // new task-orchestrator pane arrives via onAddPane → rebuildGroups + re-render
+        if (!r || r.ok === false) showSidebarErr(sb, (r && r.error) || 'could not add product');
+      } catch (err) { showSidebarErr(sb, String((err && err.message) || err)); }
+      add.disabled = false;
+    };
+    sb.appendChild(add);
+  }
+
   // nested-flex layout: grid = vertical stack of rows; each row = horizontal strip of panes. Dividers are LOCAL —
   // a vertical divider only resizes its own row's panes; a horizontal divider only the two rows it sits between.
   function layout(sid) {
     const s = sessions[sid]; if (!s) return;
-    const ids = Object.keys(s.terms).map(Number).sort((a, b) => a - b);
+    // In products mode only the SELECTED group's panes tile; the rest stay alive (terms intact) but are detached
+    // from the grid (the innerHTML='' rebuild below removes them — it never disposes their xterm). Every other mode
+    // lays out ALL panes exactly as before.
+    const ids = visiblePaneIds(s).sort((a, b) => a - b);
     const n = ids.length; if (!n) return;
     const width = s.gridEl.getBoundingClientRect().width || window.innerWidth;
     const counts = rowSplit(n, width);
@@ -341,7 +504,7 @@
     bar.innerHTML = `<span class="pdot"></span><span class="ptitle">${escapeHtml(p.heading)}</span><span class="pclose" title="Close pane">×</span>`;
     // unique per-pane identity colour, overrides role-based .ptitle CSS — but NOT for coordinator panes (orchestrator /
     // integrator): they keep their role accent (#e8915f) so a special pane reads distinctly from the plain workers.
-    if (p.role !== 'orchestrator' && p.role !== 'integrator') bar.querySelector('.ptitle').style.color = TITLE_COLORS[p.id % TITLE_COLORS.length];
+    if (p.role !== 'orchestrator' && p.role !== 'integrator' && p.role !== 'master') bar.querySelector('.ptitle').style.color = TITLE_COLORS[p.id % TITLE_COLORS.length];
     bar.querySelector('.pclose').addEventListener('click', (e) => { e.stopPropagation(); closePane(sid, p.id); });
     const termEl = document.createElement('div'); termEl.className = 'term';
     pane.appendChild(bar); pane.appendChild(termEl); grid.appendChild(pane);
@@ -350,7 +513,7 @@
     const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(termEl); fit.fit();
     const ro = new ResizeObserver(() => { if (isFitSuppressed()) return; try { fit.fit(); window.fleet.termResize({ sid, id: p.id, cols: term.cols, rows: term.rows }); } catch (_) {} });
     ro.observe(termEl);
-    sess.terms[p.id] = { term, fit, ro, started: false, paneEl: pane, heading: p.heading, role: p.role };   // PTY spawned later, in layout(), at full size; ro disconnected on teardown (disposeTerm)
+    sess.terms[p.id] = { term, fit, ro, started: false, paneEl: pane, heading: p.heading, role: p.role, product: p.product };   // PTY spawned later, in layout(), at full size; ro disconnected on teardown (disposeTerm)
     term.write('\x1b[90m  Starting Claude…\x1b[0m');
     term.onData((data) => window.fleet.termInput({ sid, id: p.id, data }));
 
@@ -467,7 +630,10 @@
   async function closePane(sid, paneId) {
     const s = sessions[sid]; if (!s || !s.terms[paneId]) return;
     const t = s.terms[paneId];
-    if (t.role === 'orchestrator' || t.role === 'integrator') {
+    if (t.role === 'master') {   // Master owns the whole session — don't close it while any product/worker pane still runs
+      const kids = Object.values(s.terms).filter((x) => x !== t).length;
+      if (kids > 0) { window.alert('Close the product panes first — Master can’t be closed while its products are still running.'); return; }
+    } else if (t.role === 'orchestrator' || t.role === 'integrator') {
       const workers = Object.values(s.terms).filter((x) => x.role === 'worker').length;
       if (workers > 0) { window.alert('Close the worker panes first — the ' + (t.role === 'integrator' ? 'Integrator' : 'Orchestrator') + ' can’t be closed while its workers are still running.'); return; }
     }
@@ -479,6 +645,11 @@
     if (s.paneStates) delete s.paneStates[paneId];
     if (!Object.keys(s.terms).length) { doCloseTab(sid); return; }   // already confirmed — no second prompt
     if (s.activePaneId === paneId) s.activePaneId = +Object.keys(s.terms)[0];
+    if (s.mode === 'products') {   // regroup + fall back to Master if the selected product's panes are all gone
+      rebuildGroups(s);
+      if (s.activeGroup !== 'master' && !(s.groupMap && s.groupMap[s.activeGroup])) s.activeGroup = 'master';
+      renderProductsSidebar(sid);
+    }
     refreshTabState(s);
     layout(sid);
   }
@@ -533,6 +704,7 @@
     s.paneStates[id] = state;
     const t = s.terms[id]; if (t && t.paneEl) applyStateClass(t.paneEl.querySelector('.pbar'), state);
     refreshTabState(s);
+    if (s.mode === 'products') renderProductsSidebar(sid);   // reflect the new state on the group/Master sidebar dot
   });
   // clicked a permission notification → jump to that tab + pane and focus it
   function jumpToPane(sid, id) {
