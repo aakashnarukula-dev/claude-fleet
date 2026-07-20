@@ -65,35 +65,39 @@
   .xterm { height:100%; }
   /* Products / Master mode ONLY: a left sidebar + a pane STAGE replace the plain single-grid. The panes themselves
      (.pane/.pbar/.term/grid tiling) are byte-for-byte the existing ones — only the CONTAINER + which panes are
-     visible at once change. Every other mode keeps the plain absolute-inset grid, untouched. */
+     visible at once change. Every other mode keeps the plain absolute-inset grid, untouched. The sidebar chrome
+     matches the finalized reference mock (products-mode-mock.html): Master card first, "Tasks" label, "+ Add
+     product" at the top of the scroll, one task row per product (dot + name + status pill), selected task expands. */
   .pwrap { position:absolute; inset:0; display:flex; flex-direction:row; }
   .pstage { position:relative; flex:1; min-width:0; }   /* the grid (absolute inset:0) tiles the selected group here */
-  .psidebar { flex:none; width:210px; background:#0c0d10; border-right:1px solid var(--line); display:flex; flex-direction:column; overflow:hidden; }
-  .psb-master { -webkit-app-region:no-drag; margin:8px; padding:9px 11px; border-radius:8px; background:#241712; color:var(--accent); font-weight:700; font-size:12.5px; cursor:pointer; display:flex; align-items:center; gap:8px; box-shadow:inset 3px 0 0 #e8915f; }
-  .psb-master:hover { background:#2b1913; }
-  .psb-master.sel { background:#2e1c14; }
-  .psb-sechead { color:var(--muted); font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.06em; padding:8px 10px 4px; }
-  .psb-products { flex:1; overflow:auto; padding:0 6px 6px; }
-  .pgroup { margin-bottom:1px; }
-  .pgrow { -webkit-app-region:no-drag; display:flex; align-items:center; gap:7px; padding:6px 8px; border-radius:7px; cursor:pointer; color:var(--fg); font-size:12.5px; font-weight:600; }
-  .pgrow:hover { background:#16181c; }
-  .pgrow.sel { background:#1f2937; }
-  .pgrow .tw { width:12px; flex:none; text-align:center; color:var(--muted); font-size:10px; cursor:pointer; }
-  .pgrow .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .pgkids { margin-left:19px; }
-  .pgkids .pk { -webkit-app-region:no-drag; padding:4px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .pgkids .pk:hover { background:#16181c; color:#fff; }
-  .pgkids .pk.orch { color:#e8915f; font-weight:600; }
-  .paddprod { -webkit-app-region:no-drag; flex:none; margin:8px; padding:8px 11px; border:1px dashed #3a3e48; border-radius:8px; background:transparent; color:var(--muted); font-size:12px; font-weight:600; cursor:pointer; text-align:left; }
-  .paddprod:hover { border-color:var(--accent); color:var(--accent); }
-  .paddprod:disabled { opacity:.5; cursor:default; }
-  .psb-err { color:#ff6b61; font-size:11px; padding:2px 10px 6px; }
-  /* sidebar status dots: reuse the pane state ranking (permission > failed > idle; working = no dot) */
-  .psb-master .pdot, .pgrow .pdot { width:8px; height:8px; border-radius:50%; flex:none; display:none; }
-  .psb-master .pdot { margin-left:auto; }
-  .psb-master.st-idle .pdot, .pgrow.st-idle .pdot { display:block; background:#e0a86b; }
-  .psb-master.st-failed .pdot, .pgrow.st-failed .pdot { display:block; background:#ff5c57; }
-  .psb-master.st-permission .pdot, .pgrow.st-permission .pdot { display:block; background:var(--accent); animation:permpulse 1.2s ease-in-out infinite; }
+  .psidebar { flex:none; width:250px; background:#141519; border-right:1px solid var(--line); display:flex; flex-direction:column; overflow:hidden; }
+  .psidebar .masteritem { -webkit-app-region:no-drag; margin:8px 10px; display:flex; align-items:center; gap:9px; padding:10px 11px; border-radius:9px; background:#241c14; border:1px solid #40301f; cursor:pointer; }
+  .psidebar .masteritem.on { box-shadow:inset 0 0 0 1.5px #e8915f; }
+  .psidebar .masteritem .ic { width:22px; height:22px; border-radius:6px; background:#e8915f; color:#1a1206; display:grid; place-items:center; font-weight:800; font-size:12px; flex:none; }
+  .psidebar .masteritem .mt b { color:#e8915f; font-size:12.5px; }
+  .psidebar .masteritem .mt small { display:block; color:#9aa0ac; font-size:10.5px; }
+  .psidebar .sb-title { padding:12px 14px 8px; font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:#6b7280; font-weight:700; }
+  .psidebar .sb-scroll { flex:1; overflow:auto; padding:0 10px 10px; }
+  .psidebar .addtask { -webkit-app-region:no-drag; margin:0 2px 8px; width:calc(100% - 4px); background:transparent; border:1px dashed #3a3f4a; color:#9aa0ac; border-radius:8px; padding:8px; cursor:pointer; font-size:12px; text-align:center; font-weight:600; }
+  .psidebar .addtask:hover { border-color:#e8915f; color:#e8915f; }
+  .psidebar .addtask:disabled { opacity:.5; cursor:default; }
+  .psidebar .task { margin-bottom:6px; border:1px solid var(--line); border-radius:9px; background:#1e2026; overflow:hidden; }
+  .psidebar .task.on { border-color:#3a3f4a; }
+  .psidebar .task-head { -webkit-app-region:no-drag; display:flex; align-items:center; gap:9px; padding:9px 11px; cursor:pointer; }
+  .psidebar .task-head .dot { width:9px; height:9px; border-radius:50%; flex:none; }
+  .psidebar .task-head .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px; font-weight:600; color:var(--fg); }
+  .psidebar .task-head .st { margin-left:auto; font-size:10px; padding:1px 7px; border-radius:20px; font-weight:600; flex:none; }
+  .psidebar .st.working { background:#2a2410; color:#e8c15f; }
+  .psidebar .st.shipped { background:#132a1c; color:#5bd18b; }
+  .psidebar .st.held { background:#2a1414; color:#e86f6f; }
+  .psidebar .task-panes { padding:2px 8px 9px; display:none; }
+  .psidebar .task.on .task-panes { display:block; }
+  .psidebar .pline { -webkit-app-region:no-drag; display:flex; align-items:center; gap:8px; padding:5px 6px; border-radius:6px; font-size:11.5px; color:#9aa0ac; cursor:pointer; overflow:hidden; }
+  .psidebar .pline:hover { background:#20222a; }
+  .psidebar .pline span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .psidebar .pline .pd { width:7px; height:7px; border-radius:50%; flex:none; }
+  .psidebar .pline.orch { color:#e8915f; }
+  .psb-err { color:#ff6b61; font-size:11px; padding:2px 12px 6px; }
   /* dividers: thin line + a wider invisible hit area (::after). Vertical dividers live INSIDE a row, so each
      row resizes its own panes; horizontal dividers sit between rows. No divider spans the whole grid. */
   .vgutter, .hgutter { flex:none; position:relative; background:var(--line); z-index:6; }
@@ -258,7 +262,7 @@
     if (sess.mode === 'products') {
       // Products / Master mode: a left sidebar + a right pane-stage replace the plain grid. The grid element itself
       // is unchanged (layout() still tiles into it) — it just lives inside the stage and shows only the selected group.
-      sess.expanded = {}; sess.activeGroup = 'master';
+      sess.activeGroup = 'master';
       const wrap = document.createElement('div'); wrap.className = 'pwrap';
       const sb = document.createElement('div'); sb.className = 'psidebar';
       const stage = document.createElement('div'); stage.className = 'pstage';
@@ -269,7 +273,14 @@
     }
     sessEl.appendChild(sEl); sess.sessEl = sEl; sess.gridEl = grid;
     panes.forEach((p) => buildPane(sid, sess, grid, p));
-    if (sess.mode === 'products') { rebuildGroups(sess); renderProductsSidebar(sid); }
+    if (sess.mode === 'products') {
+      rebuildGroups(sess); renderProductsSidebar(sid);
+      // FIX A: in products mode EVERY pane must boot as soon as it exists — not just the currently-visible group.
+      // The session defaults to activeGroup 'master', so without this only the master PTY would ever spawn (layout()
+      // fires term-ready for visible ids only). Start each pane now; hidden panes run in the background, PTY alive,
+      // output buffering, exactly like every other fleet mode. layout() re-fits (termResize) the visible ones next.
+      panes.forEach((p) => ensureStarted(sid, sess, p.id));
+    }
     if (!sidebarDefaulted) {       // sidebar open by default — set before layout so terminals size to the pushed width
       sidebarDefaulted = true;
       document.getElementById('filepanel').classList.add('open');
@@ -279,17 +290,29 @@
     activate(sid); layout(sid);   // make visible first, then size + spawn at the real dimensions (activate loads the file tree)
   });
 
-  // orchestrator spawned a new worker -> add a pane and re-flow the grid
+  // orchestrator spawned a new worker (or a product was added) -> add a pane and re-flow the grid
   window.fleet.onAddPane(({ sid, pane }) => {
     const s = sessions[sid]; if (!s) return;
     s.paneCount = Math.max(s.paneCount, pane.id + 1);
     buildPane(sid, s, s.gridEl, pane);
     if (s.mode === 'products') {
-      rebuildGroups(s); renderProductsSidebar(sid);
+      rebuildGroups(s);
+      // FIX A: start the pane immediately, whatever group is visible. A task-orchestrator or worker that arrives here
+      // while its group is hidden must still boot now (PTY alive, buffering) — not on the user's first click.
+      ensureStarted(sid, s, pane.id);
+      // FIX C2: if this task-orchestrator is the one just requested via "+ Add product", land the user on its group.
+      let landed = false;
+      if (pane.role === 'orchestrator' && pane.product != null && s.pendingProductHeading && pane.heading === s.pendingProductHeading) {
+        s.pendingProductHeading = null; s.activeGroup = pane.product; s.activePaneId = pane.id; landed = true;
+      }
+      renderProductsSidebar(sid);
       // buildPane appended the new pane to the grid; if it belongs to a HIDDEN group, detach it now (layout()'s
       // shape-unchanged fast path won't rebuild the grid, so it'd otherwise linger as an orphan on the stage).
-      // The term stays alive — it re-attaches when its group is selected.
+      // The term stays alive (started above) — it re-attaches when its group is selected.
       if (visiblePaneIds(s).indexOf(pane.id) === -1) { const pe = s.terms[pane.id] && s.terms[pane.id].paneEl; if (pe && pe.parentNode) pe.parentNode.removeChild(pe); }
+      layout(sid);
+      if (landed) focusActive(sid);
+      return;
     }
     layout(sid);
   });
@@ -310,14 +333,19 @@
   // ---------------------------------------------------------------- Products / Master mode (mode==='products' only)
   // Derive the sidebar grouping from each pane's meta: the master pane (role 'master', no product) is pinned; every
   // other pane groups under its `product`. Re-run on every add-pane / close so late workers + added products land.
+  // FIX B: group STRICTLY by each pane's authoritative `product` value as delivered — NEVER re-derive it from a name.
+  // Groups are created lazily on the first pane seen for a product, so orchestrator/worker arrival order doesn't matter.
+  const UNGROUPED = '__ungrouped__';
   function rebuildGroups(s) {
     s.masterPaneId = null; const map = {}, order = [];
     Object.keys(s.terms).map(Number).sort((a, b) => a - b).forEach((id) => {
       const t = s.terms[id];
       if (t.role === 'master') { s.masterPaneId = id; return; }
-      const prod = t.product; if (prod == null || prod === '') return;   // ungrouped non-master (shouldn't happen)
-      if (!map[prod]) { map[prod] = { key: prod, name: prod, orchPaneId: null, workerPaneIds: [] }; order.push(prod); }
-      if (t.role === 'orchestrator') { map[prod].orchPaneId = id; map[prod].name = t.heading || prod; }   // task-orchestrator heading is the product's display name
+      // FIX C1: a non-master pane with no product must NOT be silently dropped (that left it invisible + unstartable).
+      // Put it in a visible "Ungrouped" fallback bucket so it's reachable and (with FIX A) already running.
+      const prod = (t.product == null || t.product === '') ? UNGROUPED : t.product;
+      if (!map[prod]) { map[prod] = { key: prod, name: prod === UNGROUPED ? 'Ungrouped' : prod, orchPaneId: null, workerPaneIds: [] }; order.push(prod); }
+      if (t.role === 'orchestrator') { map[prod].orchPaneId = id; if (t.heading) map[prod].name = t.heading; }   // task-orchestrator heading is the product's display name
       else map[prod].workerPaneIds.push(id);
     });
     s.groupOrder = order; s.groupMap = map;
@@ -337,13 +365,6 @@
     return ids.length ? ids : (s.masterPaneId != null ? [s.masterPaneId] : all);
   }
 
-  // most-urgent live state across a set of panes (drives the sidebar dot); mirrors refreshTabState's ranking
-  function groupStatus(s, ids) {
-    let top = 'working';
-    ids.forEach((id) => { const st = s.paneStates && s.paneStates[id]; if (st && (STATE_RANK[st] || 0) > (STATE_RANK[top] || 0)) top = st; });
-    return top;
-  }
-
   // switch the visible group and re-tile the stage (hidden panes' terminals stay alive — layout() only detaches them)
   function selectGroup(sid, g) {
     const s = sessions[sid]; if (!s || s.mode !== 'products') return;
@@ -360,60 +381,100 @@
     e.textContent = msg;
   }
 
-  // rebuild the whole sidebar (Master pinned at top → Products list → "+ Add product"). Cheap: N is small, and the
-  // expand/selection state lives on the session, so a re-render never loses the user's place.
+  // per-product status pill (shipped / working / held). The renderer only knows each pane's live state, so map it:
+  // any failed → held (red); anything working/awaiting-permission → working (amber); otherwise (panes idle = work
+  // drained) → shipped (green); nothing reported yet → working. Mirrors the reference mock's pill vocabulary.
+  function productPill(s, ids) {
+    let anyFailed = false, anyWorking = false, anyIdle = false;
+    ids.forEach((id) => {
+      const st = s.paneStates && s.paneStates[id];
+      if (st === 'failed') anyFailed = true;
+      else if (st === 'working' || st === 'permission') anyWorking = true;
+      else if (st === 'idle') anyIdle = true;
+    });
+    if (anyFailed) return 'held';
+    if (anyWorking) return 'working';
+    if (anyIdle) return 'shipped';
+    return 'working';
+  }
+  // per-product accent dot colours (from the reference mock)
+  const PROD_DOTS = ['#7aa2f7', '#bb9af7', '#7dcfff', '#9ece6a', '#f7768e', '#e0af68'];
+
+  // rebuild the whole sidebar to match the reference mock, top→bottom: Master card → "Tasks" label → "+ Add product"
+  // (first in the scroll) → one task row per product (dot + name + status pill; the SELECTED task expands to its
+  // panes). No session-title line, no footer. Cheap: N is small; selection state lives on the session so a re-render
+  // never loses the user's place.
   function renderProductsSidebar(sid) {
     const s = sessions[sid]; if (!s || s.mode !== 'products' || !s.sidebarEl) return;
-    const sb = s.sidebarEl; sb.innerHTML = ''; if (!s.expanded) s.expanded = {};
+    const sb = s.sidebarEl; sb.innerHTML = '';
 
-    const m = document.createElement('div'); m.className = 'psb-master' + (s.activeGroup === 'master' ? ' sel' : '');
-    m.innerHTML = '<span>Master</span><span class="pdot"></span>';
-    if (s.masterPaneId != null) applyStateClass(m, groupStatus(s, [s.masterPaneId]));
+    // 1. Master card FIRST (accent-bordered when selected; "M" badge + subtitle)
+    const m = document.createElement('div'); m.className = 'masteritem' + (s.activeGroup === 'master' ? ' on' : '');
+    m.innerHTML = '<div class="ic">M</div><div class="mt"><b>Master</b><small>admin · conflicts · merge · push</small></div>';
     m.onclick = () => selectGroup(sid, 'master');
     sb.appendChild(m);
 
-    const list = document.createElement('div'); list.className = 'psb-products';
-    const head = document.createElement('div'); head.className = 'psb-sechead'; head.textContent = 'Products';
-    list.appendChild(head);
-    (s.groupOrder || []).forEach((prod) => {
-      const grp = s.groupMap[prod]; if (!grp) return;
-      const gids = [grp.orchPaneId, ...grp.workerPaneIds].filter((id) => id != null && s.terms[id]);
-      const exp = !!s.expanded[prod];
-      const wrapG = document.createElement('div'); wrapG.className = 'pgroup';
-      const row = document.createElement('div'); row.className = 'pgrow' + (s.activeGroup === prod ? ' sel' : '');
-      row.innerHTML = '<span class="tw">' + (exp ? '▾' : '▸') + '</span><span class="nm"></span><span class="pdot"></span>';
-      row.querySelector('.nm').textContent = grp.name;
-      applyStateClass(row, groupStatus(s, gids));
-      row.querySelector('.tw').onclick = (e) => { e.stopPropagation(); s.expanded[prod] = !s.expanded[prod]; renderProductsSidebar(sid); };
-      row.onclick = () => { s.expanded[prod] = true; selectGroup(sid, prod); };
-      wrapG.appendChild(row);
-      if (exp) {
-        const kids = document.createElement('div'); kids.className = 'pgkids';
-        gids.forEach((id) => {
-          const t = s.terms[id];
-          const k = document.createElement('div'); k.className = 'pk' + (t.role === 'orchestrator' ? ' orch' : '');
-          k.textContent = t.heading;
-          k.onclick = (e) => { e.stopPropagation(); if (s.activeGroup !== prod) selectGroup(sid, prod); s.activePaneId = id; focusActive(sid); };
-          kids.appendChild(k);
-        });
-        wrapG.appendChild(kids);
-      }
-      list.appendChild(wrapG);
-    });
-    sb.appendChild(list);
+    // 2. "Tasks" section label
+    const title = document.createElement('div'); title.className = 'sb-title'; title.textContent = 'Tasks';
+    sb.appendChild(title);
 
-    const add = document.createElement('button'); add.className = 'paddprod'; add.textContent = '+ Add product';
+    // 3. scroll area — "+ Add product" is the FIRST item, above the task list
+    const scroll = document.createElement('div'); scroll.className = 'sb-scroll';
+    const add = document.createElement('button'); add.className = 'addtask'; add.textContent = '+ Add product';
     add.onclick = async () => {
       const name = await askName('New product', 'e.g. Billing');
       if (!name) return;
       add.disabled = true;
       try {
-        const r = await window.fleet.addProduct({ sid, name });   // new task-orchestrator pane arrives via onAddPane → rebuildGroups + re-render
+        const r = await window.fleet.addProduct({ sid, name });   // new task-orchestrator arrives via onAddPane → rebuildGroups + re-render
         if (!r || r.ok === false) showSidebarErr(sb, (r && r.error) || 'could not add product');
+        else if (r.heading) s.pendingProductHeading = r.heading;   // FIX C2: onAddPane auto-selects + expands this group
       } catch (err) { showSidebarErr(sb, String((err && err.message) || err)); }
-      add.disabled = false;
+      if (add.isConnected) add.disabled = false;   // FIX C2: guard — the sidebar may have re-rendered (button detached)
     };
-    sb.appendChild(add);
+    scroll.appendChild(add);
+
+    // 4. one row per product; the selected task expands (.task.on) to list its panes
+    (s.groupOrder || []).forEach((prod, gi) => {
+      const grp = s.groupMap[prod]; if (!grp) return;
+      const gids = [grp.orchPaneId, ...grp.workerPaneIds].filter((id) => id != null && s.terms[id]);
+      const box = document.createElement('div'); box.className = 'task' + (s.activeGroup === prod ? ' on' : '');
+      const head = document.createElement('div'); head.className = 'task-head';
+      const pill = productPill(s, gids);
+      head.innerHTML = '<span class="dot" style="background:' + PROD_DOTS[gi % PROD_DOTS.length] + '"></span>' +
+        '<span class="nm"></span><span class="st ' + pill + '">' + pill + '</span>';
+      head.querySelector('.nm').textContent = grp.name;
+      head.onclick = () => selectGroup(sid, prod);
+      box.appendChild(head);
+      const panes = document.createElement('div'); panes.className = 'task-panes';
+      gids.forEach((id) => {
+        const t = s.terms[id];
+        const isOrch = t.role === 'orchestrator';
+        const line = document.createElement('div'); line.className = 'pline' + (isOrch ? ' orch' : '');
+        const col = isOrch ? '#e8915f' : TITLE_COLORS[id % TITLE_COLORS.length];
+        line.innerHTML = '<span class="pd" style="background:' + col + '"></span>';
+        const span = document.createElement('span'); span.textContent = isOrch ? 'Orchestrator' : t.heading; line.appendChild(span);
+        line.onclick = (e) => { e.stopPropagation(); if (s.activeGroup !== prod) selectGroup(sid, prod); s.activePaneId = id; focusActive(sid); };
+        panes.appendChild(line);
+      });
+      box.appendChild(panes);
+      scroll.appendChild(box);
+    });
+
+    sb.appendChild(scroll);
+  }
+
+  // FIX A: boot a pane's PTY NOW (fire term-ready once), regardless of whether its group is currently visible. Used in
+  // products mode so hidden task-orchestrators/workers run in the background instead of waiting for a click. The xterm
+  // was already opened into its DOM element in buildPane; fit best-effort here (a hidden/detached element may measure
+  // 0) and fall back to a sane default size — layout() re-fits (termResize) once the pane becomes visible. Idempotent.
+  function ensureStarted(sid, s, id) {
+    const t = s.terms[id]; if (!t || t.started) return;
+    try { t.fit.fit(); } catch (_) {}
+    let cols = t.term.cols, rows = t.term.rows;
+    if (!cols || cols < 2) cols = 80;
+    if (!rows || rows < 2) rows = 24;
+    window.fleet.termReady({ sid, id, cols, rows }); t.started = true;
   }
 
   // nested-flex layout: grid = vertical stack of rows; each row = horizontal strip of panes. Dividers are LOCAL —
