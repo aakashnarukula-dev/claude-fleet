@@ -144,6 +144,36 @@ project the "Use orchestrator" checkbox still toggles Dispatch vs Grid.
   MUST `cd` into a repo sub-dir before `--done` (fail-closed; a bare `--done` from the non-git
   workspace root errors rather than falsely signalling the master that the whole product is ready).
 
+### Live Preview + Visual Editor (added 2026-07-20)
+Preview a product's running dev server INSIDE the app and edit it with the REAL Chrome DevTools (Elements +
+Styles), then round-trip the edits to an agent that implements them in source and ships via the Master. Files:
+- `src/devserver.js` — dev-server manager (spawn `npm run dev` per worktree, free-port, readiness = banner-port +
+  TCP probe, group-SIGKILL teardown incl. a SYNCHRONOUS `stopAllSync` for app-quit so no `npm run dev` orphans).
+  Sets `CFLEET_INSTRUMENT=1` + `CFLEET_OID_PLUGIN=src/preview/oid-babel-plugin.js` + best-effort Vite config overlay
+  to inject the oid tagger; graceful-degrades to selector/text locate if absent.
+- `src/preview/oid-babel-plugin.js` — stamps stable `data-cfleet-oid` (+`data-cfleet-loc`) on React JSX host elements
+  (dev-only, guarded by `CFLEET_INSTRUMENT`). `src/preview/locate.js` — tiered DOM→source: oid→`_debugSource`→
+  selector/XPath+a11y (plain HTML/CSS/JS maps selector directly to source). Unit tests in `src/preview/__tests__/`.
+- `src/preview-overlay-preload.js` — injected into the previewed page; a `MutationObserver` captures the user's
+  DevTools DOM edits (text/style/attr/move/add/delete, per-text-node granularity, coalesced) tagged with oid→source;
+  reports to the host via `sendToHost('cfleet:change', …)`. CSSOM diff keys rules by selector (not index) + recurses
+  `@media`/`@supports`.
+- `src/main.js` — `preview-start/stop/status` (returns `commitBase`=repo HEAD), `preview-open/close-devtools` (docked
+  via a 2nd webview + `setDevToolsWebContents`), CDP capture of Styles-tab rule edits (`preview-cdp-*`), and
+  `submit-visual-edits`: validates the brief, routes it to the OWNING pane (a worker for the repo — never the
+  push-withheld Integrator) via a `.task` (existing pane) or `.spawn` (new worker), pointing at the apply protocol.
+  Preview servers + CDP torn down on `closeSession`/quit.
+- `src/grid.html` — the preview `<webview>` + toolbar; resets the edit buffer + disables Save + sends `cfleet:reset`
+  after a successful send (no double-dispatch).
+- `bin/claude-fleet` — `--visual-edit-protocol` writes/prints `<STATUS>/visual-edit-protocol.md`, the pane's apply
+  manual: locate (oid→source→selector) → apply (text/CSS auto; Tailwind class + tailwind-merge) → STRUCTURAL
+  (move/add/delete)/low-confidence → restate + CONFIRM in-pane → verify → commit + `--done` (NO push; Master ships).
+Full contract + brief schema `cfleet.visual-edit/1` in `VISUAL-EDITOR-CONTRACT.md`. Built in 4 phases + a 4-agent
+adversarial review (fixed orphan-on-quit, double-start race, wrong-port probe, oid-path, integrator mis-routing,
+text-granularity, CSS rule-key/@media, double-dispatch, CDP teardown). Preview is ADDITIVE — the terminal-grid UX is
+unchanged. GOTCHA: the oid PRECISE path needs the tagger active in the previewed repo's build (best-effort auto for
+Vite; else a one-line opt-in — see `src/preview/README.md`); without it, editing still works via selector/text locate.
+
 ## The `claude-fleet` CLI (`bin/claude-fleet`)
 
 Bash engine the app shells out to (via `execFile`, `FLEET_CLI`). Drives the whole fleet
