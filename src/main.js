@@ -1133,6 +1133,12 @@ function previewKey(sid, product) { return product ? `${sid}:${product}` : `${si
 function previewExtraPathDirs() {
   return path.isAbsolute(FLEET_CLI) ? [path.dirname(FLEET_CLI)] : [];
 }
+// current HEAD sha of the previewed worktree — the visual-edit brief's `commitBase` (drift
+// re-anchor keys off it). Best-effort: null if `cwd` isn't a git checkout / git is missing.
+function headSha(cwd) {
+  try { return String(execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8', timeout: 5000 }).trim()) || null; }
+  catch (_) { return null; }
+}
 
 ipcMain.handle('preview-start', async (_e, { sid, product, repo } = {}) => {
   const s = sessions[sid];
@@ -1147,8 +1153,9 @@ ipcMain.handle('preview-start', async (_e, { sid, product, repo } = {}) => {
       key: previewKey(sid, product), repo: tgt.repo, cwd: tgt.cwd, env,
       extraPathDirs: previewExtraPathDirs(),
     });
-    // repo basename rides along so the renderer can stamp the visual-edit brief's `repo` (P3b routing key).
-    return { ok: true, url: r.url, port: r.port, repo: path.basename(tgt.repo) };
+    // repo basename rides along so the renderer can stamp the visual-edit brief's `repo` (P3b routing key);
+    // commitBase = previewed worktree HEAD so the brief carries a real drift-detection base (was always null).
+    return { ok: true, url: r.url, port: r.port, repo: path.basename(tgt.repo), commitBase: headSha(tgt.cwd) };
   } catch (e) {
     return { ok: false, error: (e && e.message) || String(e) };
   }
@@ -1159,9 +1166,9 @@ ipcMain.handle('preview-stop', (_e, { sid, product } = {}) => {
 });
 ipcMain.handle('preview-status', (_e, { sid, product } = {}) => {
   const st = devserver.statusOf(previewKey(sid, product)) || {};
-  const s = sessions[sid];                                   // add the repo basename (P3b brief routing key) when resolvable
+  const s = sessions[sid];                                   // add the repo basename (P3b brief routing key) + commitBase when resolvable
   const tgt = s ? resolvePreviewTarget(sid, s, product, null) : null;
-  return tgt ? Object.assign({}, st, { repo: path.basename(tgt.repo) }) : st;
+  return tgt ? Object.assign({}, st, { repo: path.basename(tgt.repo), commitBase: headSha(tgt.cwd) }) : st;
 });
 
 // ---- Live Preview: real Chrome DevTools + CDP CSS-rule capture (Visual Editor P2) -----------
@@ -1231,7 +1238,7 @@ ipcMain.handle('preview-cdp-start', async (_e, { webContentsId } = {}) => {
   wc.debugger.on('detach', () => { cdpSessions.delete(wc.id); });
   wc.once('destroyed', () => { try { cdpStop(wc.id); } catch (_) {} });
   try { await wc.debugger.sendCommand('DOM.enable'); await wc.debugger.sendCommand('CSS.enable'); }
-  catch (e) { try { wc.debugger.detach(); } catch (_) {} cdpSessions.delete(wc.id); return { ok: true, attached: false, reason: (e && e.message) || String(e) }; }
+  catch (e) { try { wc.debugger.off('message', sess.onMsg); } catch (_) {} try { wc.debugger.detach(); } catch (_) {} cdpSessions.delete(wc.id); return { ok: true, attached: false, reason: (e && e.message) || String(e) }; }
   cdpSessions.set(wc.id, sess);
   return { ok: true, attached: true };
 });
@@ -1244,7 +1251,15 @@ ipcMain.handle('preview-collect-changes', async (_e, { webContentsId } = {}) => 
   for (const id of Array.from(sess.dirty)) {
     const rec = sess.sheets.get(id); if (!rec) { sess.dirty.delete(id); continue; }
     const after = await cdpFetchSheetText(wc, id);
-    if (after !== rec.baseline) css.push({ sourceURL: rec.sourceURL, before: rec.baseline || '', after });
+    if (rec.baseline == null) {
+      // baseline never finished loading before this change arrived (styleSheetAdded's async
+      // fetch lost the race). Diffing against '' would report the ENTIRE stylesheet as one
+      // edit — adopt the current text as the baseline and skip this round rather than emit a
+      // bogus whole-sheet diff; subsequent edits diff correctly.
+      rec.baseline = after;
+      continue;
+    }
+    if (after !== rec.baseline) css.push({ sourceURL: rec.sourceURL, before: rec.baseline, after });
     rec.baseline = after;   // re-baseline so a second Save reports only NEW rule edits
   }
   sess.dirty.clear();
@@ -1255,6 +1270,23 @@ function cdpStop(id) {
   cdpSessions.delete(id);
   try { sess.wc.debugger.off('message', sess.onMsg); } catch (_) {}
   try { if (sess.wc.debugger.isAttached()) sess.wc.debugger.detach(); } catch (_) {}
+}
+// detach EVERY CDP session (app quit) — so no attached webContents.debugger leaks/blocks
+// the user's own DevTools.
+function cdpStopAll() { for (const id of Array.from(cdpSessions.keys())) { try { cdpStop(id); } catch (_) {} } }
+// detach CDP sessions that belong to `win` (a session close) plus any whose guest
+// webContents is already gone. A <webview> guest's hostWebContents is the embedder
+// (the grid window), which lets us scope teardown to just the closing session's window.
+function cdpStopForWindow(win) {
+  const hostId = (win && !win.isDestroyed()) ? win.webContents.id : null;
+  for (const [id, sess] of Array.from(cdpSessions.entries())) {
+    let drop = false;
+    try {
+      if (!sess.wc || sess.wc.isDestroyed()) drop = true;
+      else { const host = sess.wc.hostWebContents; if (hostId != null && host && host.id === hostId) drop = true; }
+    } catch (_) { drop = true; }
+    if (drop) { try { cdpStop(id); } catch (_) {} }
+  }
 }
 ipcMain.handle('preview-cdp-stop', (_e, { webContentsId } = {}) => {
   const wc = guestWC(webContentsId);
@@ -1311,7 +1343,11 @@ function findVisualEditPane(sid, s, repoBasename, product) {
     if (idx < 0) idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'worker' && p.product === product);
     if (idx < 0) idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'master');
   } else {
-    idx = panes.findIndex((p, i) => isLive(i) && p && (p.role === 'orchestrator' || p.role === 'integrator'));
+    // The orchestrator (dispatch) owns source edits — route there first. NEVER the Integrator:
+    // in integrator mode it is integrate-only + push-withheld and must not implement edits, so
+    // send the brief to a WORKER owning the repo (else any live worker); if none is live, idx < 0
+    // and the caller spawns a fresh worker.
+    idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'orchestrator');
     if (idx < 0) idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'worker' && (ownsRepo(p) || !p.repo));
     if (idx < 0) idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'worker');
   }
@@ -2107,6 +2143,7 @@ function stopSessionPreviews(sid) {
 
 function closeSession(sid) {
   const s = sessions[sid]; if (!s) return;
+  try { cdpStopForWindow(winForSid(sid)); } catch (_) {}   // detach this session's preview CDP so an attached debugger doesn't leak
   stopSessionPreviews(sid);   // tear down any Live Preview dev servers first (never orphan them)
   // a scratch (new-project, unnamed) session has no real repo to --clean — tear it down in-process, guarded so it
   // can only ever remove the .cfleet-scratch- dirs (never a live/foreign session). saveState afterward.
@@ -2128,7 +2165,8 @@ function closeSession(sid) {
 
 function killAll() {
   saveState();   // window close / quit preserves sessions + worktrees so they can be restored next launch
-  try { devserver.stopAll(); } catch (_) {}   // stop every Live Preview dev server (no orphaned npm run dev)
+  try { cdpStopAll(); } catch (_) {}          // detach every preview CDP session (don't leak an attached debugger)
+  try { devserver.stopAllSync(); } catch (_) {}   // SYNCHRONOUSLY force-kill every Live Preview dev server group (no orphaned npm run dev on quit)
   Object.values(ptys).forEach((t) => { try { t.kill(); } catch (_) {} });
   Object.values(sessions).forEach((s) => { if (s.watcher) { try { s.watcher.close(); } catch (_) {} } });
   stopOverlayFollow();
