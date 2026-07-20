@@ -65,6 +65,9 @@
 #                          atomic push the Integrator uses to land ONLY the repos a single worker changed (all-or-none).
 #   --touched <slug>       (multi-repo) print the repos a worker slug actually CHANGED (its fleet/s<sid>/<slug> branch is
 #                          ahead of that repo's _main). The Integrator scopes its --ship to exactly these.
+#   --visual-edit-protocol ensure <STATUS>/visual-edit-protocol.md exists (the apply manual a pane follows when it
+#                          receives a cfleet.visual-edit/1 brief: parse → locate tiers → apply-by-kind → gate → verify
+#                          → commit + --done) and PRINT its absolute path. Idempotent; product-scope-aware via STATUS.
 #   --gh-align             switch the gh CLI's active account to the OWNER of origin (so osxkeychain can read/push
 #                          this repo). Runs automatically at startup; this flag is the manual trigger.
 #   --clean                remove this session's worktrees + branches
@@ -2216,6 +2219,105 @@ globally unique, so use it verbatim in every scratch filename (e.g. /tmp/cfleet_
 EOF
 }
 
+# ------------------------------------------------------ Visual-edit (Live Preview + Visual Editor, VE Phase 3a)
+# Write the VISUAL-EDIT APPLY protocol ONCE to the session's .status dir. A pane that receives a
+# `cfleet.visual-edit/1` brief (routed by main.js Phase-3b via a .task) reads this to turn the captured
+# DevTools edits into REAL source changes: parse the brief → locate the source (tiered) → apply by kind →
+# gate (auto-apply vs ask) → verify → commit + --done. Product-scope-aware: STATUS already resolves to the
+# shared coord .status when CLAUDE_FLEET_PRODUCT is set (the app exports CLAUDE_FLEET_STATUS_DIR), exactly like
+# the other ensure_*_protocol writers. `cat >` overwrites, so repeat calls are idempotent (identical content).
+ensure_visual_edit_protocol() {
+  mkdir -p "$STATUS"
+  cat > "$STATUS/visual-edit-protocol.md" <<'VEP_EOF'
+# Visual-edit apply protocol (claude-fleet)
+
+You received a VISUAL-EDIT BRIEF (JSON, schema `cfleet.visual-edit/1`) routed into this pane by the app: the
+set of edits a user made in the live preview's real Chrome DevTools. Your job is to turn each edit into a REAL
+source change in the repo, verify, commit, and hand up so the Master/Integrator ships it. This file is the HOW;
+follow it IN ADDITION to your normal worker manual (commit style, --done/--failed, --need, stay-in-scope).
+Wherever it says <your-slug>, use your own slug (the last segment of your branch).
+
+## 0. PARSE the brief
+The `.task` that woke you points at a brief JSON. Read it. Top-level fields:
+- `schema` = "cfleet.visual-edit/1"; plus `briefId`, `sid`, `repo`, `route`, `viewport`, `intent` (optional NL goal).
+- `commitBase` = the SHA the preview was rendered from (drift detection — see LOCATE).
+- `edits[]` — each entry is ONE change:
+  - `editId`.
+  - `kind` = one of  text | style | attr | move | add | delete | reorder.
+  - `target` — how to find the source node, IN PRIORITY ORDER:
+      `oid` (opaque `data-cfleet-oid`) → `source{file,line,col,component}` (resolved from the build-time oid map)
+      → `domPath` / `selector` → `role` + `accName`.
+  - `before` — snapshot BEFORE the edit: `text`, `className`, `computed{…}` (corroboration).
+  - `after` — the change: `prop` (className|text|style|<attr>), `value`, `rawValue`, and `tokenResolved` +
+      `tokenName` when a color/spacing resolved to a project design token.
+  - `confidence` = "high" | "low" (structural kinds default to low).
+- `screenshots` — before/after crops. CORROBORATION ONLY; never the source of truth.
+A brief may carry MANY edits. INDEPENDENT edits (different files, no ordering) → run as parallel inline subagents;
+edits touching the SAME file → batch into one pass (you have one worktree — same-file parallelism clobbers).
+
+## 1. LOCATE each edit's source (tiered — stop at the first tier that resolves)
+1. `target.source{file,line,col}` present (from the oid map) → use it directly. Best case.
+2. else resolve `target.oid` via the repo's build-time oid map → file/line/col.
+3. else fall back to DOM identity, per repo shape:
+   - Plain HTML/CSS/JS → `selector`/`domPath` maps DIRECTLY to a node in the source `.html` (rendered ≈ source).
+     Confirm with `before.text` / `before.className`, then patch that node in place. Text edits via text-search;
+     style edits map to the matching CSS rule (or add a class + rule).
+   - React/JSX → find the JSX by `target.component` + `before.text` (and role/accName): grep the component, match
+     the element that renders that text.
+   - Last resort → `role` + `accName` + `before.text` search.
+DRIFT: if `commitBase` != the repo's current HEAD the source has moved — do NOT trust a stale `line` number;
+RE-ANCHOR via oid / component+text / selector instead. If you cannot confidently map an edit to exactly ONE
+source node, treat it as UNRESOLVABLE and go to the GATE (ask — never guess).
+
+## 2. APPLY — keyed by kind + confidence + the repo's styling system
+- `text` → edit the text node (HTML) or the JSX text child in place; preserve surrounding markup/whitespace.
+- `style` / `attr` (high confidence) → put the change where the source actually carries it:
+    - Tailwind repo → mutate the element's `className`: add/replace the utility in `after.value`, resolving
+      conflicting utilities the tailwind-merge way (last wins — drop the overridden one). Prefer the token class
+      (`tokenName`) over a raw hex when `tokenResolved` is true.
+    - inline style is the source shape → edit the `style={{…}}` / `style="…"` prop.
+    - a stylesheet / SCSS / CSS-module RULE edit → edit the matching CSS rule (the brief carries the selector /
+      rule text); only add a class + new rule if there is no existing rule to patch.
+- `move` / `reorder` / `add` / `delete` (STRUCTURAL — reshape the DOM across parents, default LOW confidence) →
+  do NOT guess; a wrong structural guess corrupts the layout. Go to the GATE.
+
+## 3. GATE policy (auto-apply vs ask)
+AUTO-APPLY (NO confirm gate — apply + commit straight away) when ALL hold:
+  `text` / `style` / `attr`  AND  `confidence:"high"`  AND  the target resolved cleanly to a single node.
+ASK IN THIS PANE FIRST (restate + show the diff, then WAIT for the user before committing) when ANY hold:
+  - kind is `move` / `add` / `delete` / `reorder` (structural), OR
+  - `confidence:"low"`, OR
+  - the target was UNRESOLVABLE / ambiguous / drifted (couldn't anchor to one node), OR
+  - the post-apply VERIFY mismatched (build/lint broke, or the render doesn't match the intended change).
+Whenever you ask, ALWAYS restate what you understood first, literally: "I understand: <plain-English of the edit>.
+Proposed diff: <diff>. Apply? (y/n)" — then wait. Never commit a gated edit before the user answers.
+
+## 4. VERIFY after applying
+Run the touched repo's build/lint per its CLAUDE.md. If it can render, sanity-check that the changed node matches
+the intended `after` (screenshots corroborate — they don't decide). A failure or mismatch DEMOTES the edit to the
+GATE (ask); do NOT commit a broken change.
+
+## 5. COMMIT + HAND UP
+- ONE brief = ONE coherent commit / changeset. Commit on your branch with SEPARATE plain commands:
+  `git add <files>` then `git commit -m "<what + why>"` (reference the briefId / intent). Do NOT push.
+- Self-signal: `claude-fleet --done`. In a MULTI-REPO run, cd into each repo sub-dir you changed and run the
+  normal `claude-fleet --touched` + `claude-fleet --done` flow, so the Master / Integrator merges → test-gates →
+  ships it (the existing pipeline — you never push).
+- A prerequisite you hit, or a follow-up another pane must do → `claude-fleet --need "<what + why + which files>"`.
+
+## 6. AMBIGUITY / UNDO
+- Any edit you can't map cleanly to source → ASK in this pane (Gate). Never silently drop or approximate it.
+- A landed brief is exactly ONE commit, so UNDO = normal git (revert that commit). Say so if the user asks to undo.
+VEP_EOF
+}
+
+# CLI verb: ensure the visual-edit protocol exists, then print its absolute path (main.js Phase-3b references
+# it in the .task it writes to point a pane at the apply manual). Product-scope-aware via STATUS (see above).
+cmd_visual_edit_protocol() {
+  ensure_visual_edit_protocol
+  printf '%s\n' "$STATUS/visual-edit-protocol.md"
+}
+
 # Integrator-mode worker prompt: one general pane spanning EVERY repo, but it COMMITS + --done ONLY (never pushes) — the
 # Integrator pane owns integration + pushing. wsdir = the per-pane workspace dir (its cwd); sub-dirs are the repos.
 integrator_worker_prompt() { # heading slug workspace_dir [initial_requirement]
@@ -2796,6 +2898,7 @@ case "${1:-}" in
   --ship-all)     cmd_ship_all ;;
   --ship)         shift; cmd_ship "$@" ;;
   --touched)      shift; cmd_touched "${1:-}" ;;
+  --visual-edit-protocol) cmd_visual_edit_protocol ;;
   --new-project)  shift; cmd_new_project "${1:-}" "${2:-}" ;;
   --clean)        cmd_clean ;;
   --gc)           cmd_gc ;;
