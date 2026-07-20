@@ -428,7 +428,7 @@
     if (account === user) clearGithub();
     delete repoCache[user];
     loadAccounts();
-    if (mode === 'gyftalala') loadGyfRepos();   // refresh the multi-repo checklist (was showing the now-removed account's repos)
+    if (mode === 'gyftalala' || mode === 'products') loadGyfRepos();   // refresh the multi-repo/products checklist (was showing the now-removed account's repos)
   }
   // device-code connect modal
   const ghModal = document.getElementById('ghModal'), ghCode = document.getElementById('ghCode'), ghStatus = document.getElementById('ghStatus');
@@ -478,10 +478,10 @@
     account = id; repo = ''; newProject = false; newProjBtn.classList.remove('on');   // choosing GitHub clears the local folder + new-project
     setProjLabel();
     [...acctsEl.children].forEach((c) => c.classList.toggle('on', c.dataset.id === id));
-    renderRecent(); document.getElementById('repoPickRow').style.display = (mode === 'gyftalala') ? 'none' : '';   // multi-repo uses the checklist, not the single dropdown
-    // In multi-repo mode loadGyfRepos OWNS the fetch (it calls loadRepos(account) itself when uncached); calling
+    renderRecent(); document.getElementById('repoPickRow').style.display = (mode === 'gyftalala' || mode === 'products') ? 'none' : '';   // multi-repo/products use the checklist, not the single dropdown
+    // In multi-repo/products mode loadGyfRepos OWNS the fetch (it calls loadRepos(account) itself when uncached); calling
     // loadRepos(id) here too would race a SECOND identical `gh repo list` subprocess to fill the same cache.
-    if (mode === 'gyftalala') loadGyfRepos();
+    if (mode === 'gyftalala' || mode === 'products') loadGyfRepos();
     else loadRepos(id);
   }
   async function loadRepos(acct) {
@@ -666,7 +666,7 @@
       gyfAll = []; gyfChecked = new Set(); gyfLoadedAccount = null;
       emptyRepoMsg('Loading repos…'); updateRepoCount(); refreshGo();
       loadRepos(account).then(() => {
-        if (mode !== 'gyftalala') return;
+        if (mode !== 'gyftalala' && mode !== 'products') return;
         // Only recurse on SUCCESS (repos now cached). On a persistent error loadRepos doesn't cache → recursing would
         // refetch forever (a gh process each round); show a terminal message instead.
         if (repoCache[account]) loadGyfRepos();
