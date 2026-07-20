@@ -142,6 +142,52 @@
   #edsave:disabled { opacity:.45; }
   #monaco { flex:1; min-height:0; }
   /* in-app permission queue removed — permission prompts now surface only through the system-wide overlay window. */
+
+  /* ---- Live Preview + Visual Editor (Products mode ONLY) — VE Phase 2 ------------------------
+     A preview view overlays the products pane-STAGE: [ <webview> (page | docked DevTools) ][ Changes panel ].
+     It is display:none until a product's "Preview & edit" is opened, and never affects any other mode. */
+  .pline.prev { color:#7dcfff !important; }
+  .psidebar .pline.prev.on { background:#16222e; color:#9fd4ff !important; }
+  .pvwrap { position:absolute; inset:0; display:none; flex-direction:row; background:#0e0f12; z-index:8; }
+  .pvwrap.show { display:flex; }
+  .pvmain { flex:1; min-width:0; display:flex; flex-direction:column; background:#0e0f12; }
+  .pvtool { display:flex; align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--bar); flex:none; }
+  .pvtool .pv-url { flex:1; min-width:0; background:var(--bg); border:1px solid var(--line); border-radius:7px; padding:6px 10px; font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pvtool .pv-url .g { color:#5bd18b; } .pvtool .pv-url.off .g { color:#e86f6f; }
+  .pvtool .pv-seg { display:flex; background:#1e2026; border:1px solid var(--line); border-radius:7px; overflow:hidden; flex:none; }
+  .pvtool .pv-seg button { background:transparent; border:0; color:var(--muted); padding:5px 10px; cursor:pointer; font-size:11px; }
+  .pvtool .pv-seg button.on { background:#232630; color:#fff; }
+  .pvtool .pv-editbtn { flex:none; background:var(--accent); color:#1a1206; border:0; border-radius:7px; padding:6px 13px; font-weight:700; cursor:pointer; font-size:12px; }
+  .pvtool .pv-editbtn.off { background:#232630; color:var(--muted); }
+  .pvtool .pv-close { flex:none; background:transparent; border:1px solid var(--line); color:var(--muted); border-radius:7px; padding:6px 10px; cursor:pointer; font-size:12px; }
+  .pvtool .pv-close:hover { border-color:var(--accent); color:#fff; }
+  .pvcanvas { flex:1; min-height:0; overflow:hidden; display:flex; background:#0b0c10; }
+  .pvcanvas.mobile { justify-content:center; padding:14px; overflow:auto; }
+  .pv-webview { display:flex; flex:1; width:100%; height:100%; border:0; background:#fff; }
+  .pvcanvas.mobile .pv-webview { flex:none; width:420px; max-width:100%; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .pv-start { margin:auto; text-align:center; color:var(--muted); display:flex; flex-direction:column; gap:12px; align-items:center; padding:24px; }
+  .pv-start button { background:var(--accent); color:#1a1206; border:0; border-radius:9px; padding:10px 20px; font-weight:700; cursor:pointer; font-size:13px; }
+  .pv-start .err { color:#e86f6f; font-size:12px; max-width:440px; word-break:break-word; }
+  .pvside { width:322px; flex:none; background:#1e2026; border-left:1px solid var(--line); display:flex; flex-direction:column; }
+  .pvside .pv-sh { display:flex; align-items:center; gap:8px; padding:10px 13px; border-bottom:1px solid var(--line); font-size:12px; font-weight:600; color:#fff; }
+  .pvside .pv-sh .pv-pill { margin-left:auto; font-size:10px; background:#232630; border:1px solid var(--line); border-radius:20px; padding:2px 8px; color:var(--muted); }
+  .pvside .pv-scroll { flex:1; overflow:auto; padding:11px 13px; }
+  .pv-hint { color:#6b7280; font-size:11.5px; line-height:1.5; padding:4px 2px; }
+  .pv-change { background:#232630; border:1px solid var(--line); border-radius:8px; padding:8px 9px; margin-bottom:7px; }
+  .pv-change .pv-x { float:right; color:#6b7280; cursor:pointer; font-size:13px; line-height:1; }
+  .pv-change .pv-k { display:inline-block; font-size:9px; text-transform:uppercase; letter-spacing:.5px; font-weight:700; padding:1px 5px; border-radius:4px; margin-bottom:4px; }
+  .pv-k.text { background:#12233a; color:#6fb2ff; } .pv-k.style { background:#2a2118; color:var(--accent); } .pv-k.attr { background:#1c2733; color:#7dcfff; }
+  .pv-k.move { background:#241b33; color:#bb9af7; } .pv-k.add { background:#132a1c; color:#5bd18b; } .pv-k.delete { background:#2a1414; color:#e86f6f; }
+  .pv-change .pv-conf { display:inline-block; font-size:9px; font-weight:700; padding:1px 5px; border-radius:4px; margin-left:6px; }
+  .pv-conf.low { background:#2a2410; color:#e8c15f; } .pv-conf.high { background:#132a1c; color:#5bd18b; }
+  .pv-change .pv-src { font:600 10px/1.3 'SF Mono', Menlo, monospace; color:var(--muted); margin:2px 0 3px; word-break:break-all; }
+  .pv-change .pv-chg { font:11.5px/1.5 'SF Mono', Menlo, monospace; word-break:break-word; }
+  .pv-change .pv-chg .b { color:#e86f6f; } .pv-change .pv-chg .a { color:#5bd18b; }
+  .pv-empty { color:#6b7280; font-size:11.5px; padding:6px 2px; }
+  .pvside .pv-foot { padding:11px 13px; border-top:1px solid var(--line); }
+  .pv-save { width:100%; background:var(--accent); color:#1a1206; border:0; border-radius:9px; padding:11px; font-weight:700; font-size:13px; cursor:pointer; }
+  .pv-save:disabled { background:#232630; color:#6b7280; cursor:default; }
+  .pv-sent { color:#5bd18b; font-size:11.5px; padding:8px 2px 0; line-height:1.5; }
 </style>
 </head>
 <body>
@@ -369,6 +415,7 @@
   function selectGroup(sid, g) {
     const s = sessions[sid]; if (!s || s.mode !== 'products') return;
     s.activeGroup = g;
+    teardownPreview(s);   // selecting a pane group means "show panes" — tear down any open preview (stops capture/DevTools)
     renderProductsSidebar(sid);
     layout(sid);
     const vis = visiblePaneIds(s);
@@ -457,6 +504,13 @@
         line.onclick = (e) => { e.stopPropagation(); if (s.activeGroup !== prod) selectGroup(sid, prod); s.activePaneId = id; focusActive(sid); };
         panes.appendChild(line);
       });
+      // "Preview & edit" — opens the Live Preview + Visual Editor view for this product (VE P2)
+      const prev = document.createElement('div');
+      prev.className = 'pline prev' + ((s.previewOn && s.previewProduct === prod) ? ' on' : '');
+      prev.innerHTML = '<span class="pd" style="background:#7dcfff"></span>';
+      const psp = document.createElement('span'); psp.textContent = '◉ Preview & edit'; prev.appendChild(psp);
+      prev.onclick = (e) => { e.stopPropagation(); openPreview(sid, prod); };
+      panes.appendChild(prev);
       box.appendChild(panes);
       scroll.appendChild(box);
     });
@@ -679,6 +733,7 @@
   }
   function doCloseTab(sid) {
     const s = sessions[sid]; if (!s) return;
+    teardownPreview(s);   // stop any live preview capture/DevTools before the session goes away (no leaks)
     window.fleet.closeSession(sid);
     Object.values(s.terms).forEach(disposeTerm);   // dispose ALL terminals + observers (closing a tab killed the PTYs but leaked the xterm views)
     const next = activeSid === sid ? pickNextActive(sid) : null;   // resolve neighbor BEFORE dropping the tab from the DOM
@@ -961,6 +1016,314 @@
       mEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveFile);
       monacoLoading = false; cb();
     });
+  }
+
+  // ============================================================================================
+  // Live Preview + Visual Editor (Products mode ONLY) — VE Phase 2.
+  // A preview view overlays the products pane-STAGE: a toolbar + an Electron <webview> (the REAL
+  // Chrome DevTools dock INSIDE it, page-left / DevTools-right) + a host-side "Changes" panel.
+  // The overlay preload (preview-overlay-preload.js) captures every DOM/CSS edit the user makes in
+  // DevTools and streams change records here; Save assembles the visual-edit brief and hands it to
+  // the agent via window.fleet.submitVisualEdits (guarded — Phase 3 wires the handler). ALL of this
+  // is gated on products mode + an open preview; the terminal grid / sidebar / panes are untouched.
+  const PREVIEW_PRELOAD = new URL('preview-overlay-preload.js', location.href).href;
+  const PV_STRUCTURAL = ['move', 'add', 'delete', 'reorder'];
+
+  function ensurePreview(sid) {
+    const s = sessions[sid]; if (!s || s.mode !== 'products' || !s.stageEl) return null;
+    if (s.preview && s.preview.wrap) return s.preview;
+    const wrap = document.createElement('div'); wrap.className = 'pvwrap';
+    const main = document.createElement('div'); main.className = 'pvmain';
+    const tool = document.createElement('div'); tool.className = 'pvtool';
+    tool.innerHTML =
+      '<div class="pv-url"><span class="g">●</span> <span class="pv-host">—</span></div>' +
+      '<div class="pv-seg"><button data-vp="desktop" class="on">Desktop</button><button data-vp="mobile">Mobile</button></div>' +
+      '<button class="pv-editbtn off" data-role="edit">✎ Edit: OFF</button>' +
+      '<button class="pv-close" data-role="close" title="Back to panes">✕ Close</button>';
+    const canvas = document.createElement('div'); canvas.className = 'pvcanvas';
+    main.appendChild(tool); main.appendChild(canvas);
+    const side = document.createElement('div'); side.className = 'pvside';
+    side.innerHTML =
+      '<div class="pv-sh">Changes <span class="pv-pill" data-el="status">—</span></div>' +
+      '<div class="pv-scroll"><div class="pv-hint" data-el="hint">Turn on <b>Edit</b> to open DevTools on the preview. Edit text/HTML in the <b>Elements</b> tab or CSS in the <b>Styles</b> tab — every change is captured below.</div><div data-el="list"></div></div>' +
+      '<div class="pv-foot"><button class="pv-save" data-el="save" disabled>Save &amp; send to agent</button><div class="pv-sent" data-el="sent" style="display:none"></div></div>';
+    wrap.appendChild(main); wrap.appendChild(side);
+    s.stageEl.appendChild(wrap);
+    const pv = s.preview = {
+      wrap, main, tool, canvas, side, webview: null, wcId: null,
+      overlayReady: false, product: null, repo: null, url: null, route: '/', running: false,
+      editing: false, viewport: 'desktop', cdpAttached: false, commitBase: null, changes: [],
+      els: {
+        host: tool.querySelector('.pv-host'), url: tool.querySelector('.pv-url'),
+        editBtn: tool.querySelector('[data-role=edit]'),
+        status: side.querySelector('[data-el=status]'), hint: side.querySelector('[data-el=hint]'),
+        list: side.querySelector('[data-el=list]'), save: side.querySelector('[data-el=save]'),
+        sent: side.querySelector('[data-el=sent]'),
+      },
+    };
+    tool.querySelectorAll('.pv-seg button').forEach((b) => b.onclick = () => setPreviewViewport(sid, b.dataset.vp));
+    pv.els.editBtn.onclick = () => setPreviewEditing(sid, !pv.editing);
+    tool.querySelector('[data-role=close]').onclick = () => closePreview(sid);
+    pv.els.save.onclick = () => savePreview(sid);
+    return pv;
+  }
+
+  async function openPreview(sid, product) {
+    const s = sessions[sid]; if (!s || s.mode !== 'products') return;
+    const pv = ensurePreview(sid); if (!pv) return;
+    if (pv.wrap.classList.contains('show') && pv.product === product && pv.webview) return;   // already open on this product
+    detachWebview(pv);                                   // clean any prior mount before (re)opening
+    if (pv.product && pv.product !== product) pv.changes = [];   // switched products — fresh buffer
+    pv.product = product;
+    s.activeGroup = product; s.previewProduct = product; s.previewOn = true;
+    pv.wrap.classList.add('show');
+    renderProductsSidebar(sid);
+    renderChanges(sid);
+    // reuse a running dev server if one exists; otherwise show a Start affordance (don't auto-spawn npm).
+    let st = null;
+    try { st = await window.fleet.previewStatus({ sid, product }); } catch (_) {}
+    if (st && st.running && st.url) { pv.url = st.url; pv.running = true; mountWebview(sid); }
+    else showStart(sid, '');
+  }
+
+  function showStart(sid, err) {
+    const pv = sessions[sid].preview; pv.canvas.classList.remove('mobile'); pv.canvas.innerHTML = '';
+    const box = document.createElement('div'); box.className = 'pv-start';
+    box.innerHTML = '<div>Preview the running dev server for this product.</div>' +
+      (err ? '<div class="err">' + escapeHtml(err) + '</div>' : '') + '<button>▶ Start preview</button>';
+    box.querySelector('button').onclick = () => startPreview(sid);
+    pv.canvas.appendChild(box);
+    setStatus(pv, 'not running', false);
+  }
+
+  async function startPreview(sid) {
+    const s = sessions[sid], pv = s.preview; if (!pv) return;
+    setStatus(pv, 'starting…', true);
+    let r; try { r = await window.fleet.previewStart({ sid, product: pv.product, repo: null }); }
+    catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+    if (!r || r.ok === false) { showStart(sid, (r && r.error) || 'could not start preview'); return; }
+    pv.url = r.url; pv.running = true; mountWebview(sid);
+  }
+
+  function mountWebview(sid) {
+    const s = sessions[sid], pv = s.preview; if (!pv || !pv.url) return;
+    pv.canvas.innerHTML = ''; pv.overlayReady = false; pv.wcId = null;
+    applyViewport(pv);
+    const wv = document.createElement('webview');
+    wv.className = 'pv-webview';
+    wv.setAttribute('src', pv.url);
+    wv.setAttribute('preload', PREVIEW_PRELOAD);
+    wv.setAttribute('webpreferences', 'contextIsolation=yes');
+    wv.setAttribute('allowpopups', 'false');
+    pv.webview = wv;
+    wv.addEventListener('dom-ready', () => {
+      try { pv.wcId = wv.getWebContentsId(); } catch (_) {}
+      try { pv.route = new URL(wv.getURL()).pathname || '/'; } catch (_) {}
+      setStatus(pv, pv.changes.length ? (pv.changes.length + ' changes') : 'ready', true);
+      if (pv.editing) enterEditMode(sid);   // preload re-injects on every load — re-open DevTools + capture
+    });
+    wv.addEventListener('ipc-message', (e) => onOverlayMessage(sid, e));
+    wv.addEventListener('did-fail-load', (e) => { if (e && e.errorCode && e.errorCode !== -3) showStart(sid, 'load failed: ' + (e.errorDescription || e.errorCode)); });
+    pv.canvas.appendChild(wv);
+    setStatus(pv, 'loading…', true);
+  }
+
+  function hostLabel(pv) {
+    let h = pv.url || '—';
+    try { const u = new URL(pv.url); h = u.host + (pv.route && pv.route !== '/' ? ' · ' + pv.route : ''); } catch (_) {}
+    return h + (pv.product ? ' · ' + pv.product : '');
+  }
+  function setStatus(pv, text, ok) { pv.els.status.textContent = text; pv.els.host.textContent = hostLabel(pv); pv.els.url.classList.toggle('off', !ok); }
+
+  function onOverlayMessage(sid, e) {
+    const pv = sessions[sid] && sessions[sid].preview; if (!pv) return;
+    const p = (e.args && e.args[0]) || {};
+    if (e.channel === 'cfleet:ready') { pv.overlayReady = true; if (pv.editing) sendOverlay(pv, 'cfleet:capture', { on: true }); }
+    else if (e.channel === 'cfleet:change') { appendChange(sid, p); }
+  }
+  function sendOverlay(pv, channel, payload) { if (pv.webview && pv.overlayReady) { try { pv.webview.send(channel, payload); } catch (_) {} } }
+
+  function setPreviewViewport(sid, vp) {
+    const pv = sessions[sid].preview; if (!pv) return; pv.viewport = vp;
+    pv.tool.querySelectorAll('.pv-seg button').forEach((b) => b.classList.toggle('on', b.dataset.vp === vp));
+    applyViewport(pv);
+  }
+  function applyViewport(pv) { if (pv.canvas) pv.canvas.classList.toggle('mobile', pv.viewport === 'mobile'); }
+
+  async function setPreviewEditing(sid, on) {
+    const pv = sessions[sid].preview; if (!pv) return;
+    if (on && !pv.running) { await startPreview(sid); if (!pv.running) return; }
+    pv.editing = !!on;
+    pv.els.editBtn.textContent = on ? '✎ Edit: ON' : '✎ Edit: OFF';
+    pv.els.editBtn.classList.toggle('off', !on);
+    if (on) enterEditMode(sid); else exitEditMode(sid);
+    renderChanges(sid);
+  }
+  async function enterEditMode(sid) {
+    const pv = sessions[sid].preview; if (!pv || pv.wcId == null) return;   // wait for dom-ready; it re-invokes this
+    try { await window.fleet.previewOpenDevtools({ webContentsId: pv.wcId, mode: 'right' }); } catch (_) {}
+    // best-effort CDP for source-mapped CSS-rule diffs; it can't attach while DevTools holds the
+    // debugger (expected) — the preload's CSSOM diff + MutationObserver are the reliable capture path.
+    try { const r = await window.fleet.previewCdpStart({ webContentsId: pv.wcId }); pv.cdpAttached = !!(r && r.attached); } catch (_) { pv.cdpAttached = false; }
+    sendOverlay(pv, 'cfleet:capture', { on: true });
+  }
+  async function exitEditMode(sid) {
+    const pv = sessions[sid].preview; if (!pv) return;
+    sendOverlay(pv, 'cfleet:capture', { on: false });
+    if (pv.wcId != null) {
+      try { await window.fleet.previewCloseDevtools({ webContentsId: pv.wcId }); } catch (_) {}
+      try { await window.fleet.previewCdpStop({ webContentsId: pv.wcId }); } catch (_) {}
+    }
+    pv.cdpAttached = false;
+  }
+
+  // ---- change buffer ----
+  function changeKey(r) {
+    const t = r.target || {};
+    if (r.cssRule) return 'css|' + (r.sourceURL || '') + '|' + (t.selector || r.name || '');
+    return (t.oid || t.selector || t.domPath || r.name || '?') + '|' + r.kind + '|' + (r.prop || '');
+  }
+  function isStructural(r) { return !r.cssRule && (r.structural || PV_STRUCTURAL.indexOf(r.kind) >= 0); }
+  function appendChange(sid, r) {
+    const pv = sessions[sid] && sessions[sid].preview; if (!pv || !r || !r.kind) return;
+    if (isStructural(r)) {
+      const k = changeKey(r) + '|' + (r.after || '');
+      if (pv.changes.some((x) => x.__k === k)) return;   // dedup identical structural emits
+      r.__k = k; pv.changes.push(r);
+    } else {
+      const k = changeKey(r); const ex = pv.changes.find((x) => x.__k === k);
+      if (ex) { ex.after = r.after; ex.rawValue = r.rawValue; ex.tokenName = r.tokenName; ex.tokenResolved = r.tokenResolved; }
+      else { r.__k = k; pv.changes.push(r); }
+    }
+    renderChanges(sid);
+  }
+  function renderChanges(sid) {
+    const pv = sessions[sid] && sessions[sid].preview; if (!pv) return;
+    const list = pv.els.list, n = pv.changes.length;
+    pv.els.save.disabled = n === 0;
+    pv.els.status.textContent = n ? (n + ' change' + (n > 1 ? 's' : '')) : (pv.editing ? 'editing…' : (pv.running ? 'ready' : 'not running'));
+    if (!n) { list.innerHTML = ''; pv.els.hint.style.display = ''; return; }
+    pv.els.hint.style.display = 'none';
+    list.innerHTML = '';
+    pv.changes.forEach((r, i) => {
+      const badge = badgeOf(r), t = r.target || {};
+      const src = r.cssRule ? (t.selector || r.name || 'rule') + (t.source && t.source.file ? '  ' + t.source.file : '')
+        : (t.oid || (t.source && t.source.file ? t.source.file + (t.source.line ? ':' + t.source.line : '') : '') || t.selector || r.name || 'element');
+      const before = truncate(r.before, 60), after = truncate(r.after, 60);
+      const chg = isStructural(r) ? '<span class="a">' + escapeHtml(after) + '</span>'
+        : (before ? '<span class="b">' + escapeHtml(before) + '</span> → ' : '') + '<span class="a">' + escapeHtml(after) + '</span>'
+          + (r.tokenName ? ' <span style="color:#6b7280">(' + escapeHtml(r.tokenName) + ')</span>' : '');
+      const conf = (r.confidence === 'low') ? '<span class="pv-conf low">confirm</span>' : '<span class="pv-conf high">auto</span>';
+      const d = document.createElement('div'); d.className = 'pv-change';
+      d.innerHTML = '<span class="pv-x" data-i="' + i + '">×</span>' +
+        '<span class="pv-k ' + badge.cls + '">' + badge.label + (r.prop && !isStructural(r) && r.kind === 'style' && !r.cssRule ? ' · ' + escapeHtml(r.prop) : '') + '</span>' + conf +
+        '<div class="pv-src">' + escapeHtml(src) + '</div><div class="pv-chg">' + chg + '</div>';
+      list.appendChild(d);
+    });
+    list.querySelectorAll('.pv-x').forEach((x) => x.onclick = () => { pv.changes.splice(+x.dataset.i, 1); renderChanges(sid); });
+  }
+  function badgeOf(r) {
+    const k = r.kind;
+    if (k === 'text') return { cls: 'text', label: 'text' };
+    if (k === 'attr') return { cls: 'attr', label: 'attr' };
+    if (k === 'move' || k === 'reorder') return { cls: 'move', label: 'move' };
+    if (k === 'add') return { cls: 'add', label: 'add' };
+    if (k === 'delete') return { cls: 'delete', label: 'delete' };
+    return { cls: 'style', label: r.cssRule ? 'css' : 'style' };
+  }
+  function truncate(s, n) { s = (s == null ? '' : String(s)); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+
+  // ---- Save -> assemble the visual-edit brief -> submit ----
+  async function savePreview(sid) {
+    const s = sessions[sid], pv = s.preview; if (!pv) return;
+    pv.els.save.disabled = true; pv.els.sent.style.display = 'none';
+    sendOverlay(pv, 'cfleet:collect', {});   // flush pending DOM records + diff the CSSOM now
+    let cdp = null;
+    if (pv.wcId != null) { try { cdp = await window.fleet.previewCollectChanges({ webContentsId: pv.wcId }); } catch (_) {} }
+    if (cdp && cdp.ok && Array.isArray(cdp.css)) mergeCdpCss(pv, cdp.css);
+    await new Promise((res) => setTimeout(res, 350));   // let the overlay's async cfleet:change messages land
+    const brief = buildBrief(sid);
+    renderChanges(sid);
+    let res = null;
+    if (window.fleet && typeof window.fleet.submitVisualEdits === 'function') {
+      try { res = await window.fleet.submitVisualEdits(sid, brief); } catch (e) { res = { ok: false, error: String((e && e.message) || e) }; }
+    } else {
+      console.log('[cfleet] submitVisualEdits not wired yet (Phase 3). Brief:', brief);   // eslint-disable-line no-console
+      res = { ok: false, pending: true };
+    }
+    showSent(pv, brief, res);
+  }
+  function mergeCdpCss(pv, cssList) {
+    cssList.forEach((c) => {
+      if (!c || c.before === c.after) return;
+      if (pv.changes.some((x) => x.cssRule && x.sourceURL && x.sourceURL === c.sourceURL)) return;   // CSSOM diff already covers this sheet per-rule
+      const r = { kind: 'style', prop: 'css-rule', cssRule: true, sourceURL: c.sourceURL, confidence: 'high',
+        name: c.sourceURL || 'stylesheet', before: c.before, after: c.after,
+        target: { selector: null, source: { file: c.sourceURL || null, line: 0, col: 0, component: null }, cssRule: true } };
+      r.__k = changeKey(r); pv.changes.push(r);
+    });
+  }
+  function buildBrief(sid) {
+    const s = sessions[sid], pv = s.preview;
+    let vp = { w: 0, h: 0, dpr: 1, theme: 'light' };
+    try {
+      const wv = pv.webview;
+      vp = { w: (wv && wv.clientWidth) || 0, h: (wv && wv.clientHeight) || 0, dpr: window.devicePixelRatio || 1,
+        theme: (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light' };
+    } catch (_) {}
+    const edits = pv.changes.map((r, i) => {
+      const t = r.target || {}, structural = isStructural(r);
+      return {
+        editId: 'e' + (i + 1),
+        kind: r.kind,
+        target: { oid: t.oid || null, source: t.source || null, domPath: t.domPath || null, selector: t.selector || null,
+          role: t.role || null, accName: t.accName || null, cssRule: !!r.cssRule },
+        before: r.cssRule ? { css: r.before } : { text: r.before != null ? r.before : null, value: r.before != null ? r.before : null },
+        after: { prop: r.prop || r.kind, value: r.after, rawValue: r.rawValue || null,
+          tokenResolved: !!r.tokenResolved, tokenName: r.tokenName || null },
+        confidence: r.confidence || (structural ? 'low' : 'high'),
+      };
+    });
+    return {
+      schema: 'cfleet.visual-edit/1',
+      briefId: 've-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+      sid: sid, repo: pv.repo || null, route: pv.route || '/', viewport: vp,
+      commitBase: pv.commitBase || null, intent: null, edits: edits, screenshots: null,
+    };
+  }
+  function showSent(pv, brief, res) {
+    const el = pv.els.sent; el.style.display = 'block';
+    const n = brief.edits.length, low = brief.edits.filter((e) => e.confidence === 'low').length;
+    if (res && res.ok) el.innerHTML = '✓ Sent ' + n + ' edit' + (n !== 1 ? 's' : '') + ' to the agent' + (res.slug ? ' (' + escapeHtml(res.slug) + ')' : '') + '. ' + (low ? low + ' structural need confirming in the pane.' : '');
+    else if (res && res.pending) el.innerHTML = '⏳ Brief assembled (' + n + ' edit' + (n !== 1 ? 's' : '') + '); agent hand-off lands in Phase 3. Logged to console.';
+    else el.innerHTML = '<span style="color:#e86f6f">Send failed: ' + escapeHtml((res && res.error) || 'unknown') + '</span>';
+    pv.els.save.disabled = brief.edits.length === 0;
+  }
+
+  // detach the webview: stop capture, detach CDP, close DevTools, drop the element (dev server stays up).
+  function detachWebview(pv) {
+    if (!pv) return;
+    const wcId = pv.wcId;
+    if (pv.webview) { try { sendOverlay(pv, 'cfleet:capture', { on: false }); } catch (_) {} }
+    if (wcId != null) {
+      try { window.fleet.previewCloseDevtools({ webContentsId: wcId }); } catch (_) {}
+      try { window.fleet.previewCdpStop({ webContentsId: wcId }); } catch (_) {}
+    }
+    try { if (pv.webview && pv.webview.parentNode) pv.webview.parentNode.removeChild(pv.webview); } catch (_) {}
+    pv.webview = null; pv.wcId = null; pv.overlayReady = false; pv.editing = false; pv.running = false; pv.cdpAttached = false;
+    if (pv.els && pv.els.editBtn) { pv.els.editBtn.textContent = '✎ Edit: OFF'; pv.els.editBtn.classList.add('off'); }
+  }
+  // hide the whole preview (back to the pane grid). Called from selectGroup + closePreview + tab close.
+  function teardownPreview(s) {
+    const pv = s && s.preview; if (!pv || !pv.wrap || !pv.wrap.classList.contains('show')) return;
+    detachWebview(pv);
+    pv.wrap.classList.remove('show'); s.previewOn = false;
+  }
+  function closePreview(sid) {
+    const s = sessions[sid]; if (!s) return;
+    teardownPreview(s);
+    renderProductsSidebar(sid);
+    layout(sid); focusActive(sid);
   }
 </script>
 </body>

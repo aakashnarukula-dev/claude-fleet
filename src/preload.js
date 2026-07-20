@@ -18,6 +18,12 @@ contextBridge.exposeInMainWorld('fleet', {
   previewStart: (a) => ipcRenderer.invoke('preview-start', a),   // -> {ok, url, port} | {ok:false, error}
   previewStop: (a) => ipcRenderer.invoke('preview-stop', a),     // -> {ok}
   previewStatus: (a) => ipcRenderer.invoke('preview-status', a), // -> {running, url, port, ready}
+  // Live Preview — real DevTools + CDP CSS-rule capture (Visual Editor P2). {webContentsId, mode?}
+  previewOpenDevtools: (a) => ipcRenderer.invoke('preview-open-devtools', a),   // dock native DevTools right of the preview
+  previewCloseDevtools: (a) => ipcRenderer.invoke('preview-close-devtools', a),
+  previewCdpStart: (a) => ipcRenderer.invoke('preview-cdp-start', a),           // -> {ok, attached, reason?}
+  previewCollectChanges: (a) => ipcRenderer.invoke('preview-collect-changes', a), // -> {ok, attached, css:[{sourceURL,before,after}]}
+  previewCdpStop: (a) => ipcRenderer.invoke('preview-cdp-stop', a),
 
   // GitHub accounts (gh multi-account)
   ghAccounts: () => ipcRenderer.invoke('gh-accounts'),

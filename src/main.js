@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, clipboard, Menu, dialog, powerSaveBlocker, Tray, nativeImage, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, clipboard, Menu, dialog, powerSaveBlocker, Tray, nativeImage, shell, webContents } = require('electron');
 const path = require('path');
 const os = require('os');
 const fsmod = require('fs');
@@ -410,7 +410,7 @@ function createGridWindow(bounds) {
   const opts = {
     width: 1500, height: 950, backgroundColor: '#141518', show: false,
     titleBarStyle: 'hiddenInset', title: 'Claude Fleet', acceptFirstMouse: true,   // first click from another app hits the pane/button you clicked, not just window focus
-    webPreferences: { preload: path.join(__dirname, 'preload.js'), backgroundThrottling: false },   // keep rAF/timers running while backgrounded so panes spawn even when you're in another app
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), backgroundThrottling: false, webviewTag: true },   // keep rAF/timers running while backgrounded so panes spawn even when you're in another app; webviewTag enables the Live-Preview <webview>
   };
   if (bounds) Object.assign(opts, bounds);
   const win = new BrowserWindow(opts);
@@ -1157,6 +1157,88 @@ ipcMain.handle('preview-stop', (_e, { sid, product } = {}) => {
   return { ok: true };
 });
 ipcMain.handle('preview-status', (_e, { sid, product } = {}) => devserver.statusOf(previewKey(sid, product)));
+
+// ---- Live Preview: real Chrome DevTools + CDP CSS-rule capture (Visual Editor P2) -----------
+// The preview <webview>'s guest webContents (id passed from the renderer via getWebContentsId())
+// is the target for BOTH the docked native DevTools and a best-effort CDP session. NOTE: Electron
+// will not let contents.debugger.attach() coexist with the native DevTools front-end on the SAME
+// webContents (DevTools owns the debugger) — so when DevTools is docked, CDP attach fails and we
+// degrade to the preload's MutationObserver + CSSOM diff (which capture with DevTools open). The
+// CDP path still yields source-file-mapped CSS-rule diffs whenever it CAN attach (DevTools closed).
+function guestWC(id) { try { const wc = webContents.fromId(Number(id)); return (wc && !wc.isDestroyed()) ? wc : null; } catch (_) { return null; } }
+
+// open the native DevTools DOCKED to the right of the preview (page left, DevTools right).
+ipcMain.handle('preview-open-devtools', (_e, { webContentsId, mode } = {}) => {
+  const wc = guestWC(webContentsId);
+  if (!wc) return { ok: false, error: 'preview webContents not found' };
+  try { wc.openDevTools({ mode: mode || 'right' }); return { ok: true }; }
+  catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+});
+ipcMain.handle('preview-close-devtools', (_e, { webContentsId } = {}) => {
+  const wc = guestWC(webContentsId);
+  if (wc) { try { wc.closeDevTools(); } catch (_) {} }
+  return { ok: true };
+});
+
+// CDP CSS capture: id -> { wc, onMsg, sheets:Map<styleSheetId,{sourceURL, baseline}>, dirty:Set }
+const cdpSessions = new Map();
+async function cdpFetchSheetText(wc, styleSheetId) {
+  try { const r = await wc.debugger.sendCommand('CSS.getStyleSheetText', { styleSheetId }); return (r && r.text) || ''; }
+  catch (_) { return ''; }
+}
+ipcMain.handle('preview-cdp-start', async (_e, { webContentsId } = {}) => {
+  const wc = guestWC(webContentsId);
+  if (!wc) return { ok: false, attached: false, reason: 'preview webContents not found' };
+  if (cdpSessions.has(wc.id)) return { ok: true, attached: true, reason: 'already attached' };
+  try { wc.debugger.attach('1.3'); }
+  catch (e) { return { ok: true, attached: false, reason: (e && e.message) || String(e) }; }   // DevTools likely holds the debugger — degrade to preload capture
+  const sess = { wc, sheets: new Map(), dirty: new Set(), onMsg: null };
+  sess.onMsg = (_ev, method, params) => {
+    try {
+      if (method === 'CSS.styleSheetAdded' && params && params.header) {
+        const h = params.header; sess.sheets.set(h.styleSheetId, { sourceURL: h.sourceURL || '', baseline: null });
+        cdpFetchSheetText(wc, h.styleSheetId).then((t) => { const rec = sess.sheets.get(h.styleSheetId); if (rec && rec.baseline == null) rec.baseline = t; });
+      } else if (method === 'CSS.styleSheetChanged' && params && params.styleSheetId) {
+        sess.dirty.add(params.styleSheetId);
+      } else if (method === 'CSS.styleSheetRemoved' && params && params.styleSheetId) {
+        sess.sheets.delete(params.styleSheetId); sess.dirty.delete(params.styleSheetId);
+      }
+    } catch (_) { /* never throw out of a debugger message */ }
+  };
+  wc.debugger.on('message', sess.onMsg);
+  wc.debugger.on('detach', () => { cdpSessions.delete(wc.id); });
+  wc.once('destroyed', () => { try { cdpStop(wc.id); } catch (_) {} });
+  try { await wc.debugger.sendCommand('DOM.enable'); await wc.debugger.sendCommand('CSS.enable'); }
+  catch (e) { try { wc.debugger.detach(); } catch (_) {} cdpSessions.delete(wc.id); return { ok: true, attached: false, reason: (e && e.message) || String(e) }; }
+  cdpSessions.set(wc.id, sess);
+  return { ok: true, attached: true };
+});
+// return the CSS-rule changeset gathered since start (source-file-mapped diffs), then re-baseline.
+ipcMain.handle('preview-collect-changes', async (_e, { webContentsId } = {}) => {
+  const wc = guestWC(webContentsId);
+  const sess = wc && cdpSessions.get(wc.id);
+  if (!sess) return { ok: true, attached: false, css: [] };
+  const css = [];
+  for (const id of Array.from(sess.dirty)) {
+    const rec = sess.sheets.get(id); if (!rec) { sess.dirty.delete(id); continue; }
+    const after = await cdpFetchSheetText(wc, id);
+    if (after !== rec.baseline) css.push({ sourceURL: rec.sourceURL, before: rec.baseline || '', after });
+    rec.baseline = after;   // re-baseline so a second Save reports only NEW rule edits
+  }
+  sess.dirty.clear();
+  return { ok: true, attached: true, css };
+});
+function cdpStop(id) {
+  const sess = cdpSessions.get(id); if (!sess) return;
+  cdpSessions.delete(id);
+  try { sess.wc.debugger.off('message', sess.onMsg); } catch (_) {}
+  try { if (sess.wc.debugger.isAttached()) sess.wc.debugger.detach(); } catch (_) {}
+}
+ipcMain.handle('preview-cdp-stop', (_e, { webContentsId } = {}) => {
+  const wc = guestWC(webContentsId);
+  if (wc) cdpStop(wc.id);
+  return { ok: true };
+});
 
 ipcMain.handle('pick-folder', async () => {
   const win = configWin || focusedGridWin() || anyGridWin();
