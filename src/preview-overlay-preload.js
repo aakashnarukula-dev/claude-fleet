@@ -38,7 +38,10 @@
  * never triggers alert/confirm/prompt, never throws into the page.
  */
 
-const { ipcRenderer } = require('electron');
+// require('electron') is unavailable under plain Node (unit tests) — guard it so the
+// LOCATE/capture logic can be required + exercised without Electron.
+var ipcRenderer = null;
+try { ipcRenderer = require('electron').ipcRenderer; } catch (_) { ipcRenderer = null; }
 
 /* ================================================================= *
  *  Inlined Phase-1 LOCATE (mirror of src/preview/locate.js). Isolated
@@ -297,14 +300,18 @@ var L = (function () {
 /* ================================================================= *
  *  Capture: MutationObserver (DOM edits) + CSSOM diff (rule edits).
  * ================================================================= */
-(function () {
+var CAPTURE = (function () {
   var CAP = false;                 // capturing? (driven by host 'cfleet:capture')
   var mo = null;                   // the MutationObserver
-  var pending = new Map();         // key -> record (coalesced non-structural edits)
+  var pending = new Map();         // key -> record (coalesced edits: text/style/attr AND structural)
   var flushT = null;
-  var cssBaseline = null;          // [{ href, map:{ 'idx::selector': declText } }]
+  var cssBaseline = null;          // [{ href, map:{ 'ctx>selector #occ': declText } }]
+  var sink = null;                 // test hook: when set, records go here instead of the host
+  var nodeIds = new WeakMap(), nodeSeq = 0;
+  function nodeId(n) { var id = nodeIds.get(n); if (!id) { id = ++nodeSeq; nodeIds.set(n, id); } return id; }
 
   function ready(fn) {
+    if (typeof document === 'undefined') return;
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true });
     else fn();
   }
@@ -329,17 +336,39 @@ var L = (function () {
   }
   function norm(s) { return (s == null ? '' : String(s)).replace(/\s+/g, ' ').trim(); }
 
-  // nodes whose mutations we never care about (framework/head/self plumbing)
+  // Overlay CHROME markers: nodes the inspect/edit overlay (this file or a sibling) injects
+  // into the page — highlight box, source chip, element picker — plus any inline-style/position
+  // toggle it sets on a page node to highlight it. Those must NEVER be captured as user edits.
+  // NOTE: data-cfleet-oid / data-cfleet-loc are BUILD-TIME source tags on REAL page nodes — they
+  // are NOT chrome and must stay observable, so they are explicitly exempted below.
+  var CHROME_SEL = '[data-cfleet-overlay],[data-cfleet-ui],[data-cfleet-chrome],[data-cfleet-highlight],[data-cfleet-picker],.cfleet-overlay,.cfleet-chrome';
+  function isChromeAttr(name) {
+    return typeof name === 'string' && name.indexOf('data-cfleet') === 0 &&
+      name !== 'data-cfleet-oid' && name !== 'data-cfleet-loc';
+  }
+  function isChrome(el) {
+    if (!el) return false;
+    try {
+      if (el.matches && el.matches(CHROME_SEL)) return true;
+      if (el.closest && el.closest(CHROME_SEL)) return true;
+    } catch (_) {}
+    return false;
+  }
+  // nodes whose mutations we never care about (framework/head/self plumbing + overlay chrome)
   function ignore(el) {
     if (!el || el.nodeType !== 1) return true;
     var tag = (el.tagName || '').toLowerCase();
     if (tag === 'script' || tag === 'link' || tag === 'meta' || tag === 'head' || tag === 'html' || tag === 'style' || tag === 'title') return true;
     try { if (el.closest && el.closest('head')) return true; } catch (_) {}
+    if (isChrome(el)) return true;
     return false;
   }
 
-  // -------- outbound --------
-  function send(rec) { try { ipcRenderer.sendToHost('cfleet:change', rec); } catch (_) {} }
+  // -------- outbound + buffer --------
+  function send(rec) {
+    if (sink) { try { sink(rec); } catch (_) {} return; }
+    try { if (ipcRenderer) ipcRenderer.sendToHost('cfleet:change', rec); } catch (_) {}
+  }
   function scheduleFlush() { if (flushT) return; flushT = setTimeout(flush, 300); }
   function flush() {
     if (flushT) { clearTimeout(flushT); flushT = null; }
@@ -347,29 +376,52 @@ var L = (function () {
     var batch = pending; pending = new Map();
     batch.forEach(send);
   }
-  function keyFor(target, kind, prop) {
-    var t = target || {};
-    return (t.oid || t.selector || t.domPath || '?') + '|' + kind + '|' + (prop || '');
+  // coalesce key: text edits key by host + node-index (two edited text nodes in one host stay
+  // SEPARATE); structural edits key by a stable per-node id (repeat moves of one node collapse).
+  function keyFor(rec) {
+    var t = rec.target || {};
+    var base = (t.oid || t.selector || t.domPath || '?') + '|' + rec.kind + '|' + (rec.prop || '');
+    if (rec.structKey != null) base += '|n' + rec.structKey;
+    if (rec.nodeIndex != null) base += '|i' + rec.nodeIndex;
+    return base;
   }
-  // coalesce a non-structural edit: keep the FIRST-captured `before`, update `after`.
+  // keep the FIRST-captured `before`, update `after` (+ token fields) — one CONSISTENT
+  // granularity per key. Structural repeats collapse to one net record.
   function coalesce(rec) {
-    var k = keyFor(rec.target, rec.kind, rec.prop);
-    var ex = pending.get(k);
-    if (ex) { ex.after = rec.after; ex.rawValue = rec.rawValue; ex.tokenName = rec.tokenName; ex.tokenResolved = rec.tokenResolved; }
-    else pending.set(k, rec);
+    var k = keyFor(rec), ex = pending.get(k);
+    if (ex) {
+      ex.after = rec.after;
+      if ('rawValue' in rec) ex.rawValue = rec.rawValue;
+      if ('tokenName' in rec) ex.tokenName = rec.tokenName;
+      if ('tokenResolved' in rec) ex.tokenResolved = rec.tokenResolved;
+    } else pending.set(k, rec);
     scheduleFlush();
   }
 
   // -------- DOM mutation -> records --------
-  function textRecord(host, oldValue) {
-    if (ignore(host)) return null;
-    var before = norm(oldValue), after = norm(host.textContent);
+  function nodeIndexInHost(node, host) {
+    if (!host || !host.childNodes) return -1;
+    var kids = host.childNodes;
+    for (var i = 0; i < kids.length; i++) if (kids[i] === node) return i;
+    return -1;
+  }
+  // A single edited TEXT NODE. before/after are BOTH that node's value (comparable, correctly
+  // anchored), plus host oid + the node's index among the host's child nodes so the agent can
+  // target the exact text run inside a mixed-content element (<p>Read <a>terms</a> now</p>).
+  function textRecord(textNode, oldValue) {
+    var host = textNode && textNode.parentElement;
+    if (!host || ignore(host)) return null;
+    var before = norm(oldValue);
+    var after = norm(textNode.data != null ? textNode.data : textNode.textContent);
     if (before === after) return null;
-    var info = L.locate(host);
-    return { kind: 'text', prop: 'text', target: info, name: nameOf(host, info), before: before, after: after, confidence: 'high' };
+    var info = L.locate(host), idx = nodeIndexInHost(textNode, host);
+    if (info) info.nodeIndex = idx;
+    return { kind: 'text', prop: 'text', target: info, name: nameOf(host, info),
+      nodeIndex: idx, before: before, after: after, confidence: 'high' };
   }
   function attrRecord(el, attr, oldValue) {
     if (ignore(el)) return null;
+    if (isChromeAttr(attr)) return null;                 // overlay highlight/position toggle — not a user edit
     var after = el.getAttribute(attr);
     if ((oldValue || '') === (after || '')) return null;
     var isStyleish = (attr === 'style' || attr === 'class');
@@ -385,28 +437,41 @@ var L = (function () {
     }
     return rec;
   }
+  // structural edits route through the SAME buffer as text/style (ordering preserved; repeat
+  // moves of one node collapse to one net record via a stable structKey).
   function structuralRec(kind, node, desc) {
+    if (ignore(node)) return;
     var info = L.locate(node);
-    send({ kind: kind, prop: kind, target: info, name: nameOf(node, info), before: '', after: desc, confidence: 'low', structural: true });
+    coalesce({ kind: kind, prop: kind, target: info, name: nameOf(node, info),
+      before: '', after: desc, confidence: 'low', structural: true, structKey: nodeId(node) });
   }
 
   function onMutations(list) {
     if (!CAP) return;
-    var removed = [], added = [];
+    var removed = [], added = [], textRemoved = [], textAdded = [];
     for (var i = 0; i < list.length; i++) {
       var m = list[i];
       if (m.type === 'characterData') {
-        var host = m.target && m.target.parentElement;
-        if (host) { var r = textRecord(host, m.oldValue); if (r) coalesce(r); }
+        // m.target IS the edited text node — record at TEXT-NODE granularity.
+        var r = textRecord(m.target, m.oldValue); if (r) coalesce(r);
       } else if (m.type === 'attributes') {
-        var r2 = attrRecord(m.target, m.attributeName, m.oldValue);
-        if (r2) coalesce(r2);
+        var r2 = attrRecord(m.target, m.attributeName, m.oldValue); if (r2) coalesce(r2);
       } else if (m.type === 'childList') {
-        for (var a = 0; a < m.removedNodes.length; a++) { var rn = m.removedNodes[a]; if (rn.nodeType === 1 && !ignore(rn)) removed.push(rn); }
-        for (var b = 0; b < m.addedNodes.length; b++) { var an = m.addedNodes[b]; if (an.nodeType === 1 && !ignore(an)) added.push(an); }
+        var parent = m.target;   // childList target is the parent node (captured now: removed nodes detach)
+        for (var a = 0; a < m.removedNodes.length; a++) {
+          var rn = m.removedNodes[a];
+          if (rn.nodeType === 1) { if (!ignore(rn)) removed.push(rn); }
+          else if (rn.nodeType === 3) textRemoved.push({ parent: parent, text: rn.data != null ? rn.data : (rn.textContent || '') });
+        }
+        for (var b = 0; b < m.addedNodes.length; b++) {
+          var an = m.addedNodes[b];
+          if (an.nodeType === 1) { if (!ignore(an)) added.push(an); }
+          else if (an.nodeType === 3) textAdded.push({ parent: parent, text: an.data != null ? an.data : (an.textContent || '') });
+        }
       }
     }
     if (removed.length || added.length) processStructural(removed, added);
+    if (textRemoved.length || textAdded.length) processTextNodes(textRemoved, textAdded);
   }
 
   // Correlate childList add/remove within ONE observer batch (a moved node appears in both):
@@ -424,45 +489,98 @@ var L = (function () {
     });
   }
 
+  // Added/removed TEXT nodes (DevTools "Edit as HTML", text insertions). A host whose text child
+  // was swapped becomes a `text` edit (removed text -> added text, comparable); a pure insert/
+  // removal is still recorded (before/after reflect it) rather than silently dropped.
+  function processTextNodes(textRemoved, textAdded) {
+    var byParent = new Map();
+    function slot(parent) { var s = byParent.get(parent); if (!s) { s = { removed: [], added: [] }; byParent.set(parent, s); } return s; }
+    textRemoved.forEach(function (e) { slot(e.parent).removed.push(e.text); });
+    textAdded.forEach(function (e) { slot(e.parent).added.push(e.text); });
+    byParent.forEach(function (s, parent) {
+      if (!parent || parent.nodeType !== 1 || ignore(parent)) return;
+      var before = norm(s.removed.join('')), after = norm(s.added.join(''));
+      if (before === after) return;
+      var info = L.locate(parent);
+      if (info) info.nodeIndex = 'text';
+      coalesce({ kind: 'text', prop: 'text', target: info, name: nameOf(parent, info),
+        nodeIndex: 'text', before: before, after: after, confidence: 'high' });
+    });
+  }
+
   // -------- CSSOM stylesheet-rule diff (Styles-tab edits to matched rules) --------
   function shortHref(href) {
     if (!href) return '(inline)';
-    try { var u = new URL(href, document.baseURI); return u.pathname + (u.search || ''); } catch (_) { return href; }
+    try { var u = new URL(href, (typeof document !== 'undefined' ? document.baseURI : href)); return u.pathname + (u.search || ''); } catch (_) { return href; }
   }
-  function snapshotCSS() {
-    var out = [], sheets = document.styleSheets;
+  // grouping-context label for @media / @supports / @layer (and other grouping rules) so nested
+  // rules are attributed; null for a plain style rule (or a non-grouping rule to descend past).
+  function groupingLabel(rule) {
+    var nested;
+    try { nested = rule.cssRules; } catch (_) { return null; }
+    if (!nested || nested.length === undefined) return null;
+    if (rule.type === 1) return null;
+    if (rule.type === 4) return '@media ' + (rule.conditionText || (rule.media && rule.media.mediaText) || '');
+    if (rule.type === 12) return '@supports ' + (rule.conditionText || '');
+    if (typeof rule.name === 'string' && rule.name) return '@layer ' + rule.name;   // CSSLayerBlockRule
+    return '@group ' + (rule.conditionText || (rule.cssText ? String(rule.cssText).split('{')[0].trim() : ''));
+  }
+  // RECURSE into grouping rules; key each style rule by (grouping context + selectorText +
+  // occurrence), NOT its array index — so inserting/deleting a sibling rule shifts NO key and a
+  // single inserted rule yields ONE add, never mass churn.
+  function walkRules(rules, ctx, occ, map) {
+    if (!rules) return;
+    for (var j = 0; j < rules.length; j++) {
+      var rule = rules[j];
+      if (!rule) continue;
+      if (rule.type === 1 && rule.selectorText) {
+        var sel = (ctx ? ctx + '>' : '') + rule.selectorText;
+        occ[sel] = (occ[sel] || 0) + 1;
+        map[sel + ' #' + occ[sel]] = rule.style ? rule.style.cssText : '';
+      } else {
+        var label = groupingLabel(rule);
+        if (label != null) {
+          var nested; try { nested = rule.cssRules; } catch (_) { nested = null; }
+          walkRules(nested, (ctx ? ctx + ' ' : '') + label, occ, map);
+        }
+      }
+    }
+  }
+  function snapshotCSS(sheets) {
+    if (!sheets) sheets = (typeof document !== 'undefined' ? document.styleSheets : []);
+    var out = [];
     for (var i = 0; i < sheets.length; i++) {
       var sh = sheets[i], rules;
       try { rules = sh.cssRules; } catch (_) { continue; }   // cross-origin — skip
       if (!rules) continue;
-      var map = {};
-      for (var j = 0; j < rules.length; j++) {
-        var rule = rules[j];
-        if (rule && rule.type === 1 && rule.selectorText) map[j + '::' + rule.selectorText] = rule.style ? rule.style.cssText : '';
-      }
+      var map = {}, occ = {};
+      walkRules(rules, '', occ, map);
       out.push({ href: sh.href || ('inline#' + i), map: map });
     }
     return out;
+  }
+  function diffCSS(baseSnap, nowSnap, emit) {
+    nowSnap.forEach(function (cur) {
+      var base = null;
+      for (var k = 0; k < baseSnap.length; k++) { if (baseSnap[k].href === cur.href) { base = baseSnap[k]; break; } }
+      var baseMap = (base && base.map) || {};
+      Object.keys(cur.map).forEach(function (key) {
+        var after = cur.map[key], before = baseMap[key];
+        if (before === undefined) emit(cur.href, key, '', after, 'add');
+        else if (before !== after) emit(cur.href, key, before, after, 'style');
+      });
+      Object.keys(baseMap).forEach(function (key) { if (!(key in cur.map)) emit(cur.href, key, baseMap[key], '', 'delete'); });
+    });
   }
   function baselineCSS() { cssBaseline = snapshotCSS(); }
   function collectCSS() {
     var now = snapshotCSS();
     if (!cssBaseline) { cssBaseline = now; return; }
-    now.forEach(function (cur) {
-      var base = null;
-      for (var k = 0; k < cssBaseline.length; k++) { if (cssBaseline[k].href === cur.href) { base = cssBaseline[k]; break; } }
-      var baseMap = (base && base.map) || {};
-      Object.keys(cur.map).forEach(function (key) {
-        var after = cur.map[key], before = baseMap[key];
-        if (before === undefined) emitCss(cur.href, key, '', after, 'add');
-        else if (before !== after) emitCss(cur.href, key, before, after, 'style');
-      });
-      Object.keys(baseMap).forEach(function (key) { if (!(key in cur.map)) emitCss(cur.href, key, baseMap[key], '', 'delete'); });
-    });
+    diffCSS(cssBaseline, now, emitCss);
     cssBaseline = now;   // re-baseline so a second Save reports only NEW rule edits
   }
   function emitCss(href, key, before, after, sub) {
-    var selector = key.split('::').slice(1).join('::');
+    var selector = key.split(' #')[0];   // strip the occurrence counter; keep grouping context
     var target = { selector: selector, source: { file: shortHref(href), line: 0, col: 0, component: null }, cssRule: true };
     var kind = sub === 'style' ? 'style' : sub;   // 'style' | 'add' | 'delete'
     send({
@@ -475,6 +593,7 @@ var L = (function () {
   function setCapture(on) {
     CAP = !!on;
     if (CAP) {
+      if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') return;
       if (!mo) mo = new MutationObserver(onMutations);
       try {
         mo.observe(document.documentElement || document, {
@@ -488,9 +607,25 @@ var L = (function () {
       flush();
     }
   }
-  ipcRenderer.on('cfleet:capture', function (_e, m) { try { setCapture(m && m.on); } catch (_) {} });
-  ipcRenderer.on('cfleet:collect', function () { try { flush(); collectCSS(); } catch (_) {} });
-  ipcRenderer.on('cfleet:reset', function () { try { pending.clear(); baselineCSS(); } catch (_) {} });
+  if (ipcRenderer) {
+    ipcRenderer.on('cfleet:capture', function (_e, m) { try { setCapture(m && m.on); } catch (_) {} });
+    ipcRenderer.on('cfleet:collect', function () { try { flush(); collectCSS(); } catch (_) {} });
+    ipcRenderer.on('cfleet:reset', function () { try { pending.clear(); baselineCSS(); } catch (_) {} });
+  }
+  ready(function () { try { if (ipcRenderer) ipcRenderer.sendToHost('cfleet:ready', {}); } catch (_) {} });
 
-  ready(function () { try { ipcRenderer.sendToHost('cfleet:ready', {}); } catch (_) {} });
+  // test hooks (used only by the dependency-free unit test; harmless/inert in the preload)
+  return {
+    onMutations: onMutations, textRecord: textRecord, attrRecord: attrRecord,
+    structuralRec: structuralRec, processStructural: processStructural, processTextNodes: processTextNodes,
+    snapshotCSS: snapshotCSS, diffCSS: diffCSS, ignore: ignore, isChrome: isChrome,
+    setCapture: setCapture, flush: flush,
+    __setSink: function (fn) { sink = fn; },
+    __setCap: function (v) { CAP = !!v; },
+    __pending: function () { return pending; },
+  };
 })();
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { L: L, capture: CAPTURE };
+}
