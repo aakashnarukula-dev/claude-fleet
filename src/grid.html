@@ -1056,6 +1056,7 @@
       wrap, main, tool, canvas, side, webview: null, wcId: null, devtoolsWebview: null, dtWcId: null,
       overlayReady: false, product: null, repo: null, url: null, route: '/', running: false,
       editing: false, viewport: 'desktop', cdpAttached: false, commitBase: null, changes: [],
+      submitting: false, lastBriefId: null, previewTheme: null,
       els: {
         host: tool.querySelector('.pv-host'), url: tool.querySelector('.pv-url'),
         editBtn: tool.querySelector('[data-role=edit]'),
@@ -1085,7 +1086,7 @@
     // reuse a running dev server if one exists; otherwise show a Start affordance (don't auto-spawn npm).
     let st = null;
     try { st = await window.fleet.previewStatus({ sid, product }); } catch (_) {}
-    if (st && st.running && st.url) { pv.url = st.url; pv.running = true; if (st.repo) pv.repo = st.repo; mountWebview(sid); }
+    if (st && st.running && st.url) { pv.url = st.url; pv.running = true; if (st.repo) pv.repo = st.repo; if (st.commitBase) pv.commitBase = st.commitBase; mountWebview(sid); }
     else showStart(sid, '');
   }
 
@@ -1106,6 +1107,7 @@
     catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
     if (!r || r.ok === false) { showStart(sid, (r && r.error) || 'could not start preview'); return; }
     pv.url = r.url; pv.running = true; if (r.repo) pv.repo = r.repo;   // repo stamps the visual-edit brief (P3b routing key)
+    if (r.commitBase) pv.commitBase = r.commitBase;   // previewed repo HEAD sha → brief drift re-anchor
     mountWebview(sid);
   }
 
@@ -1149,14 +1151,14 @@
   function sendOverlay(pv, channel, payload) { if (pv.webview && pv.overlayReady) { try { pv.webview.send(channel, payload); } catch (_) {} } }
 
   function setPreviewViewport(sid, vp) {
-    const pv = sessions[sid].preview; if (!pv) return; pv.viewport = vp;
+    const s = sessions[sid], pv = s && s.preview; if (!pv) return; pv.viewport = vp;   // guard tab-close race
     pv.tool.querySelectorAll('.pv-seg button').forEach((b) => b.classList.toggle('on', b.dataset.vp === vp));
     applyViewport(pv);
   }
   function applyViewport(pv) { if (pv.canvas) pv.canvas.classList.toggle('mobile', pv.viewport === 'mobile'); }
 
   async function setPreviewEditing(sid, on) {
-    const pv = sessions[sid].preview; if (!pv) return;
+    const s = sessions[sid], pv = s && s.preview; if (!pv) return;   // guard tab-close race
     if (on && !pv.running) { await startPreview(sid); if (!pv.running) return; }
     pv.editing = !!on;
     pv.els.editBtn.textContent = on ? '✎ Edit: ON' : '✎ Edit: OFF';
@@ -1271,13 +1273,17 @@
 
   // ---- Save -> assemble the visual-edit brief -> submit ----
   async function savePreview(sid) {
-    const s = sessions[sid], pv = s.preview; if (!pv) return;
+    const s = sessions[sid], pv = s && s.preview; if (!pv) return;
+    if (pv.submitting || !pv.changes.length) return;   // idempotency: no double-dispatch of the in-flight/empty buffer
+    pv.submitting = true;
     pv.els.save.disabled = true; pv.els.sent.style.display = 'none';
     sendOverlay(pv, 'cfleet:collect', {});   // flush pending DOM records + diff the CSSOM now
     let cdp = null;
     if (pv.wcId != null) { try { cdp = await window.fleet.previewCollectChanges({ webContentsId: pv.wcId }); } catch (_) {} }
     if (cdp && cdp.ok && Array.isArray(cdp.css)) mergeCdpCss(pv, cdp.css);
     await new Promise((res) => setTimeout(res, 350));   // let the overlay's async cfleet:change messages land
+    // read the PREVIEWED page's theme (not the Fleet host) for the brief viewport
+    try { if (pv.webview && typeof pv.webview.executeJavaScript === 'function') pv.previewTheme = await pv.webview.executeJavaScript('(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light"'); } catch (_) {}
     const brief = buildBrief(sid);
     renderChanges(sid);
     let res = null;
@@ -1287,16 +1293,28 @@
       console.log('[cfleet] submitVisualEdits not wired yet (Phase 3). Brief:', brief);   // eslint-disable-line no-console
       res = { ok: false, pending: true };
     }
+    if (res && res.ok) {
+      pv.lastBriefId = brief.briefId;
+      pv.changes = [];                        // dispatched — reset so a second Save can't re-submit the same edits
+      sendOverlay(pv, 'cfleet:reset', {});    // reset the overlay's own buffer + CSSOM baseline
+      renderChanges(sid);                     // empty list + Save disabled; only NEW edits re-enable it
+    }
+    pv.submitting = false;
     showSent(pv, brief, res);
   }
   function mergeCdpCss(pv, cssList) {
     cssList.forEach((c) => {
       if (!c || c.before === c.after) return;
-      if (pv.changes.some((x) => x.cssRule && x.sourceURL && x.sourceURL === c.sourceURL)) return;   // CSSOM diff already covers this sheet per-rule
-      const r = { kind: 'style', prop: 'css-rule', cssRule: true, sourceURL: c.sourceURL, confidence: 'high',
-        name: c.sourceURL || 'stylesheet', before: c.before, after: c.after,
-        target: { selector: null, source: { file: c.sourceURL || null, line: 0, col: 0, component: null }, cssRule: true } };
-      r.__k = changeKey(r); pv.changes.push(r);
+      const sel = c.selector || null;
+      // dedup at RULE/SELECTOR granularity — sourceURL + selector (or rule content when the CDP entry
+      // has no selector). NOT whole-sheet: two edited rules in one sheet (and inline <style> sheets that
+      // all share an empty sourceURL) must each survive.
+      const k = 'css|' + (c.sourceURL || '') + '|' + (sel || (c.after != null ? String(c.after).slice(0, 200) : ''));
+      if (pv.changes.some((x) => x.__k === k)) return;   // this exact rule already captured
+      const r = { kind: 'style', prop: 'css-rule', cssRule: true, sourceURL: c.sourceURL, selector: sel, confidence: 'high',
+        name: sel || c.sourceURL || 'stylesheet', before: c.before, after: c.after,
+        target: { selector: sel, source: { file: c.sourceURL || null, line: 0, col: 0, component: null }, cssRule: true } };
+      r.__k = k; pv.changes.push(r);
     });
   }
   function buildBrief(sid) {
@@ -1305,16 +1323,24 @@
     try {
       const wv = pv.webview;
       vp = { w: (wv && wv.clientWidth) || 0, h: (wv && wv.clientHeight) || 0, dpr: window.devicePixelRatio || 1,
-        theme: (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light' };
+        theme: pv.previewTheme   // the PREVIEWED page's theme (captured in savePreview); host fallback only
+          || ((window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light') };
     } catch (_) {}
     const edits = pv.changes.map((r, i) => {
       const t = r.target || {}, structural = isStructural(r);
+      const isClass = r.prop === 'class' || r.prop === 'className';
       return {
         editId: 'e' + (i + 1),
         kind: r.kind,
         target: { oid: t.oid || null, source: t.source || null, domPath: t.domPath || null, selector: t.selector || null,
           role: t.role || null, accName: t.accName || null, cssRule: !!r.cssRule },
-        before: r.cssRule ? { css: r.before } : { text: r.before != null ? r.before : null, value: r.before != null ? r.before : null },
+        // schema fields text/className/computed; keep css/value as extra context. Populate what's sourced; no fabrication.
+        before: r.cssRule
+          ? { text: null, className: null, computed: null, css: r.before }
+          : { text: (r.kind === 'text' ? (r.before != null ? r.before : null) : (t.text != null ? t.text : null)),
+              className: isClass ? (r.before != null ? r.before : null) : null,
+              computed: null,
+              value: r.before != null ? r.before : null },
         after: { prop: r.prop || r.kind, value: r.after, rawValue: r.rawValue || null,
           tokenResolved: !!r.tokenResolved, tokenName: r.tokenName || null },
         confidence: r.confidence || (structural ? 'low' : 'high'),
@@ -1333,7 +1359,7 @@
     if (res && res.ok) el.innerHTML = '✓ Sent ' + n + ' edit' + (n !== 1 ? 's' : '') + ' to the agent' + (res.slug ? ' (' + escapeHtml(res.slug) + ')' : '') + '. ' + (low ? low + ' structural need confirming in the pane.' : '');
     else if (res && res.pending) el.innerHTML = '⏳ Brief assembled (' + n + ' edit' + (n !== 1 ? 's' : '') + '); agent hand-off lands in Phase 3. Logged to console.';
     else el.innerHTML = '<span style="color:#e86f6f">Send failed: ' + escapeHtml((res && res.error) || 'unknown') + '</span>';
-    pv.els.save.disabled = brief.edits.length === 0;
+    pv.els.save.disabled = !pv.changes || pv.changes.length === 0;   // cleared on success ⇒ stays disabled until NEW edits
   }
 
   // detach the webview: stop capture, detach CDP, close DevTools, drop the element (dev server stays up).
