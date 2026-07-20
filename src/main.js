@@ -5,6 +5,7 @@ const fsmod = require('fs');
 const { execFile, execFileSync } = require('child_process');
 const https = require('https');
 const { ensureCaveman } = require('./caveman-install');
+const devserver = require('./devserver');   // Live Preview dev-server manager (Visual Editor P1a)
 
 // Keep the app LIVE in the background: macOS otherwise throttles the renderer (pauses requestAnimationFrame,
 // clamps timers) when the window isn't focused — which stalls pane/PTY spawning until you return. These switches
@@ -1098,6 +1099,65 @@ function addProduct(sid, name) {
   });
 }
 ipcMain.handle('add-product', (_e, { sid, name }) => addProduct(sid, name));
+
+// ---- Live Preview: dev-server manager IPC (Visual Editor P1a) -----------------------------------
+// Resolve the previewable worktree dir + repo for a session/product. Products: the product's primary
+// repo integrated checkout (`_product-<P>`); multi (non-products): the primary repo's `_main`; single
+// repo: `_main`. Falls back to the fleet dir root, then the repo itself, so a preview still has a cwd
+// even before an integrated checkout exists. Returns { cwd, repo } or null when the session is unknown.
+function resolvePreviewTarget(sid, s, product, repoArg) {
+  if (!s) return null;
+  const multi = !!(s.coordDir);
+  // primary repo: an explicit valid repoArg wins; else the first selected repo (multi) or s.repo.
+  let repo = null;
+  if (repoArg && Array.isArray(s.repos) && s.repos.some((r) => r === repoArg || path.basename(r) === repoArg)) {
+    repo = s.repos.find((r) => r === repoArg || path.basename(r) === repoArg);
+  } else {
+    repo = (multi && Array.isArray(s.repos) && s.repos[0]) || s.repo;
+  }
+  if (!repo) return null;
+  const fdir = fleetDir(repo, sid);
+  const candidates = [];
+  if (s.products && product) candidates.push(path.join(fdir, `_product-${product}`));
+  candidates.push(path.join(fdir, '_main'));
+  candidates.push(fdir);
+  candidates.push(repo);
+  const cwd = candidates.find((d) => { try { return fsmod.existsSync(d); } catch (_) { return false; } }) || repo;
+  return { cwd, repo };
+}
+
+// key namespacing: one dev server per session+product. A non-products session uses the bare sid.
+function previewKey(sid, product) { return product ? `${sid}:${product}` : `${sid}`; }
+
+// bundled-CLI dir + homebrew, mirroring spawnPane, so `npm`/`node` resolve under the app's thin PATH.
+function previewExtraPathDirs() {
+  return path.isAbsolute(FLEET_CLI) ? [path.dirname(FLEET_CLI)] : [];
+}
+
+ipcMain.handle('preview-start', async (_e, { sid, product, repo } = {}) => {
+  const s = sessions[sid];
+  if (!s) return { ok: false, error: 'unknown session' };
+  const tgt = resolvePreviewTarget(sid, s, product, repo);
+  if (!tgt) return { ok: false, error: 'could not resolve preview repo/worktree' };
+  try {
+    const env = Object.assign({}, process.env, {
+      CLAUDE_FLEET_SESSION: String(sid), CLAUDE_FLEET_REPO: tgt.repo,
+    });
+    const r = await devserver.startDevServer({
+      key: previewKey(sid, product), repo: tgt.repo, cwd: tgt.cwd, env,
+      extraPathDirs: previewExtraPathDirs(),
+    });
+    return { ok: true, url: r.url, port: r.port };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || String(e) };
+  }
+});
+ipcMain.handle('preview-stop', (_e, { sid, product } = {}) => {
+  try { devserver.stopDevServer(previewKey(sid, product)); } catch (_) {}
+  return { ok: true };
+});
+ipcMain.handle('preview-status', (_e, { sid, product } = {}) => devserver.statusOf(previewKey(sid, product)));
+
 ipcMain.handle('pick-folder', async () => {
   const win = configWin || focusedGridWin() || anyGridWin();
   const r = await dialog.showOpenDialog(win, { title: 'Choose project folder', properties: ['openDirectory', 'createDirectory'], buttonLabel: 'Use this project' });
@@ -1824,8 +1884,20 @@ function launchOrchestratorSession({ repoPath, title, color, autonomous, seedGoa
   runOrchestrator(sid, repoPath).then(onReady).catch(onErr);
 }
 
+// Stop every Live Preview dev server this session started (bare-sid key + one per product), so a
+// closed/torn-down session never leaves an orphaned `npm run dev`. Best-effort + idempotent.
+function stopSessionPreviews(sid) {
+  const s = sessions[sid];
+  const keys = new Set([previewKey(sid)]);
+  if (s && Array.isArray(s.tasks)) s.tasks.forEach((t) => keys.add(previewKey(sid, t)));
+  // also sweep any tracked server whose key belongs to this sid (covers products added at runtime).
+  try { for (const k of devserver._servers.keys()) { if (k === String(sid) || k.startsWith(`${sid}:`)) keys.add(k); } } catch (_) {}
+  keys.forEach((k) => { try { devserver.stopDevServer(k); } catch (_) {} });
+}
+
 function closeSession(sid) {
   const s = sessions[sid]; if (!s) return;
+  stopSessionPreviews(sid);   // tear down any Live Preview dev servers first (never orphan them)
   // a scratch (new-project, unnamed) session has no real repo to --clean — tear it down in-process, guarded so it
   // can only ever remove the .cfleet-scratch- dirs (never a live/foreign session). saveState afterward.
   if (s.newProject) { teardownScratch(sid); saveState(); return; }
@@ -1846,6 +1918,7 @@ function closeSession(sid) {
 
 function killAll() {
   saveState();   // window close / quit preserves sessions + worktrees so they can be restored next launch
+  try { devserver.stopAll(); } catch (_) {}   // stop every Live Preview dev server (no orphaned npm run dev)
   Object.values(ptys).forEach((t) => { try { t.kill(); } catch (_) {} });
   Object.values(sessions).forEach((s) => { if (s.watcher) { try { s.watcher.close(); } catch (_) {} } });
   stopOverlayFollow();

@@ -14,6 +14,11 @@ contextBridge.exposeInMainWorld('fleet', {
   addGridWorker: ({ sid, name }) => ipcRenderer.invoke('add-grid-worker', { sid, name }),
   addProduct: ({ sid, name }) => ipcRenderer.invoke('add-product', { sid, name }),   // PRODUCTS mode: add one product (task-orchestrator pane) to a running session
 
+  // Live Preview — dev-server manager (Visual Editor P1a). {sid, product, repo}
+  previewStart: (a) => ipcRenderer.invoke('preview-start', a),   // -> {ok, url, port} | {ok:false, error}
+  previewStop: (a) => ipcRenderer.invoke('preview-stop', a),     // -> {ok}
+  previewStatus: (a) => ipcRenderer.invoke('preview-status', a), // -> {running, url, port, ready}
+
   // GitHub accounts (gh multi-account)
   ghAccounts: () => ipcRenderer.invoke('gh-accounts'),
   ghConnect: () => ipcRenderer.invoke('gh-connect'),
