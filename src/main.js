@@ -473,7 +473,15 @@ function migrateSession(sid, fromWin, toWin) {
 }
 function rebuildSessionInWindow(sid, win) {
   const s = sessions[sid]; if (!s) return;
-  const meta = (s.panes || []).map((p, i) => (p ? { id: i, role: p.role, heading: p.heading } : null)).filter(Boolean);
+  const meta = (s.panes || []).map((p, i) => {
+    if (!p) return null;
+    const m = { id: i, role: p.role, heading: p.heading };
+    // Products: carry the pane's product so the destination window's grid can group task-orchestrators + workers
+    // (grid.html's rebuildGroups keys off `product`; without it a torn-off products tab loses all grouping). Master
+    // has no product. Guarded on s.products so every other mode's migration meta stays byte-for-byte identical.
+    if (s.products && p.product) m.product = p.product;
+    return m;
+  }).filter(Boolean);
   if (!meta.length) return;
   sendAddSession(sid, s.title, s.color, meta, s.mode, win, true);   // migrated: destination force-refreshes to clear reflow striping
   if (s.pstate) Object.keys(s.pstate).forEach((idx) => {       // restore each pane's current status dot
@@ -570,14 +578,23 @@ async function buildFleet({ autonomous, repo, nameWithOwner, defaultBranch, acco
       const s = sessions[sid]; if (!s) return;
       s.panes = panes; s.planReady = true;
       panes.forEach((p, i) => { if (p.slug) s.slugIdx[p.slug] = i; });
+      // The initial add-session delivered ONLY the master (id 0). Now that the engine plan has resolved with the
+      // AUTHORITATIVE per-pane slugs, deliver each task-orchestrator via the SAME add-pane channel the workers use,
+      // carrying the real engine slug as its `product`. This makes the engine slug the single grouping key (no
+      // fleetSlug hint ever reaches the renderer), so grid.html groups task-orchestrators + workers + added products
+      // on one authoritative slug — no dedup/reserved-'master' divergence.
+      panes.forEach((p, i) => {
+        if (i === 0 || !p || p.role === 'master') return;
+        sendToSid(sid, 'add-pane', { sid, pane: { id: i, role: p.role, heading: p.heading, product: p.product } });
+      });
       Object.keys(s.pending).forEach((idx) => spawnPane(sid, +idx, s.pending[idx].cols, s.pending[idx].rows));
       startWatcher(sid); saveState(); updateBadgeAndTray();
     };
     const onErr = (err) => sendToSid(sid, 'fleet-error', { sid, msg: String(err.message || err) });
-    // MASTER pane first (id 0 → renders top-left; the app keys pane id = array index), then one task-orchestrator per
-    // product. The `product` hint lets Phase-2's sidebar group panes; authoritative slugs arrive via onReady.
-    const meta = [{ id: 0, role: 'master', heading: 'Master' }]
-      .concat(taskNames.map((n, i) => ({ id: i + 1, role: 'orchestrator', heading: n, product: fleetSlug(n) })));
+    // MASTER pane ONLY in the initial meta (id 0 → renders top-left; the app keys pane id = array index). The
+    // task-orchestrators arrive via add-pane in onReady with their REAL engine slugs (dedup/reserve-'master' applied),
+    // so no un-reconciled fleetSlug hint is ever used as a grouping key. See onReady above.
+    const meta = [{ id: 0, role: 'master', heading: 'Master' }];
     sendAddSession(sid, title, color, meta, 'products', win);
     runProductsPlan(sid, coord, cl.paths, taskNames).then(onReady).catch(onErr);
     return { ok: true };
@@ -1052,6 +1069,9 @@ ipcMain.handle('add-grid-worker', (_e, { sid, name }) => addGridWorker(sid, name
 function addProduct(sid, name) {
   const s = sessions[sid];
   if (!s || !s.products || !s.coordDir) return Promise.resolve({ ok: false, error: 'not a products session' });
+  // Guard the repos join below: a restored/partial session with s.repos null/undefined would throw synchronously and
+  // reject the IPC instead of returning a clean error.
+  if (!Array.isArray(s.repos) || !s.repos.length) return Promise.resolve({ ok: false, error: 'products session has no repos' });
   if (!s.planReady) return Promise.resolve({ ok: false, error: 'session is still starting — try again in a moment' });
   const nm = String(name || '').trim();
   if (!nm) return Promise.resolve({ ok: false, error: 'name required' });
@@ -1301,7 +1321,7 @@ function setPaneState(sid, idx, state) {
   // The orchestrator just went idle → flush any re-signal nudges that were queued while it was busy (see
   // maybeNudgeOrchestrator). Without this, a worker the user re-tasked directly while the orchestrator was busy would
   // --done into a dropped fs event and never be caught.
-  if (state === 'idle' && s.panes[idx] && (s.panes[idx].role === 'orchestrator' || s.panes[idx].role === 'integrator')) flushPendingNudges(sid, idx);
+  if (state === 'idle' && s.panes[idx] && isCoordinator(s.panes[idx].role)) flushPendingNudges(sid, idx);   // master counts (products): a master going idle must flush product-level nudges routed to it
 }
 // A worker pane that's already been --merged/--done but picks up a NEW in-pane task goes back to running with NO engine
 // status marker until it next runs --done — so --next reports ALL DONE and --statuses shows nothing for it, and an
@@ -1587,8 +1607,20 @@ function maybeNudgeOrchestrator(sid, filename) {
   const s = sessions[sid]; if (!s || !s.statusDir) return;
   const slug = filename.slice(0, -5);            // strip ".done"
   if (!s.mergedSeen || !s.mergedSeen.has(slug)) return;   // never integrated → the orchestrator's live --next loop owns this
-  // Route the re-signal nudge to the coordinating pane: the Orchestrator (dispatch/multi) OR the Integrator (integrator mode).
-  const orchIdx = (s.panes || []).findIndex((p) => p && (p.role === 'orchestrator' || p.role === 'integrator'));
+  // Route the re-signal nudge to the CORRECT coordinating pane.
+  //  - dispatch/multi/integrator: the single Orchestrator/Integrator pane.
+  //  - PRODUCTS (N task-orchestrators + a master): a WORKER slug `<P>__<w>` wakes product P's TASK-ORCHESTRATOR
+  //    (role 'orchestrator', product===P); a TOP-LEVEL product slug `<P>` (no `__`) wakes the MASTER (role 'master').
+  let orchIdx;
+  if (s.products) {
+    const sep = slug.indexOf('__');
+    const P = sep >= 0 ? slug.slice(0, sep) : null;
+    orchIdx = P != null
+      ? (s.panes || []).findIndex((p) => p && p.role === 'orchestrator' && p.product === P)
+      : (s.panes || []).findIndex((p) => p && p.role === 'master');
+  } else {
+    orchIdx = (s.panes || []).findIndex((p) => p && (p.role === 'orchestrator' || p.role === 'integrator'));
+  }
   if (orchIdx < 0 || !s.panes[orchIdx] || !ptys[`${sid}:${orchIdx}`]) return;   // no live coordinating pane → nothing to nudge
   let mtime = 0;
   try { mtime = fsmod.statSync(path.join(s.statusDir, filename)).mtimeMs; } catch (_) { return; }   // marker vanished (race) → nothing to nudge
@@ -1604,7 +1636,7 @@ function maybeNudgeOrchestrator(sid, filename) {
     // worker the user re-tasked directly while the orchestrator was busy would never be caught). So QUEUE it and flush the
     // moment the orchestrator returns to idle (flushPendingNudges, hooked in setPaneState).
     if (!s.pendingNudge) s.pendingNudge = {};
-    s.pendingNudge[slug] = heading;
+    s.pendingNudge[slug] = { heading, orchIdx };   // remember the TARGET coordinator so flush routes to the right pane (products: many)
     return;
   }
   routeTextToPane(sid, orchIdx, nudgeText('worker', `"${heading}"`));
@@ -1614,12 +1646,15 @@ function maybeNudgeOrchestrator(sid, filename) {
 // queued slugs into one line.
 function flushPendingNudges(sid, orchIdx) {
   const s = sessions[sid]; if (!s || !s.pendingNudge) return;
-  const slugs = Object.keys(s.pendingNudge);
+  if (!ptys[`${sid}:${orchIdx}`]) return;        // no live coordinator pty → keep queued for the next idle transition
+  // Flush ONLY the nudges targeted at THIS coordinator. Products mode has many coordinators (N task-orchestrators + a
+  // master), so product-2's queued nudge must not fire into product-1's pane when product-1 goes idle. (Single-
+  // coordinator modes: every entry shares the one orchIdx, so this is the original flush-all behavior.)
+  const slugs = Object.keys(s.pendingNudge).filter((sl) => s.pendingNudge[sl].orchIdx === orchIdx);
   if (!slugs.length) return;
-  if (!ptys[`${sid}:${orchIdx}`]) return;        // no live orchestrator pty → keep queued for the next idle transition
-  const list = slugs.map((sl) => `"${s.pendingNudge[sl]}"`).join(', ');
+  const list = slugs.map((sl) => `"${s.pendingNudge[sl].heading}"`).join(', ');
   routeTextToPane(sid, orchIdx, nudgeText(slugs.length > 1 ? 'workers' : 'worker', list));
-  s.pendingNudge = {};
+  slugs.forEach((sl) => delete s.pendingNudge[sl]);
 }
 
 function startWatcher(sid) {
