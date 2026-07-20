@@ -24,6 +24,8 @@ contextBridge.exposeInMainWorld('fleet', {
   previewCdpStart: (a) => ipcRenderer.invoke('preview-cdp-start', a),           // -> {ok, attached, reason?}
   previewCollectChanges: (a) => ipcRenderer.invoke('preview-collect-changes', a), // -> {ok, attached, css:[{sourceURL,before,after}]}
   previewCdpStop: (a) => ipcRenderer.invoke('preview-cdp-stop', a),
+  // Live Preview — round-trip the captured brief to the owning pane (Visual Editor P3b).
+  submitVisualEdits: (sid, brief) => ipcRenderer.invoke('submit-visual-edits', { sid, brief }), // -> {ok, slug} | {ok:false, error}
 
   // GitHub accounts (gh multi-account)
   ghAccounts: () => ipcRenderer.invoke('gh-accounts'),

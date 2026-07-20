@@ -165,6 +165,9 @@
   .pvcanvas.mobile { justify-content:center; padding:14px; overflow:auto; }
   .pv-webview { display:flex; flex:1; width:100%; height:100%; border:0; background:#fff; }
   .pvcanvas.mobile .pv-webview { flex:none; width:420px; max-width:100%; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  /* DevTools host webview — true in-app dock: page LEFT, DevTools RIGHT. Hidden until Edit is on. */
+  .pv-devtools { display:none; flex:none; width:46%; min-width:360px; height:100%; border:0; border-left:1px solid var(--line); background:#fff; }
+  .pvcanvas.has-devtools .pv-devtools { display:flex; }
   .pv-start { margin:auto; text-align:center; color:var(--muted); display:flex; flex-direction:column; gap:12px; align-items:center; padding:24px; }
   .pv-start button { background:var(--accent); color:#1a1206; border:0; border-radius:9px; padding:10px 20px; font-weight:700; cursor:pointer; font-size:13px; }
   .pv-start .err { color:#e86f6f; font-size:12px; max-width:440px; word-break:break-word; }
@@ -1050,7 +1053,7 @@
     wrap.appendChild(main); wrap.appendChild(side);
     s.stageEl.appendChild(wrap);
     const pv = s.preview = {
-      wrap, main, tool, canvas, side, webview: null, wcId: null,
+      wrap, main, tool, canvas, side, webview: null, wcId: null, devtoolsWebview: null, dtWcId: null,
       overlayReady: false, product: null, repo: null, url: null, route: '/', running: false,
       editing: false, viewport: 'desktop', cdpAttached: false, commitBase: null, changes: [],
       els: {
@@ -1082,7 +1085,7 @@
     // reuse a running dev server if one exists; otherwise show a Start affordance (don't auto-spawn npm).
     let st = null;
     try { st = await window.fleet.previewStatus({ sid, product }); } catch (_) {}
-    if (st && st.running && st.url) { pv.url = st.url; pv.running = true; mountWebview(sid); }
+    if (st && st.running && st.url) { pv.url = st.url; pv.running = true; if (st.repo) pv.repo = st.repo; mountWebview(sid); }
     else showStart(sid, '');
   }
 
@@ -1102,12 +1105,14 @@
     let r; try { r = await window.fleet.previewStart({ sid, product: pv.product, repo: null }); }
     catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
     if (!r || r.ok === false) { showStart(sid, (r && r.error) || 'could not start preview'); return; }
-    pv.url = r.url; pv.running = true; mountWebview(sid);
+    pv.url = r.url; pv.running = true; if (r.repo) pv.repo = r.repo;   // repo stamps the visual-edit brief (P3b routing key)
+    mountWebview(sid);
   }
 
   function mountWebview(sid) {
     const s = sessions[sid], pv = s.preview; if (!pv || !pv.url) return;
     pv.canvas.innerHTML = ''; pv.overlayReady = false; pv.wcId = null;
+    pv.devtoolsWebview = null; pv.dtWcId = null; pv.canvas.classList.remove('has-devtools');   // innerHTML='' dropped any prior DevTools host
     applyViewport(pv);
     const wv = document.createElement('webview');
     wv.className = 'pv-webview';
@@ -1159,9 +1164,39 @@
     if (on) enterEditMode(sid); else exitEditMode(sid);
     renderChanges(sid);
   }
+  // Create (once) the second webview that hosts the docked DevTools front-end, laid out RIGHT of the
+  // preview. Resolves its webContents id (main renders DevTools into it via setDevToolsWebContents).
+  function ensureDevtoolsHost(sid) {
+    const pv = sessions[sid] && sessions[sid].preview;
+    return new Promise((resolve) => {
+      if (!pv || !pv.canvas) return resolve(null);
+      if (pv.devtoolsWebview && pv.dtWcId != null) return resolve(pv.dtWcId);
+      const dv = document.createElement('webview');
+      dv.className = 'pv-devtools';
+      dv.setAttribute('src', 'about:blank');
+      dv.setAttribute('webpreferences', 'contextIsolation=yes');
+      pv.devtoolsWebview = dv;
+      let settled = false;
+      dv.addEventListener('dom-ready', () => {
+        if (settled) return; settled = true;
+        try { pv.dtWcId = dv.getWebContentsId(); } catch (_) { pv.dtWcId = null; }
+        pv.canvas.classList.add('has-devtools');
+        resolve(pv.dtWcId);
+      });
+      pv.canvas.appendChild(dv);
+    });
+  }
+  function removeDevtoolsHost(pv) {
+    if (!pv) return;
+    if (pv.devtoolsWebview) { try { if (pv.devtoolsWebview.parentNode) pv.devtoolsWebview.parentNode.removeChild(pv.devtoolsWebview); } catch (_) {} }
+    pv.devtoolsWebview = null; pv.dtWcId = null;
+    if (pv.canvas) pv.canvas.classList.remove('has-devtools');
+  }
   async function enterEditMode(sid) {
     const pv = sessions[sid].preview; if (!pv || pv.wcId == null) return;   // wait for dom-ready; it re-invokes this
-    try { await window.fleet.previewOpenDevtools({ webContentsId: pv.wcId, mode: 'right' }); } catch (_) {}
+    let dtWcId = null;
+    try { dtWcId = await ensureDevtoolsHost(sid); } catch (_) { dtWcId = null; }   // in-app DevTools host; null → main falls back to native dock
+    try { await window.fleet.previewOpenDevtools({ webContentsId: pv.wcId, devtoolsWebContentsId: dtWcId, mode: 'right' }); } catch (_) {}
     // best-effort CDP for source-mapped CSS-rule diffs; it can't attach while DevTools holds the
     // debugger (expected) — the preload's CSSOM diff + MutationObserver are the reliable capture path.
     try { const r = await window.fleet.previewCdpStart({ webContentsId: pv.wcId }); pv.cdpAttached = !!(r && r.attached); } catch (_) { pv.cdpAttached = false; }
@@ -1174,6 +1209,7 @@
       try { await window.fleet.previewCloseDevtools({ webContentsId: pv.wcId }); } catch (_) {}
       try { await window.fleet.previewCdpStop({ webContentsId: pv.wcId }); } catch (_) {}
     }
+    removeDevtoolsHost(pv);
     pv.cdpAttached = false;
   }
 
@@ -1287,7 +1323,7 @@
     return {
       schema: 'cfleet.visual-edit/1',
       briefId: 've-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
-      sid: sid, repo: pv.repo || null, route: pv.route || '/', viewport: vp,
+      sid: sid, repo: pv.repo || null, product: pv.product || null, route: pv.route || '/', viewport: vp,
       commitBase: pv.commitBase || null, intent: null, edits: edits, screenshots: null,
     };
   }
@@ -1309,6 +1345,7 @@
       try { window.fleet.previewCloseDevtools({ webContentsId: wcId }); } catch (_) {}
       try { window.fleet.previewCdpStop({ webContentsId: wcId }); } catch (_) {}
     }
+    removeDevtoolsHost(pv);
     try { if (pv.webview && pv.webview.parentNode) pv.webview.parentNode.removeChild(pv.webview); } catch (_) {}
     pv.webview = null; pv.wcId = null; pv.overlayReady = false; pv.editing = false; pv.running = false; pv.cdpAttached = false;
     if (pv.els && pv.els.editBtn) { pv.els.editBtn.textContent = '✎ Edit: OFF'; pv.els.editBtn.classList.add('off'); }

@@ -1147,7 +1147,8 @@ ipcMain.handle('preview-start', async (_e, { sid, product, repo } = {}) => {
       key: previewKey(sid, product), repo: tgt.repo, cwd: tgt.cwd, env,
       extraPathDirs: previewExtraPathDirs(),
     });
-    return { ok: true, url: r.url, port: r.port };
+    // repo basename rides along so the renderer can stamp the visual-edit brief's `repo` (P3b routing key).
+    return { ok: true, url: r.url, port: r.port, repo: path.basename(tgt.repo) };
   } catch (e) {
     return { ok: false, error: (e && e.message) || String(e) };
   }
@@ -1156,7 +1157,12 @@ ipcMain.handle('preview-stop', (_e, { sid, product } = {}) => {
   try { devserver.stopDevServer(previewKey(sid, product)); } catch (_) {}
   return { ok: true };
 });
-ipcMain.handle('preview-status', (_e, { sid, product } = {}) => devserver.statusOf(previewKey(sid, product)));
+ipcMain.handle('preview-status', (_e, { sid, product } = {}) => {
+  const st = devserver.statusOf(previewKey(sid, product)) || {};
+  const s = sessions[sid];                                   // add the repo basename (P3b brief routing key) when resolvable
+  const tgt = s ? resolvePreviewTarget(sid, s, product, null) : null;
+  return tgt ? Object.assign({}, st, { repo: path.basename(tgt.repo) }) : st;
+});
 
 // ---- Live Preview: real Chrome DevTools + CDP CSS-rule capture (Visual Editor P2) -----------
 // The preview <webview>'s guest webContents (id passed from the renderer via getWebContentsId())
@@ -1168,11 +1174,27 @@ ipcMain.handle('preview-status', (_e, { sid, product } = {}) => devserver.status
 function guestWC(id) { try { const wc = webContents.fromId(Number(id)); return (wc && !wc.isDestroyed()) ? wc : null; } catch (_) { return null; } }
 
 // open the native DevTools DOCKED to the right of the preview (page left, DevTools right).
-ipcMain.handle('preview-open-devtools', (_e, { webContentsId, mode } = {}) => {
+// A <webview> guest's own openDevTools({mode:'right'}) can open DETACHED in a separate OS window on
+// some Electron versions. TRUE in-app docking: the renderer creates a SECOND <webview> to host the
+// DevTools front-end and passes its webContents id here; we render DevTools INTO that guest via
+// setDevToolsWebContents(devtoolsWC) + openDevTools(), and grid.html lays the two side-by-side.
+// If no host id is given, or setDevToolsWebContents is unavailable, fall back to the old mode:'right'.
+ipcMain.handle('preview-open-devtools', (_e, { webContentsId, devtoolsWebContentsId, mode } = {}) => {
   const wc = guestWC(webContentsId);
   if (!wc) return { ok: false, error: 'preview webContents not found' };
-  try { wc.openDevTools({ mode: mode || 'right' }); return { ok: true }; }
-  catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+  const dv = (devtoolsWebContentsId != null) ? guestWC(devtoolsWebContentsId) : null;
+  try {
+    if (dv && typeof wc.setDevToolsWebContents === 'function') {
+      wc.setDevToolsWebContents(dv);
+      wc.openDevTools();                                     // renders the front-end into the host webview (docked in-app)
+      return { ok: true, docked: true };
+    }
+    wc.openDevTools({ mode: mode || 'right' });              // no host webview → best-effort native dock
+    return { ok: true, docked: false };
+  } catch (e) {
+    try { wc.openDevTools({ mode: mode || 'right' }); return { ok: true, docked: false }; }   // embed path threw → degrade, never break preview
+    catch (e2) { return { ok: false, error: (e2 && e2.message) || String(e2) }; }
+  }
 });
 ipcMain.handle('preview-close-devtools', (_e, { webContentsId } = {}) => {
   const wc = guestWC(webContentsId);
@@ -1238,6 +1260,112 @@ ipcMain.handle('preview-cdp-stop', (_e, { webContentsId } = {}) => {
   const wc = guestWC(webContentsId);
   if (wc) cdpStop(wc.id);
   return { ok: true };
+});
+
+// ---- Live Preview: route a captured visual-edit brief to the owning pane (Visual Editor P3b) ------
+// The renderer's "Save & send to agent" calls submitVisualEdits(sid, brief). We validate the brief,
+// resolve the pane that OWNS brief.repo in this session, and hand the brief off through the EXISTING
+// marker transport: a `<slug>.task` for a live pane (watcher pastes it in) or a CLI --spawn-file for a
+// fresh worker (creates the worktree + writes the `.spawn` marker handleSpawn consumes). The task text
+// points the pane at the apply protocol (claude-fleet --visual-edit-protocol) rather than inlining it.
+
+// env for a claude-fleet CLI call from the app, mirroring the plan helpers (single vs shared-coordination multi).
+function cliEnvFor(sid, s) {
+  const env = Object.assign({}, process.env, { CLAUDE_FLEET_SESSION: String(sid) });
+  if (s && s.coordDir) {
+    env.CLAUDE_FLEET_MULTI = '1';
+    env.CLAUDE_FLEET_REPOS = (s.repos || []).join(':');
+    env.CLAUDE_FLEET_STATUS_DIR = s.statusDir;
+    env.CLAUDE_FLEET_REPO = path.basename(s.coordDir);   // coord basename → coordination fleet name (not a git repo; multi skips the check)
+  } else if (s) {
+    env.CLAUDE_FLEET_REPO = s.repo;
+  }
+  return env;
+}
+// run a read-only CLI verb, resolving { ok, out } (never rejects) so a missing verb degrades gracefully.
+function cliRead(args, env) {
+  return new Promise((resolve) => {
+    execFile(FLEET_CLI, args, { encoding: 'utf8', env, timeout: 15000, maxBuffer: 8 * 1024 * 1024 }, (err, out) => {
+      resolve(err ? { ok: false, out: out || '' } : { ok: true, out: out || '' });
+    });
+  });
+}
+// the pane preamble + the brief JSON. protoPath present → point at the apply protocol; else a short inline fallback.
+function buildVisualEditTask(protoPath, brief) {
+  const json = JSON.stringify(brief, null, 2);
+  const head = protoPath
+    ? `Visual-edit brief received. READ ${protoPath} NOW and apply this brief exactly, following its locate → apply → gate → verify → commit → --done steps:`
+    : 'Visual-edit brief received. Apply this brief exactly — for each edit LOCATE the source (oid → source → selector/role → text), APPLY it (high-confidence text/style: auto-apply + commit; structural OR low-confidence: PAUSE and ASK in this pane before committing), verify against the brief, then commit and run: claude-fleet --done.';
+  return `${head}\n\n${json}\n`;
+}
+// resolve the pane index that owns brief.repo for this session, or -1. Products: the product's task-orchestrator,
+// else a live worker of that product, else the master. Single/other: the coordinator (orchestrator/integrator),
+// else a worker owning the repo (grid/shared-grid), else any live worker. Only LIVE panes (a spawned pty) qualify.
+function findVisualEditPane(sid, s, repoBasename, product) {
+  const panes = s.panes || [];
+  const isLive = (i) => panes[i] && ptys[`${sid}:${i}`];
+  const ownsRepo = (p) => p && p.repo && (path.basename(p.repo) === repoBasename || p.repo === repoBasename);
+  let idx = -1;
+  if (s.products) {
+    idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'orchestrator' && p.product === product);
+    if (idx < 0) idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'worker' && p.product === product);
+    if (idx < 0) idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'master');
+  } else {
+    idx = panes.findIndex((p, i) => isLive(i) && p && (p.role === 'orchestrator' || p.role === 'integrator'));
+    if (idx < 0) idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'worker' && (ownsRepo(p) || !p.repo));
+    if (idx < 0) idx = panes.findIndex((p, i) => isLive(i) && p && p.role === 'worker');
+  }
+  return idx;
+}
+// atomically drop a `<slug>.task` marker (tmp + rename) so the watcher never reads a partial paste.
+function writeTaskMarker(statusDir, slug, text) {
+  const dest = path.join(statusDir, `${slug}.task`);
+  const tmp = dest + '.tmp';
+  fsmod.writeFileSync(tmp, text);
+  fsmod.renameSync(tmp, dest);
+}
+// no live owner → spawn a fresh worker via the existing CLI --spawn-file (creates the worktree + writes the
+// `.spawn` marker handleSpawn consumes). Products: scope by CLAUDE_FLEET_PRODUCT; multi: pin with --repo.
+function spawnVisualEditWorker(sid, s, repoBasename, product, taskText) {
+  return new Promise((resolve) => {
+    let briefFile;
+    try {
+      briefFile = path.join(os.tmpdir(), `cfleet_ve_${sid}_${process.pid}_${Date.now()}.txt`);
+      fsmod.writeFileSync(briefFile, taskText);
+    } catch (e) { return resolve({ ok: false, error: 'could not stage brief: ' + ((e && e.message) || e) }); }
+    const env = cliEnvFor(sid, s);
+    const args = ['--spawn-file', 'Visual edits', briefFile];
+    if (s.products && product) env.CLAUDE_FLEET_PRODUCT = String(product);
+    else if (s.coordDir && repoBasename) args.push('--repo', repoBasename);
+    execFile(FLEET_CLI, args, { encoding: 'utf8', env, timeout: 60000, maxBuffer: 8 * 1024 * 1024 }, (err, out, errOut) => {
+      try { fsmod.unlinkSync(briefFile); } catch (_) {}
+      if (err) return resolve({ ok: false, error: (errOut && String(errOut).trim()) || (err && err.message) || 'spawn failed' });
+      const m = /\(([^)]+)\)\.?\s*$/.exec(String(out || '').trim());   // "Spawned worker "…" (slug)."
+      resolve({ ok: true, slug: (m && m[1]) || 'visual-edits' });
+    });
+  });
+}
+ipcMain.handle('submit-visual-edits', async (_e, { sid, brief } = {}) => {
+  const s = sessions[sid];
+  if (!s || !s.statusDir) return { ok: false, error: 'unknown session' };
+  // Validate the brief: right schema, a non-empty repo, and at least one edit.
+  if (!brief || typeof brief !== 'object' || brief.schema !== 'cfleet.visual-edit/1') return { ok: false, error: 'invalid brief (schema)' };
+  const repoBasename = brief.repo ? path.basename(String(brief.repo)) : '';
+  if (!repoBasename) return { ok: false, error: 'brief is missing a repo' };
+  if (!Array.isArray(brief.edits) || brief.edits.length === 0) return { ok: false, error: 'brief has no edits' };
+  const product = s.products ? (brief.product || null) : null;
+  // Preamble points at the apply protocol; degrade to an inline instruction if the verb is unavailable (never drop the brief).
+  const proto = await cliRead(['--visual-edit-protocol'], cliEnvFor(sid, s));
+  const taskText = buildVisualEditTask(proto.ok ? proto.out.trim() : '', brief);
+  // Route to a live owning pane via a .task marker; else spawn a fresh worker.
+  const idx = findVisualEditPane(sid, s, repoBasename, product);
+  if (idx >= 0) {
+    const slug = s.panes[idx].slug;
+    try { writeTaskMarker(s.statusDir, slug, taskText); }
+    catch (e) { return { ok: false, error: 'could not write task marker: ' + ((e && e.message) || e) }; }
+    return { ok: true, slug };
+  }
+  return await spawnVisualEditWorker(sid, s, repoBasename, product, taskText);
 });
 
 ipcMain.handle('pick-folder', async () => {
