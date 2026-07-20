@@ -14,6 +14,22 @@ This doc is the SHARED CONTRACT all workers build against. Decisions (locked wit
     (or add a class + rule). No build-time tagging needed for these — they round-trip via selector→file.
 - Round-trip reuses existing Fleet plumbing (worktree panes, `.task`/`.spawn` markers, Master/Integrator ship).
 
+## Editing surface = REAL Chrome DevTools (decided 2026-07-20, supersedes the custom-inspector idea)
+The user does NOT want a custom limited inspector. The editing surface is the **actual Chrome DevTools** opened
+on the preview webContents — full **Elements** tab (edit text/HTML, DRAG nodes from one div to another) + **Styles**
+tab (edit any CSS rule / `element.style` / variables), same as inspecting a live site. We do NOT rebuild DevTools;
+we EMBED it and CAPTURE the changes:
+- Open DevTools on the preview webContents (Electron `webContents.openDevTools({mode:'right'})` / the `<webview>`'s
+  `openDevTools`), docked beside the preview.
+- CAPTURE the user's DevTools edits and round-trip them to the agent:
+  - **DOM edits** (text, attributes/class, node MOVE across parents, add/delete) → an injected `MutationObserver`
+    (in the overlay preload) records each mutation, tagged with the nearest `data-cfleet-oid` → source.
+  - **CSS rule edits** (Styles tab, stylesheet rules not just inline) → attach a CDP session
+    (`webContents.debugger`, enable `DOM`+`CSS`), listen for `CSS.styleSheetChanged`, and/or diff stylesheet text
+    before/after; the DevTools "Changes" diff is the model to mirror.
+- A "Save & send to agent" action collects the accumulated changeset → the visual-edit brief → the owning pane.
+The custom inspector panel + floating toolbar from the earlier mock are DROPPED.
+
 ## Architecture (5 subsystems)
 1. **Dev-server manager** (main process) — spawn `npm run dev` per worktree/product; free-port alloc; readiness
    (stdout banner + TCP probe); teardown wired into GC/liveness. IPC below.
