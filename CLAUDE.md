@@ -127,6 +127,22 @@ project the "Use orchestrator" checkbox still toggles Dispatch vs Grid.
   engine once per repo, with ONE shared coordination `.status` (the watcher surface) + per-repo
   fleet dirs, repo-tagged workers, and an atomic push across the whole set. See the Gyftalala
   multi-repo section below.
+- **Products / Master mode** (`mode:'products'`, multi-repo, added 2026-07-20): a 3-TIER
+  hierarchy — a **Master** (admin) over N **task-orchestrators** (one per user-named PRODUCT/task),
+  each spawning its own **workers**. Every product spans ALL selected repos; the Master is the ONLY
+  pusher (checks conflicts ACROSS products, merges each ready product into every repo's shared
+  `_main`, test-gates, auto-ships each product incrementally when green). config shows the same
+  variable-N repo checklist + a list of product NAMES; cfg = `{mode:'products', account, repos,
+  tasks:[names], autonomous:true}`. grid.html renders a LEFT SIDEBAR (Master pinned first, "Tasks"
+  label, "+ Add product" at top, product groups) instead of top tabs; selecting a group filters the
+  pane grid to that product's panes (all panes still RUN in the background). Full contract +
+  disk/board layout in `PRODUCTS-CONTRACT.md` (repo root). Engine verbs: `--products-plan N
+  <names…>`, `--add-product <name>`; product scoping via `CLAUDE_FLEET_PRODUCT=<P>` (branch ns
+  `fleet/s<sid>/<P>/…`, board slugs `<P>__<worker>`, product-level slug `<P>`); roles `master` +
+  task-orch (`orchestrator`) added to `spawnPane`/`isCoordinator`. GC: `gc_one_products` reaps the
+  `products-master-fleet-<sid>` coord after all member repo-fleets gone. GOTCHA: a product worker
+  MUST `cd` into a repo sub-dir before `--done` (fail-closed; a bare `--done` from the non-git
+  workspace root errors rather than falsely signalling the master that the whole product is ready).
 
 ## The `claude-fleet` CLI (`bin/claude-fleet`)
 
