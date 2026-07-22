@@ -343,3 +343,11 @@ when packaged — see `package.json` `asarUnpack`); `FLEET_CLI` resolves to it. 
   checkout one commit (`git -C ~/Developer/claude-fleet-app reset --hard <prev-tip>`, it's
   clean since the ff required it) then re-run `claude-fleet --rebuild` — it ff's back to the
   same tip and fires the repackage; net tree state is identical.
+
+## App-naming / bundle-id convention (REQUIRED for any app built with this tool)
+
+Any app/software scaffolded or built by this tool (or by Maestro) MUST use a bundle identifier of the
+form `com.<appname>.app` — lowercase app name, no spaces, and **NO personal names**. The human app name
+goes in `productName`. Set this in the new app's `package.json` under `build.appId` (electron-builder maps
+it to `CFBundleIdentifier`). Examples: `com.maestro.app` (Maestro), `com.claudefleet.app` (Claude Fleet).
+Never use a person's name in the bundle id (e.g. NOT `com.aakash.<x>`).

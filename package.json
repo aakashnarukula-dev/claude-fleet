@@ -12,7 +12,7 @@
     "dist": "electron-builder"
   },
   "build": {
-    "appId": "com.aakash.claudefleet",
+    "appId": "com.claudefleet.app",
     "productName": "Claude Fleet",
     "directories": {
       "buildResources": "build"
