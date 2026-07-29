@@ -14,6 +14,7 @@
   .tab .pdot { display:none; width:7px; height:7px; border-radius:50%; flex:none; }
   .tab.st-idle .pdot { display:inline-block; background:#e0a86b; }
   .tab.st-failed .pdot { display:inline-block; background:#ff5c57; }
+  .tab.st-exited .pdot { display:inline-block; background:#8a8f98; }   /* grey: a pane in this tab ENDED and can be resumed */
   .tab.st-permission .pdot { display:inline-block; background:var(--accent); animation:permpulse 1.2s ease-in-out infinite; }   /* most-urgent state across the tab's panes */
   .tab .x { width:16px; height:16px; border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:14px; color:var(--muted); }
   .tab.active .x { color:rgba(255,255,255,0.85); }
@@ -61,6 +62,15 @@
   @keyframes permpulse { 0%,100% { opacity:1; } 50% { opacity:.3; } }
   .pbar .pclose { flex:none; width:18px; height:18px; border-radius:5px; display:flex; align-items:center; justify-content:center; font-size:16px; line-height:1; color:rgba(255,255,255,0.78); cursor:pointer; }
   .pbar .pclose:hover { background:rgba(255,255,255,0.22); color:#fff; }
+  /* Resume: only on a pane whose Claude EXITED (st-exited) — relaunches it in place with `claude --continue` */
+  .pbar .presume { display:none; flex:none; height:18px; padding:0 7px; border-radius:5px; align-items:center; font-size:11px; line-height:1; font-weight:600; color:#141518; background:var(--accent); cursor:pointer; }
+  .pbar.st-exited .presume { display:flex; }
+  .pbar.st-exited .ptitle { color:rgba(255,255,255,0.45) !important; }
+  .pbar .presume:hover { filter:brightness(1.12); }
+  .pbar .presume.busy { opacity:.5; pointer-events:none; }
+  #resumeall { -webkit-app-region:no-drag; display:none; align-self:center; height:28px; margin-left:6px; padding:0 12px; border:1px solid #3a2a20; border-radius:7px; background:#241712; color:var(--accent); font-size:12px; font-weight:700; cursor:pointer; }
+  #resumeall:hover { background:#2e1c14; border-color:var(--accent); }
+  #resumeall:disabled { opacity:.5; cursor:default; }
   .term { flex:1; min-height:0; padding:6px 8px; overflow:hidden; }   /* clip the terminal when its pane shrinks (no reflow) */
   .xterm { height:100%; }
   /* Products / Master mode ONLY: a left sidebar + a pane STAGE replace the plain single-grid. The panes themselves
@@ -194,7 +204,7 @@
 </style>
 </head>
 <body>
-<div id="tabbar"><button id="filesbtn" title="Browse + edit files"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><div id="tabs" style="display:flex; align-items:flex-end; gap:4px;"></div><button id="newtab" title="New session">+</button><button id="addgrid" title="Add a worker pane to this grid session">+ Pane</button></div>
+<div id="tabbar"><button id="filesbtn" title="Browse + edit files"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button><div id="tabs" style="display:flex; align-items:flex-end; gap:4px;"></div><button id="newtab" title="New session">+</button><button id="addgrid" title="Add a worker pane to this grid session">+ Pane</button><button id="resumeall" title="Relaunch every ended pane in this tab (claude --continue)">⟳ Resume all</button></div>
 <div id="modal"><div id="modalbox"><div id="modaltitle"></div><input id="modalinput" autocomplete="off" spellcheck="false" /><div id="modalbtns"><button id="modalcancel">Cancel</button><button id="modalok">Add</button></div></div></div>
 <div id="sessions"></div>
 <div id="filepanel"><select id="rootsel"></select><input id="filesearch" type="text" placeholder="Search text in files…" autocomplete="off" spellcheck="false" /><div id="filetree"></div><div id="fileresults"></div></div>
@@ -619,11 +629,12 @@
   function buildPane(sid, sess, grid, p) {
     const pane = document.createElement('div'); pane.className = 'pane';
     const bar = document.createElement('div'); bar.className = 'pbar ' + p.role;
-    bar.innerHTML = `<span class="pdot"></span><span class="ptitle">${escapeHtml(p.heading)}</span><span class="pclose" title="Close pane">×</span>`;
+    bar.innerHTML = `<span class="pdot"></span><span class="ptitle">${escapeHtml(p.heading)}</span><span class="presume" title="Resume this pane (claude --continue)">⟳ Resume</span><span class="pclose" title="Close pane">×</span>`;
     // unique per-pane identity colour, overrides role-based .ptitle CSS — but NOT for coordinator panes (orchestrator /
     // integrator): they keep their role accent (#e8915f) so a special pane reads distinctly from the plain workers.
     if (p.role !== 'orchestrator' && p.role !== 'integrator' && p.role !== 'master') bar.querySelector('.ptitle').style.color = TITLE_COLORS[p.id % TITLE_COLORS.length];
     bar.querySelector('.pclose').addEventListener('click', (e) => { e.stopPropagation(); closePane(sid, p.id); });
+    bar.querySelector('.presume').addEventListener('click', (e) => { e.stopPropagation(); resumePane(sid, p.id); });
     const termEl = document.createElement('div'); termEl.className = 'term';
     pane.appendChild(bar); pane.appendChild(termEl); grid.appendChild(pane);
 
@@ -671,6 +682,7 @@
     focusActive(sid);   // clicking a tab should land the cursor in its terminal — no extra click to type/paste
     if (document.getElementById('filepanel').classList.contains('open')) loadRoots();   // file tree follows the active tab
     document.getElementById('addgrid').style.display = (sessions[sid] && sessions[sid].mode === 'grid') ? 'inline-block' : 'none';
+    refreshResumeAll();   // the "⟳ Resume all" pill belongs to the tab you're looking at
   }
 
   // lightweight name prompt (window.prompt is disabled in Electron) -> resolves the typed name or null
@@ -801,7 +813,7 @@
       return out; } catch (_) { return ''; }
   }
   function reportState(sid, id) {
-    const s = sessions[sid]; if (!s) return; const t = s.terms[id]; if (!t || !t.started) return;
+    const s = sessions[sid]; if (!s) return; const t = s.terms[id]; if (!t || !t.started || t.exited) return;   // an ENDED pane's screen is frozen — don't report its last frame as live idle/working state
     const scr = readScreen(t.term);
     let state = 'idle';
     if (PERM_Y.test(scr) && PERM_M.test(scr)) state = 'permission';
@@ -811,11 +823,55 @@
     window.fleet.paneActivity({ sid, id, state, screen: state === 'permission' ? scr : '' });
   }
   setInterval(() => { Object.keys(sessions).forEach((sid) => { const s = sessions[sid]; if (s) Object.keys(s.terms).forEach((id) => reportState(+sid, +id)); }); }, 1500);
-  window.fleet.onPtyExit(({ sid, id }) => { const s = sessions[sid]; if (s && s.terms[id]) s.terms[id].term.write('\r\n\x1b[2m[ session ended ]\x1b[0m\r\n'); });
+  // A pane's Claude ended (crash, external kill, /exit, …). Mark it ENDED and offer Resume — the pane keeps its
+  // worktree, so `claude --continue` picks the same conversation back up without restarting the whole app.
+  window.fleet.onPtyExit(({ sid, id }) => {
+    const s = sessions[sid]; if (!s || !s.terms[id]) return;
+    const t = s.terms[id];
+    t.exited = true; t.lastReported = null;
+    t.term.write('\r\n\x1b[2m[ session ended ]\x1b[0m  \x1b[38;5;209m⟳ Resume\x1b[0m\x1b[2m in the pane header to continue this conversation.\x1b[0m\r\n');
+    if (t.paneEl) { const b = t.paneEl.querySelector('.pbar'); if (b) b.classList.add('st-exited'); }
+    refreshResumeAll();
+  });
+  // Resume ONE ended pane in place. Main relaunches it with `claude --continue` in the same worktree.
+  async function resumePane(sid, paneId) {
+    const s = sessions[sid]; if (!s) return;
+    const t = s.terms[paneId]; if (!t || !t.exited) return;
+    const btn = t.paneEl && t.paneEl.querySelector('.presume');
+    if (btn) btn.classList.add('busy');
+    const r = await window.fleet.resumePane({ sid, id: paneId, cols: t.term.cols, rows: t.term.rows });
+    if (btn) btn.classList.remove('busy');
+    if (!r || !r.ok) { t.term.write('\r\n\x1b[31m  Resume failed: ' + ((r && r.error) || 'unknown error') + '\x1b[0m\r\n'); return; }
+    t.exited = false; t.lastReported = null;
+    t.term.write('\r\n\x1b[2m  Resuming (claude --continue)…\x1b[0m\r\n');
+    if (t.paneEl) { const b = t.paneEl.querySelector('.pbar'); if (b) b.classList.remove('st-exited'); }
+    if (s.paneStates) { s.paneStates[paneId] = 'working'; refreshTabState(s); }   // drop the grey "ended" dot off the tab
+    refreshResumeAll();
+  }
+  // Resume EVERY ended pane in a session (default: the visible tab) — the "all my panes died" recovery.
+  async function resumeAll(sid) {
+    const s = sessions[sid]; if (!s) return;
+    const ids = Object.keys(s.terms).filter((id) => s.terms[id] && s.terms[id].exited);
+    for (const id of ids) await resumePane(sid, +id);   // serial: each spawn is a full claude launch, don't stampede
+  }
+  // show "⟳ Resume all (n)" only while the ACTIVE tab has ended panes
+  function refreshResumeAll() {
+    const btn = document.getElementById('resumeall'); if (!btn) return;
+    const s = activeSid != null ? sessions[activeSid] : null;
+    const n = s ? Object.values(s.terms).filter((t) => t && t.exited).length : 0;
+    btn.style.display = n > 1 ? 'inline-block' : 'none';   // 1 dead pane → its own header button is enough
+    btn.textContent = '⟳ Resume all (' + n + ')';
+  }
+  document.getElementById('resumeall').onclick = async () => {
+    if (activeSid == null) return;
+    const btn = document.getElementById('resumeall'); btn.disabled = true;
+    try { await resumeAll(activeSid); } finally { btn.disabled = false; refreshResumeAll(); }
+  };
   window.fleet.onFleetError(({ sid, msg }) => { const s = sessions[sid]; if (s) Object.values(s.terms).forEach((t) => t.term.write('\r\n\x1b[31m  ' + msg + '\x1b[0m\r\n')); });
   // a pane changed state → status dot on its header + on its tab (tab shows the most-urgent pane state)
-  const STATE_RANK = { permission: 3, failed: 2, idle: 1, working: 0 };
-  function applyStateClass(el, state) { if (!el) return; el.classList.remove('st-permission', 'st-failed', 'st-idle'); if (state === 'permission' || state === 'failed' || state === 'idle') el.classList.add('st-' + state); }
+  const STATE_RANK = { permission: 3, exited: 2, failed: 2, idle: 1, working: 0 };
+  // 'exited' rides along so a BACKGROUND tab whose panes died still raises a dot instead of looking healthy.
+  function applyStateClass(el, state) { if (!el) return; el.classList.remove('st-permission', 'st-failed', 'st-idle', 'st-exited'); if (state === 'permission' || state === 'failed' || state === 'idle' || state === 'exited') el.classList.add('st-' + state); }
   function refreshTabState(s) { let top = 'working'; Object.values(s.paneStates || {}).forEach((st) => { if ((STATE_RANK[st] || 0) > (STATE_RANK[top] || 0)) top = st; }); applyStateClass(s.tabEl, top); }
   window.fleet.onPaneState(({ sid, id, state }) => {
     const s = sessions[sid]; if (!s) return;

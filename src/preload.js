@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld('fleet', {
   setActiveSession: (sid) => ipcRenderer.send('active-session', sid),   // which tab is currently VISIBLE in this window (null = none) — gates notification suppression
   closeSession: (sid) => ipcRenderer.send('close-session', sid),
   closePane: (sid, id) => ipcRenderer.send('close-pane', { sid, id }),
+  resumePane: (info) => ipcRenderer.invoke('resume-pane', info),   // {sid,id,cols,rows} -> {ok} | {ok:false,error} — relaunch an EXITED pane (claude --continue)
   confirmClose: (kind, name) => ipcRenderer.invoke('confirm-close', { kind, name }),
   termReady: (info) => ipcRenderer.send('term-ready', info),     // {sid,id,cols,rows}
   termInput: (info) => ipcRenderer.send('term-input', info),     // {sid,id,data}

@@ -103,6 +103,15 @@ Electron, no bundler — plain HTML + vendored libs, loaded directly.
   per-pane headings, autonomy. Calls `fleet.launch(cfg)`.
 - `src/grid.html` — grid window (renderer). Chrome-style tabbed multi-sessions, the
   xterm grid, drag gutters. Receives `add-session` / `add-pane` / `pty-data`.
+  **Resuming an ENDED pane:** when a pane's `claude` exits for ANY reason (crash, OOM, an
+  outside kill, `/exit`), `spawnPane` refuses to relaunch it (`s.exited[id]`) — historically the
+  pane was dead for the life of the app and the only recovery was quitting and answering
+  **Restore**, which restarts every pane of every session. The pane header now shows
+  **⟳ Resume** while it is ended (`.pbar.st-exited`, grey dot on the tab), and the tab bar shows
+  **⟳ Resume all (n)** when the visible tab has more than one. Both call the `resume-pane` IPC,
+  which clears `s.exited[id]`, sets `p.resume = true` and re-runs `spawnPane` — the same
+  `claude --continue` the Restore path uses, in the SAME worktree, so the conversation carries
+  on. It refuses (reason printed into the pane) if the worktree is gone or the pane is running.
 - `src/preload.js` — `contextBridge` IPC surface (`window.fleet`). Edit this when
   adding any new main↔renderer channel.
 - `src/vendor/` — bundled `@xterm/xterm` + addon-fit + css. Vendored, not from npm

@@ -1454,6 +1454,26 @@ ipcMain.on('close-pane', (_e, { sid, id }) => {
   saveState();
 });
 
+// RESUME an exited pane, in place. When a pane's claude ends (crash, OOM, an external kill, /exit, a finished
+// --print run) `term.onExit` marks it in s.exited and NOTHING ever relaunches it: spawnPane bails on the s.exited
+// guard, so the pane sat at "[ session ended ]" for the life of the app and the only recovery was quitting and
+// answering Restore — which restarts EVERY pane of EVERY session. This relaunches just this one, with the same
+// `claude --continue` the restore path uses, so the conversation picks up where it stopped in the SAME worktree.
+ipcMain.handle('resume-pane', (_e, { sid, id, cols, rows }) => {
+  const s = sessions[sid];
+  if (!s || !s.panes || !s.panes[id]) return { ok: false, error: 'This pane is gone.' };
+  if (ptys[`${sid}:${id}`]) return { ok: false, error: 'This pane is already running.' };
+  const p = s.panes[id];
+  // the worktree is the pane's cwd — a reaped/cleaned session can't be resumed (pty.spawn would fail on a bad cwd)
+  if (!p.dir || !fsmod.existsSync(p.dir)) return { ok: false, error: 'Its worktree is gone: ' + (p.dir || '(none)') };
+  if (s.exited) delete s.exited[id];        // clear the guard, else spawnPane's term-ready path stays blocked too
+  p.resume = true;                          // relaunch as `claude --continue` — never re-run the original prompt
+  spawnPane(sid, id, cols, rows);
+  if (!ptys[`${sid}:${id}`]) return { ok: false, error: 'Could not start Claude in ' + p.dir };
+  saveState();
+  return { ok: true };
+});
+
 // confirmation before a destructive close (tab/pane) — returns true to proceed
 ipcMain.handle('confirm-close', (e, { kind, name }) => {
   const m = kind === 'session'
