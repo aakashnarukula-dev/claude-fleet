@@ -101,6 +101,14 @@ const ALLOW = [
   'Bash(flutter:*)', 'Bash(dart:*)', 'Bash(dotnet:*)', 'Bash(mvn:*)', 'Bash(cmake:*)', 'Bash(ninja:*)', 'Bash(npm:*)',
 ];
 
+// Hand a pane's allowlist to Claude Code OUT OF BAND (a `--settings` JSON), never as `--allowedTools` argv — see the
+// fleet-wide-kill note in spawnPane. Returns the file path, or null if the write failed (caller falls back to argv).
+function writeAllowSettings(sid, idx, allowList) {
+  const p = path.join(os.tmpdir(), `cfleet-allow-${sid}-${idx}-${process.pid}.json`);
+  try { fsmod.writeFileSync(p, JSON.stringify({ permissions: { allow: allowList } }), 'utf8'); return p; }
+  catch (_) { return null; }
+}
+
 let configWin = null;
 // MULTI-WINDOW: a registry of grid windows + a sid->window routing table replaces the old single `gridWin`.
 // PTYs stay keyed by sid:idx and are window-agnostic — moving a session (tear-off / re-dock) just re-points which
@@ -1834,7 +1842,16 @@ function spawnPane(sid, idx, cols, rows) {
   } else {
     allowList = s.autonomous ? ALLOW.concat(mayPush ? ['Bash(git push:*)'] : []) : null;   // dispatch: only the orchestrator pushes
   }
-  const allowArgs = allowList ? ' --allowedTools ' + allowList.map((a) => shQuote(a)).join(' ') : '';
+  // FLEET-WIDE-KILL HAZARD: the allowlist must NOT ride on the command line. With `--allowedTools …` every pane's
+  // argv literally contains `Bash(vite:*)`, `Bash(node:*)`, `Bash(npm:*)`, `Bash(python3:*)`… so an innocuous
+  // `pkill -f vite` in ONE pane matches EVERY OTHER pane's `claude` process and SIGTERMs the whole fleet. pkill
+  // excludes itself AND its own ancestors by default, so the pane that fired it is the lone survivor — from the grid
+  // it looks like "6 panes randomly died". (Happened 2026-08-02 20:00:50Z: 6 of 7 panes gone within 200ms of a
+  // worker's `pkill -f "vite"`.) Hand the SAME list to Claude Code through a --settings file instead; argv then
+  // carries no toolchain tokens at all.
+  const settingsFile = allowList ? writeAllowSettings(sid, idx, allowList) : null;
+  const allowArgs = settingsFile ? ' --settings ' + shQuote(settingsFile)
+    : (allowList ? ' --allowedTools ' + allowList.map((a) => shQuote(a)).join(' ') : '');   // fallback: write failed
   // Start every pane in ⏵⏵ auto mode (the `auto` permission-mode: auto-apply edits AND auto-run safe commands, no
   // per-step prompt) when autonomous — pairs with the allowlist (which auto-approves the listed Bash verbs).
   // Non-allowlisted/unsafe verbs (curl/sudo/…) still ask. Only set when autonomous so a non-autonomous run still
@@ -1871,7 +1888,7 @@ function spawnPane(sid, idx, cols, rows) {
     if (FAILED_RE.test(clean)) noteEvent(sid, idx, 'failed');
     else if (DONE_RE.test(clean)) noteEvent(sid, idx, 'done');
   });
-  term.onExit(() => { sendToSid(sid, 'pty-exit', { sid, id: idx }); delete ptys[`${sid}:${idx}`]; delete ptyBuf[`${sid}:${idx}`]; const ss = sessions[sid]; if (ss) (ss.exited || (ss.exited = {}))[idx] = true; sendToSid(sid, 'pane-state', { sid, id: idx, state: 'exited' }); clearPaneState(sid, idx); markPaneClosed(closedStatusDir, closedSlug); });
+  term.onExit(() => { if (settingsFile) { try { fsmod.unlinkSync(settingsFile); } catch (_) {} } sendToSid(sid, 'pty-exit', { sid, id: idx }); delete ptys[`${sid}:${idx}`]; delete ptyBuf[`${sid}:${idx}`]; const ss = sessions[sid]; if (ss) (ss.exited || (ss.exited = {}))[idx] = true; sendToSid(sid, 'pane-state', { sid, id: idx, state: 'exited' }); clearPaneState(sid, idx); markPaneClosed(closedStatusDir, closedSlug); });
 }
 
 ipcMain.on('term-ready', (_e, { sid, id, cols, rows }) => {

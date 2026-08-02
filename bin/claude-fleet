@@ -445,6 +445,11 @@ e.g. ${BR_PREFIX}/foo → "foo").
       — hand it straight to the pane that owns those files (list siblings: claude-fleet --statuses).
     Doing both? Scope the --need to ONLY what you did NOT hand off, and say "ALREADY HANDED OFF to
     <slug>" for the rest (auto-linked — the orchestrator tracks it without re-dispatching).
+- NEVER kill processes by a loose name pattern. \`pkill -f <word>\` matches the FULL command line of every
+  process on the machine — your SIBLING PANES included (their argv holds their whole task brief), and they
+  die silently while YOUR pane survives (pkill skips itself + its own ancestors). Stop a dev server by PORT
+  or PID instead:  \`lsof -ti tcp:<port> | xargs kill\`  (or kill the \$! you backgrounded). If you truly must
+  pattern-match, anchor it to a binary path — \`pkill -f "node_modules/.bin/vite"\` — never a bare word.
 - INCOMING WORK while you're busy (a new task typed into your pane, or --handoff'd from a sibling):
   NEVER drop, abandon, or interrupt what you're doing. Capture every one with TodoWrite, then —
   independent + non-blocking → parallel inline subagent, or queue and start when you finish; depends on
@@ -2048,6 +2053,11 @@ slug (the last segment of your branch, ${BR_PREFIX}/<your-slug>).
   print paste-text — write the full requirement to /tmp/cfleet_handoff.txt, then route + tell me which:
     a pane already owns it (git branch --list '${BR_PREFIX}/*') → claude-fleet --handoff "<that pane>" /tmp/cfleet_handoff.txt
     no pane owns it yet → claude-fleet --spawn-grid "<area name>" /tmp/cfleet_handoff.txt
+- NEVER kill processes by a loose name pattern. \`pkill -f <word>\` matches the FULL command line of every process
+  on the machine — your SIBLING PANES included (their argv holds their whole task brief), and they die silently
+  while YOUR pane survives (pkill skips itself + its own ancestors). Stop a dev server by PORT or PID:
+  \`lsof -ti tcp:<port> | xargs kill\`. If you must pattern-match, anchor to a binary path
+  (\`pkill -f "node_modules/.bin/vite"\`), never a bare word.
 - THE LOOP — run end-to-end for each requirement:
   1. MAKE the changes for the requirement — edit freely, never pause to ask.
   2. VERIFY it works: run the repo's build/test per CLAUDE.md (run any cache-bust/build step + commit its result too).
@@ -2123,6 +2133,11 @@ this file says <your-slug>, use the last segment of your branch.
       it for the user, from inside a repo sub-dir:  cd ${first_base} && claude-fleet --need "<what + why + which repos/
       files> — needs a NEW worker pane" . The user opens another pane (retract a mistake with  cd ${first_base} &&
       claude-fleet --unneed ).
+- NEVER kill processes by a loose name pattern. \`pkill -f <word>\` matches the FULL command line of every process
+  on the machine — your SIBLING PANES included (their argv holds their whole task brief), and they die silently
+  while YOUR pane survives (pkill skips itself + its own ancestors). Stop a dev server by PORT or PID:
+  \`lsof -ti tcp:<port> | xargs kill\`. If you must pattern-match, anchor to a binary path
+  (\`pkill -f "node_modules/.bin/vite"\`), never a bare word.
 - THE LOOP — run end-to-end for each requirement:
   1. MAKE the changes for the requirement — edit freely across whichever repo sub-dirs it needs; never pause to ask.
   2. VERIFY it works: run each touched repo's build/test per its CLAUDE.md (run any cache-bust/build step + commit its result too).
@@ -2206,6 +2221,11 @@ globally unique, so use it verbatim in every scratch filename (e.g. /tmp/cfleet_
       set either. Instead RECORD it for the user, from inside a repo sub-dir:  cd ${first_base} && claude-fleet --need
       "<what + why + which repos/files> — needs a NEW worker pane" . The Integrator surfaces the --need to the user, who
       opens another pane (retract a mistake with  cd ${first_base} && claude-fleet --unneed ).
+- NEVER kill processes by a loose name pattern. \`pkill -f <word>\` matches the FULL command line of every process
+  on the machine — your SIBLING PANES included (their argv holds their whole task brief), and they die silently
+  while YOUR pane survives (pkill skips itself + its own ancestors). Stop a dev server by PORT or PID:
+  \`lsof -ti tcp:<port> | xargs kill\`. If you must pattern-match, anchor to a binary path
+  (\`pkill -f "node_modules/.bin/vite"\`), never a bare word.
 - THE LOOP — run end-to-end for each requirement:
   1. MAKE the changes for the requirement — edit freely across whichever repo sub-dirs it needs; never pause to ask.
   2. VERIFY it works: run each touched repo's build/test per its CLAUDE.md (run any cache-bust/build step + commit its result too).
